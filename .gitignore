@@ -1,4 +1,7 @@
-vendor/
+vendor/*
+# Tracked vendor assets (downloaded/built deps stay ignored, but these
+# are baked into the binary via staticRead and need to ship in-tree).
+!vendor/xex2_templates/
 probe/*
 
 # Nim build outputs

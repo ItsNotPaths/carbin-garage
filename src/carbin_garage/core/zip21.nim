@@ -20,6 +20,19 @@ type
     usize*: int
     crc32*: uint32
     localHeaderOffset*: int
+    cdirExtra*: seq[byte]
+      ## Bytes of this entry's cdir-side `extra` field, captured verbatim
+      ## from the source zip. Forza zips carry an 8-byte Xbox-side
+      ## extension tag (header id 0x1123, len 4) per entry that the game's
+      ## IO layer validates at load time. The mixed-method rewriter
+      ## preserves these byte-for-byte when re-emitting the cdir.
+    versionMadeBy*: uint16        ## cdir bytes 4..5 (donor uses 10 = PKZip 1.0)
+    versionNeeded*: uint16        ## cdir bytes 6..7 (donor uses 10)
+    flags*: uint16                ## cdir bytes 8..9 (donor: 0)
+    modTime*: uint16              ## cdir bytes 12..13 (real DOS-time stamp)
+    modDate*: uint16              ## cdir bytes 14..15
+    internalAttrs*: uint16        ## cdir bytes 36..37
+    externalAttrs*: uint32        ## cdir bytes 38..41
 
 # ---- little-endian primitive readers (zip is LE) ----
 
@@ -71,19 +84,31 @@ proc listEntries*(zipPath: string): seq[Entry] =
     #   u16 mod_time, u16 mod_date, u32 crc,
     #   u32 csize, u32 usize, u16 fnl, u16 exl, u16 cml,
     #   u16 disk, u16 ia, u32 ea, u32 lho
+    let verMadeBy = leU16(data, p + 4)
+    let verNeeded = leU16(data, p + 6)
+    let flags     = leU16(data, p + 8)
     let methodId = int(leU16(data, p + 10))
+    let modTime  = leU16(data, p + 12)
+    let modDate  = leU16(data, p + 14)
     let crc      = leU32(data, p + 16)
     let csize    = int(leU32(data, p + 20))
     let usize    = int(leU32(data, p + 24))
     let fnl      = int(leU16(data, p + 28))
     let exl      = int(leU16(data, p + 30))
     let cml      = int(leU16(data, p + 32))
+    let intAttr  = leU16(data, p + 36)
+    let extAttr  = leU32(data, p + 38)
     let lho      = int(leU32(data, p + 42))
     var name = newString(fnl)
     for j in 0 ..< fnl: name[j] = char(data[p + 46 + j])
+    var cdirExtra = newSeq[byte](exl)
+    for j in 0 ..< exl: cdirExtra[j] = data[p + 46 + fnl + j]
     result.add(Entry(
       name: name, methodId: methodId, csize: csize, usize: usize,
-      crc32: crc, localHeaderOffset: lho))
+      crc32: crc, localHeaderOffset: lho, cdirExtra: cdirExtra,
+      versionMadeBy: verMadeBy, versionNeeded: verNeeded, flags: flags,
+      modTime: modTime, modDate: modDate,
+      internalAttrs: intAttr, externalAttrs: extAttr))
     p += 46 + fnl + exl + cml
 
 proc readCompressed*(zipPath: string, e: Entry): seq[byte] =

@@ -203,6 +203,10 @@ proc importToWorking*(zipPath: string, profile: GameProfile,
   # Decode .xds → .png for every texture in working/<slug>/textures/.
   # The .xds bytes stay on disk (round-trip + re-encode reference); the
   # PNG is what the glTF references and what the user edits.
+  # Stamp the PNG's mtime back to the .xds's so the
+  # PNG-newer-than-XDS dirty check (used by reencode-textures /
+  # export-to) only fires on real user edits, not on the import-time
+  # write order.
   let texDir = root / "textures"
   if dirExists(texDir):
     for kind, p in walkDir(texDir):
@@ -211,7 +215,10 @@ proc importToWorking*(zipPath: string, profile: GameProfile,
       try:
         let bytes = readFileBytes(p)
         let img = decodeXds(bytes)
-        writePng(p & ".png", img)
+        let pngPath = p & ".png"
+        writePng(pngPath, img)
+        let xdsTime = getLastModificationTime(p)
+        setLastModificationTime(pngPath, xdsTime)
       except CatchableError as e:
         echo "  - texture skipped: ", extractFilename(p), " (", e.msg, ")"
 

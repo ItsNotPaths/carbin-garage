@@ -2,7 +2,43 @@
 
 Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01.
 
-**Latest (2026-05-01, encode session):** Phase 2c.3 texture **encode**
+**Latest (2026-05-01, Slice A — port-to scaffolding):** End-to-end
+`port-to` pipeline wired with a **stub carbin transcode** that returns
+donor bytes verbatim. New modules: `core/carbin/transcode.nim` (stub +
+`tmHybridSplice` placeholder that raises until Slice B implements the
+real Option-C donor splice), `core/cardb_writer.nim` (DB row patcher;
+overlays source `cardb.json` on donor's row, `BaseCost=1` forced,
+auto-clones FH1-only `E3Drivers` from donor when porting from FM4),
+`orchestrator/portto.nim`, CLI verb `port-to <working-car>
+<target-game-id> --donor <donor-slug> [--name <new-slug>] [--dry-run]
+[--replace-db]`. Smoke probe `probe/nim_carbin_transcode_smoke.bin`:
+**16/16 pass** across the 8 paired sample cars × 2 directions
+(FM4↔FH1; output bytes equal donor + reparses cleanly). Real-mount
+dry-run on FM4→FH1 port of ALF_8C_08: textures 12/3/0
+(copy/splice/drop), geometry 11 transcode + 11 donor-only (the donor's
+11 stripped_* slots), cardb 5 overlay + 1 donor-clone (E3Drivers) + 16
+table skips. Real bytes-on-disk port + in-game test next. Slice B
+replaces only `transcodeCarbin`'s body — orchestrator + DB stay put.
+
+**Latest (2026-05-01, LZX session):** Texture edits now flow end-to-end
+through `export-to`. wimlib's `lzx_compress` is wired (`csrc/lzx_deflate.c`
++ `core/lzx_encode.nim`) and patched for CAB-LZX framing
+(`patches/wimlib_lzx_cab_compat.patch`, applied at deps-fetch time);
+single-chunk inputs ≤64 KiB byte-equal roundtrip via libmspack.
+Multi-chunk encoding desyncs at chunk boundaries because wimlib's
+match-finder + recent_offsets aren't streamably persistent — Phase 2b
+proper, captured in detail in project memory "LZX encoder partial".
+The near-term unblock is `core/zip21_writer.nim` — a mixed-method
+PKZip rewriter that copies untouched method-21 (LZX) entries verbatim
+and emits edited entries as method-0 (stored). `export-to` now invokes
+it automatically when the working tree has files newer than the
+stashed `source.zip`. End-to-end smoke test passes: edit PNG →
+`reencode-textures` → `export-to` → re-import the exported zip → the
+edit is intact (red rectangle round-trips at pixel level). In-game
+compatibility of method-0 entries is the next data point worth
+gathering.
+
+**Earlier (2026-05-01, encode session):** Phase 2c.3 texture **encode**
 + structural **cross-game porting** complete. PNG → BC1/3/5 via
 `stb_dxt`, Xenon retile (inverse of decode), 8-in-16 endian swap, and
 `.xds` header rewriter all wired in `core/xds.nim`. Mip chain length is
@@ -112,30 +148,62 @@ architecture phases got reordered as we discovered things.
 
 ## Locked next-step ordering
 
-1. **~~Finish FH1 LOD / full-model parsing~~ — done 2026-05-01.** All 8
-   sample `<car>_lod0.carbin` byte-equal roundtrip; 7/8
-   `<car>_cockpit.carbin` byte-equal (the 8th has a non-mesh anomaly
-   that round-trips fine via skip-and-resume but doesn't surface in
-   glTF). Cross-car ports now have full mesh data on both sides.
-   `stripped_*.carbin` stays on donor passthrough indefinitely —
-   likely never worth re-implementing.
-2. **Texture porting** — three sub-pieces:
-   - **Re-encode on edit (Phase 2c.3)**: PNG → BC + Xenon retile +
-     `.xds` header rewrite. Triggered by
-     `working/<slug>/textures/<name>.xds.png` newer than `<name>.xds`.
-     Unblocks visual edits flowing through to export.
-   - **Cross-game container compat**: verify FM4↔FH1 `.xds` is
-     interchangeable byte-for-byte (both Xbox 360, BC1/3/5, Xenon
-     tile). If yes, source textures port verbatim; if no, identify
-     the delta (header version? format-id remap?).
-   - **Texture-name resolution for cross-car ports**: donor's archive
-     has its own texture set; source's textures need to splice in
-     under names the donor's shaders expect. FH1 also ships
-     `extraXdsBuckets` (`interior_emissive_LOD0`, `zlights`) that FM4
-     doesn't — handle missing/extra buckets explicitly.
-3. **LZX encoder + carbin transcode + DB patcher** (already-tracked
-   Phase 2b work) — the bytes-on-the-wire side. Independent of the LOD
-   and texture work above; can run in parallel.
+The cross-game port lands as a **two-stage workflow**: source-game car
+→ `working/<slug>/` (already exists as `import`), then
+`working/<slug>/` → target-game archive (new verb, e.g.
+`port-to <working-car> <target-game-id> --donor <donor-slug>`).
+Keeping the two stages separate lets the user inspect the working tree
+between import and port, swap donors without re-importing, and reuses
+the existing `export-to` plumbing for same-game writes.
+
+1. **~~Texture encode + cross-game port plan~~ — done 2026-05-01.**
+   190/190 byte-size match on encode roundtrip; 16/16 structurally-
+   identical bucket sets; mixed-method zip writer ships dirty entries
+   as method-0 today.
+2. **Carbin transcode (TypeId 3 ↔ TypeId 5)** — the real Phase 2b
+   blocker. The byte-level deltas between the two TypeIds are mapped
+   in `FH1_CARBIN_TYPEID5.md` and `FM4_CARBIN_MASTER.md`; what's
+   missing is the writer that takes a parsed FM4 carbin and emits an
+   FH1 carbin (and vice-versa). Strategy is locked to **Option C
+   hybrid donor splice**: donor's scaffolding (header / expanded-
+   middle table / unknown per-section fields / cvFive +8 sub-skip /
+   `m_NumBoneWeights` pre-pool block / `lod0VCount × 4` post-pool
+   stream) stays; the source car's section bytes (vertex pool, index
+   pool, transform, bounds) are re-quantized into the donor's slots.
+   - Scope: main carbin first; `<car>_lod0.carbin` + `_cockpit.carbin`
+     follow the same pattern; `stripped_*.carbin` and the 4×caliper /
+     4×rotor LOD0s pass through verbatim from the donor.
+   - Validation tiers per `feedback_validation_strategy.md`:
+     codec roundtrip + structural invariants + donor shape-check +
+     in-game load test. NOT byte-equal vs. an on-disk paired car.
+3. **DB row patch** — the per-car snippet captured at import
+   (`working/<slug>/cardb.json`, ~6 tables on FH1, ~5 on FM4) is the
+   payload; `port-to` patches it into the target's `gamedb.slt` using
+   the donor's existing row as the template. FK chains (PowertrainID
+   → Powertrains, EngineID → Combo_Engines, TorqueCurveID →
+   List_TorqueCurve) are followed only for tables the source's
+   snippet references; everything else inherits the donor's value.
+   For the 9 FH1-only `Data_Car` columns (`OffRoadEnginePowerScale`,
+   `IsRentable`, `IsSelectable`, `Specials`, …) and the `E3Drivers`
+   table that FM4 lacks, the donor's values pass through unchanged.
+4. **Wire the verbs**:
+   - `import <car.zip> --out working/` (already exists) — source-game
+     car → `working/<slug>/`.
+   - `port-to <working-car> <target-game-id> --donor <donor-slug>`
+     (new) — `working/<slug>/` → target-game archive on disk, in one
+     atomic step. Internally: load donor's archive as the scaffold,
+     run carbin transcode for each carbin in `working/<slug>/geometry/`,
+     splice texture bucket plan, copy donor's `physicsdefinition.bin`
+     and `stripped_*.carbin` verbatim, patch the target's gamedb.slt
+     row from `working/<slug>/cardb.json` keyed on the donor.
+   - Same-game writes keep using `export-to` (the existing mixed-
+     method zip path).
+5. **LZX encoder** — still gated on the wimlib match-finder /
+   recent_offsets streaming patch (project memory "LZX encoder
+   partial"). Until that lands, `port-to` and `export-to` both rely on
+   the mixed-method writer (method-21 verbatim for unchanged entries,
+   method-0 stored for edited/transcoded entries). The in-game test
+   on this method-0 path is the next data point.
 
 ## Done
 
@@ -223,44 +291,71 @@ architecture phases got reordered as we discovered things.
 
 ## In progress / open
 
-### Phase 2c.3 — Texture re-encode + porting (see "Where we stopped" above for full scope)
-Three sub-pieces queued; not started:
-- PNG → BC1/BC3 via `stb_dxt.h` + Xenon retile + `.xds` header rewrite.
-- Cross-game `.xds` container compat verification (FM4 ↔ FH1).
-- Cross-car texture-name resolution against donor's shader name-set,
-  including FH1's `extraXdsBuckets`.
+### Phase 2c.3 — Texture re-encode + porting — **done 2026-05-01**
+- PNG → BC1/3/5 via `stb_dxt`, Xenon retile, header rewriter,
+  mip-chain regeneration with `inferMipCount` for byte-size parity.
+  190/190 paired samples roundtrip byte-size match; avg meanΔ
+  0.134/255.
+- Cross-game `.xds` container compat verified empirically:
+  `probe/probe_xds_pair_diff.py` shows 0 header / 0 size deltas
+  across 22 shared buckets × 8 sample cars.
+- `core/texture_port.nim` builds a `TexturePortPlan` with copy-source
+  / splice-donor / drop-extra ops, reading `extraXdsBuckets` from the
+  target profile. `probe/nim_xds_port_validate.bin` confirms 16/16
+  structurally-identical bucket sets across paired sample cars in
+  both port directions.
+- New CLI verbs: `decode-xds`, `encode-xds`, `reencode-textures`.
 
-### Phase 2b — FM4 ↔ FH1 export
-- LZX encoder via wimlib's `lzx_compress` (libmspack ships no encoder;
-  `vendor/libmspack/.../lzxc.c` is `/* todo */`). Decoder stays on
-  libmspack `lzxd` — wimlib's decoder is WIM-LZX-restricted and isn't
-  a fit for CAB-LZX bitstreams. Two libs, each used for what it does
-  well; see project memory "LZX library split".
-- Carbin transcode (TypeId 2 ↔ TypeId 5) using deltas in
-  `FH1_CARBIN_TYPEID5.md` §"Practical implications for porting".
-  Strategy = **Option C hybrid donor splice**: donor scaffolding
-  (header / expanded-middle table / unknown per-section fields), source
-  sections re-quantized in. Same approach extends to `<car>_lod0.carbin`
-  and `<car>_cockpit.carbin` once the FH1 RE for those files lands;
-  donor passthrough is the fallback until then.
-- **Validation is structural, not byte-equal-vs-on-disk.** ALF_8C_08
-  ships in both rosters, but the two games carry independently-authored
-  art passes, mesh re-exports, and DB tunings — bit-comparing our
-  ported FH1 zip against the existing on-disk FH1 ALF_8C_08 is
-  unreachable and not the right bar. Validation tiers: (1) codec
-  roundtrip stability through OUR pipeline = byte-equal; (2) structural
-  invariants (output re-parses, sections preserved, headers well-formed,
-  vertex pools valid, indices in range, DB rows respect schema);
-  (3) donor cross-check on structural shape only (section counts,
-  header field shapes, expected named sections present); (4) in-game
-  load test — the only ground truth.
-- `physicsdefinition.bin` **passthrough from a donor** — locked
-  decision 2026-05-01. We do NOT synthesize a fresh bin. The export
-  dialog asks the user to pick a "close-enough" donor car from FH1's
-  roster (e.g. Murciélago for a ported Gallardo, Raptor for a new
-  pickup truck) and the donor's bin is copied verbatim into the new
-  archive. Same passthrough applies to `stripped_*.carbin`. Details:
-  `FH1_PHYSICSDEFINITION_BIN.md` §"Donor-bin strategy".
+### Phase 2b — FM4 ↔ FH1 export — **in progress 2026-05-01**
+
+The locked workflow is two-stage: `import` → `working/` (existing),
+then `port-to <working-car> <target-game-id> --donor <donor-slug>`
+(new). Inside `port-to`:
+
+1. **Carbin transcode (TypeId 3 ↔ TypeId 5)** — *next*. Donor's
+   archive is the scaffold; for each carbin in
+   `working/<slug>/geometry/`, the source's section bytes
+   (vertex/index pools, transform, bounds, m_UVOffsetScale) are
+   re-quantized into the donor's TypeId-flavored layout. Donor keeps
+   ownership of the per-Carbin scaffolding the source can't supply
+   (cvFive header expansion, +8 sub-skip, expanded middle table,
+   `m_NumBoneWeights` pre-pool block, FH1's `lod0VCount × 4` post-pool
+   stream). `stripped_*.carbin` and caliper / rotor LOD0s pass
+   through verbatim. Scope ordering: main first, then lod0 / cockpit.
+2. **Texture splice** — already wired; just call
+   `planTexturePort(source, donor, sourceProfile, targetProfile)` and
+   apply each op against the donor archive.
+3. **DB row patch** — apply `working/<slug>/cardb.json` to the target
+   game's `gamedb.slt` using the donor's row as the template.
+   `Data_Car` keyed on `MediaName`; child tables (`Data_Engine`,
+   `List_Wheels`, `CameraOverrides`, `CarExceptions`) keyed via the
+   per-car ID columns we already capture on import. The 9 FH1-only
+   columns + the `E3Drivers` table inherit the donor's values when
+   porting from FM4. FK chains followed only for tables the snippet
+   references.
+4. **`physicsdefinition.bin` + `stripped_*.carbin`** — verbatim
+   passthrough from donor (locked policy in
+   `FH1_PHYSICSDEFINITION_BIN.md` §"Donor-bin strategy"). FH1
+   exports always need both; FM4 exports skip them.
+5. **LZX encoder** — wimlib lzx_compress wired (single-chunk works,
+   multi-chunk gated on match-finder/recent_offsets streaming
+   patches). Until that lands, `port-to` uses the mixed-method
+   writer: unchanged donor entries pass method-21 verbatim, source-
+   substituted entries (transcoded carbins, ported textures) emit as
+   method-0. Whether the FH1 / FM4 runtime accepts a heavily-method-0
+   archive is the next data point worth gathering.
+
+**Validation is structural, not byte-equal-vs-on-disk.** ALF_8C_08
+ships in both rosters, but the two games carry independently-
+authored art passes, mesh re-exports, and DB tunings — bit-
+comparing our ported FH1 zip against the existing on-disk FH1
+ALF_8C_08 is unreachable and not the right bar. Validation tiers:
+(1) codec roundtrip stability through OUR pipeline = byte-equal;
+(2) structural invariants (output re-parses, sections preserved,
+headers well-formed, vertex pools valid, indices in range, DB rows
+respect schema); (3) donor cross-check on structural shape only
+(section counts, header field shapes, expected named sections
+present); (4) in-game load test — the only ground truth.
 
 ### CLI safety layer (Phase 2.5, landed 2026-05-01)
 Pre-UI primitives that get the data model and safety guarantees right

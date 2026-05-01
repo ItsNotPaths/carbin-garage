@@ -1,0 +1,107 @@
+diff --git a/src/lzx_compress.c b/src/lzx_compress.c
+index 7ba74f6..b4ec52a 100644
+--- a/src/lzx_compress.c
++++ b/src/lzx_compress.c
+@@ -373,6 +373,12 @@ struct lzx_compressor {
+ 	 * compresses the data successfully */
+ 	bool destructive;
+ 
++	/* CAB-LZX patch (carbin-garage): emit the 1-bit "E8 disabled"
++	 * stream preamble on the first compress() call only.  Forza
++	 * Method-21 chunked streams expect exactly one preamble at the
++	 * very start of the entire entry's bitstream. */
++	bool cab_first_chunk;
++
+ 	/* Pointer to the compress() implementation chosen at allocation time */
+ 	void (*impl)(struct lzx_compressor *, const u8 *, size_t,
+ 		     struct lzx_output_bitstream *);
+@@ -1108,16 +1114,14 @@ lzx_write_compressed_block(const u8 *block_begin,
+ 	 * allocated to be capable of compressing more than 32768 bytes at once
+ 	 * (which also causes the number of main symbols to be increased).
+ 	 */
+-	if (block_size == LZX_DEFAULT_BLOCK_SIZE) {
+-		lzx_write_bits(os, 1, 1);
+-	} else {
+-		lzx_write_bits(os, 0, 1);
+-
+-		if (window_order >= 16)
+-			lzx_write_bits(os, block_size >> 16, 8);
+-
+-		lzx_write_bits(os, block_size & 0xFFFF, 16);
+-	}
++	/* CAB-LZX patch (carbin-garage): flat 24-bit block size, split
++	 * 16+8 the way libmspack lzxd reads it
++	 * (READ_BITS(i, 16); READ_BITS(j, 8); length = (i << 8) | j).
++	 * Original WIM-style 1-bit-default-flag encoding is incompatible.
++	 * See patches/wimlib_lzx_cab_compat.patch. */
++	(void)window_order;
++	lzx_write_bits(os, (block_size >> 8) & 0xFFFF, 16);
++	lzx_write_bits(os, block_size & 0xFF, 8);
+ 
+ 	/* If it's an aligned offset block, output the aligned offset code.  */
+ 	if (block_type == LZX_BLOCKTYPE_ALIGNED) {
+@@ -2893,6 +2897,14 @@ lzx_create_compressor(size_t max_bufsize, unsigned compression_level,
+ 	/* Prepare the offset => offset slot mapping. */
+ 	lzx_init_offset_slot_tabs(c);
+ 
++	/* CAB-LZX patch (carbin-garage): one-time init of the codeword-
++	 * length state.  Compress() relies on prev_lens persisting across
++	 * calls so chunk N+1 can delta-code against chunk N's last block;
++	 * see the matching patch site in lzx_compress(). */
++	c->codes_index = 0;
++	memset(&c->codes[1].lens, 0, sizeof(struct lzx_lens));
++	c->cab_first_chunk = true;
++
+ 	*c_ret = c;
+ 	return 0;
+ 
+@@ -2923,27 +2935,38 @@ lzx_compress(const void *restrict in, size_t in_nbytes,
+ 		in = c->in_buffer;
+ 	}
+ 
+-	/* Preprocess the input data. */
+-	lzx_preprocess((void *)in, in_nbytes);
+-
+-	/* Initially, the previous Huffman codeword lengths are all zeroes. */
+-	c->codes_index = 0;
+-	memset(&c->codes[1].lens, 0, sizeof(struct lzx_lens));
++	/* CAB-LZX patch (carbin-garage): skip E8 preprocessing.  Forza
++	 * Method-21 streams advertise "E8 disabled" via a leading 0 bit
++	 * (emitted below) and libmspack lzxd will not undo a transform
++	 * unless that bit is 1.  See patches/wimlib_lzx_cab_compat.patch.
++	 *
++	 * The codes_index / prev_lens reset that originally lived here has
++	 * moved to lzx_create_compressor — Forza streams chunk-by-chunk
++	 * with persistent Huffman state (delta-coded against the previous
++	 * chunk's last block), so the encoder must NOT zero prev_lens on
++	 * each compress() call. */
+ 
+ 	/* Initialize the output bitstream. */
+ 	lzx_init_output(&os, out, out_nbytes_avail);
+ 
++	/* CAB-LZX preamble: 1-bit "E8 enabled" flag, written before any
++	 * block headers, ONLY on the first compress() call for this
++	 * compressor.  We always advertise disabled because we don't
++	 * preprocess.  Subsequent chunks must NOT emit it again — the
++	 * decoder only reads the preamble once. */
++	if (c->cab_first_chunk) {
++		lzx_write_bits(&os, 0, 1);
++		c->cab_first_chunk = false;
++	}
++
+ 	/* Call the compression level-specific compress() function. */
+ 	(*c->impl)(c, in, in_nbytes, &os);
+ 
+ 	/* Flush the output bitstream. */
+ 	result = lzx_flush_output(&os);
+ 
+-	/* If the data did not compress to less than its original size and we
+-	 * preprocessed the original buffer, then postprocess it to restore it
+-	 * to its original state. */
+-	if (result == 0 && c->destructive)
+-		lzx_postprocess((void *)in, in_nbytes);
++	/* CAB-LZX patch (carbin-garage): no preprocess was applied, so no
++	 * postprocess is needed even when result == 0.  Return as-is. */
+ 
+ 	/* Return the number of compressed bytes, or 0 if the input did not
+ 	 * compress to less than its original size. */

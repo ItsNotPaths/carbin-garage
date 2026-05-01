@@ -9,6 +9,9 @@ import ./orchestrator/importwc
 import ./orchestrator/scan
 import ./orchestrator/mount as mountop
 import ./orchestrator/exportto
+import ./orchestrator/portto
+import ./orchestrator/patchxex
+import ./core/xex2_patches
 
 const
   NAME = "carbin-garage"
@@ -96,6 +99,32 @@ usage:
                                             <target>.bak already exists.
                                             --dry-run prints the plan
                                             without touching disk.
+  carbin-garage port-to <working-car> <target-game-id> --donor <donor-slug>
+                                            [--name <new-slug>] [--dry-run]
+                                            [--replace-db]
+                                            Cross-game port. Donor's archive
+                                            scaffolds the export; source's
+                                            textures + carbin slots are
+                                            spliced in (v0: carbins are
+                                            donor-verbatim, real transcode
+                                            lands in Slice B). DB row is
+                                            patched into target gamedb.slt
+                                            using donor's row as template;
+                                            BaseCost=1 forced. Atomic zip
+                                            write via tmp + .bak rename.
+                                            --replace-db deletes any
+                                            existing rows for the new
+                                            MediaName before insert.
+  carbin-garage patch-xex <path-to-default.xex> [--dry-run] [--restore]
+                                            Patch the FH1 default.xex to disable
+                                            integrity checks for moddable files
+                                            (gamedb.slt + 8 media zips). Required
+                                            before any port-to deploy can load
+                                            in-game without dirty-disc errors.
+                                            10-site, 66-byte patch in .rdata.
+                                            Atomic: <xex>.vanillabak holds the
+                                            original. --restore swaps the bak
+                                            back over the active xex.
   carbin-garage diff <a.zip> <b.zip>        (Phase 1, TODO)
 """
 
@@ -359,6 +388,80 @@ proc cmdMounts(args: seq[string]) =
     let exists = dirExists(m.folder)
     echo "  ", m.gameId, "  ", m.folder, (if exists: "" else: "  [missing]")
 
+proc cmdPatchXex(args: seq[string]) =
+  if args.len == 0:
+    echo "patch-xex: missing <path-to-default.xex>"; quit 1
+  let xexPath = args[0]
+  let restore = "--restore" in args
+  let dryRun = "--dry-run" in args
+  if restore:
+    try:
+      executeRestore(xexPath)
+      echo "restored vanilla xex at ", xexPath
+    except PatchXexError as e:
+      echo "patch-xex: ", e.msg; quit 1
+    return
+  let plan =
+    try: planPatch(xexPath, Fh1IntegrityBypassPatch)
+    except PatchXexError as e:
+      echo "patch-xex: ", e.msg; quit 1
+  echo "patch-xex: ", plan.patchSet.name
+  stdout.write describePlan(plan)
+  if dryRun:
+    echo "  (dry-run — no files touched)"
+    return
+  if plan.allSitesAlreadyPatched:
+    echo "  no-op (already patched)"
+    return
+  try:
+    executePatch(plan)
+  except PatchXexError as e:
+    echo "patch-xex: ", e.msg; quit 1
+  echo "  wrote ", xexPath, "  (vanilla saved at ", plan.backupPath, ")"
+
+proc cmdPortTo(args: seq[string]) =
+  if args.len < 2:
+    echo "port-to: missing <working-car> <target-game-id>"; quit 1
+  let workingCar = args[0]
+  let gameId = args[1]
+  let donor = parseFlag(args, "--donor")
+  if donor.len == 0:
+    echo "port-to: --donor <donor-slug> is required"
+    echo "  (the donor must be a real car already shipping in the target game)"
+    quit 1
+  let newName = parseFlag(args, "--name")
+  let dryRun = "--dry-run" in args
+  let replaceDb = "--replace-db" in args
+  let fromDonorOnly = "--from-donor-only" in args
+  let noEntryRename = "--no-entry-rename" in args
+  let all = loadMounts()
+  let i = findMount(all, gameId)
+  if i < 0:
+    echo "port-to: no mount registered for game-id '", gameId, "'"
+    echo "  (run: carbin-garage mount <game-folder>)"
+    quit 1
+  let prof = loadProfileById(gameId)
+  let plan =
+    try: planPort(workingCar, all[i], prof, donor, newName, fromDonorOnly, noEntryRename)
+    except PortError as e:
+      echo "port-to: ", e.msg; quit 1
+  echo "port-to [", gameId, "]: ", plan.sourceSlug, " -> ", plan.newSlug,
+       "  (donor: ", plan.donorSlug, ")"
+  stdout.write describePlan(plan)
+  if dryRun:
+    echo "  (dry-run — no files touched)"
+    return
+  try:
+    executePort(plan, replaceDb = replaceDb)
+  except PortError as e:
+    echo "port-to: ", e.msg; quit 1
+  if plan.targetExists:
+    echo "  wrote ", plan.targetZip, " (previous saved at ", plan.backupPath, ")"
+  else:
+    echo "  wrote ", plan.targetZip
+  if plan.targetGamedb.len > 0:
+    echo "  patched ", plan.targetGamedb
+
 proc cmdExportTo(args: seq[string]) =
   if args.len < 2:
     echo "export-to: missing <working-car> <game-id>"; quit 1
@@ -424,6 +527,10 @@ proc main*() =
     cmdMounts(rest)
   of "export-to":
     cmdExportTo(rest)
+  of "port-to":
+    cmdPortTo(rest)
+  of "patch-xex":
+    cmdPatchXex(rest)
   else:
     echo "TODO: command '" & cmd & "' not yet implemented"
     quit(1)
