@@ -41,12 +41,36 @@ fetch "sdl3_ttf" \
     "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-3.2.2.tar.gz" \
     "$VENDOR/sdl3_ttf"
 
-echo "==> libmspack"
+PATCHES_DIR="$(cd "$(dirname "$0")" && pwd)/patches"
+
+# Two LZX libraries, each used for what it does well:
+#   * libmspack lzxd — Microsoft CAB-LZX decoder (Forza Method-21 native)
+#   * wimlib lzx_compress — LGPL LZX encoder (wimlib's own decoder is the
+#     WIM-restricted variant and isn't a fit for CAB-LZX bitstreams).
+# Total vendored footprint is comparable to a wimlib-only setup with a
+# growing patch series, with zero integration risk on the decoder.
+echo "==> libmspack (CAB-LZX decoder)"
 if [ -d "$VENDOR/libmspack" ] && [ -n "$(ls -A "$VENDOR/libmspack" 2>/dev/null)" ]; then
     echo "  already present: libmspack"
 else
     echo "  cloning libmspack..."
     git clone --depth=1 "https://github.com/kyz/libmspack.git" "$VENDOR/libmspack"
+    echo "  done."
+fi
+
+echo "==> wimlib (LZX encoder)"
+if [ -d "$VENDOR/wimlib" ] && [ -n "$(ls -A "$VENDOR/wimlib" 2>/dev/null)" ]; then
+    echo "  already present: wimlib"
+else
+    echo "  cloning wimlib..."
+    git clone --depth=1 "https://github.com/ebiggers/wimlib.git" "$VENDOR/wimlib"
+    if ls "$PATCHES_DIR"/wimlib_*.patch >/dev/null 2>&1; then
+        echo "  applying patches..."
+        for p in "$PATCHES_DIR"/wimlib_*.patch; do
+            echo "    $(basename "$p")"
+            (cd "$VENDOR/wimlib" && git apply "$p")
+        done
+    fi
     echo "  done."
 fi
 

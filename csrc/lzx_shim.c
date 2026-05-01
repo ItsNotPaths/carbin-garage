@@ -3,8 +3,14 @@
  * Forza Method-21 zip entries are LZX with chunked framing; the caller
  * (zip21.nim) strips the framing and passes a contiguous LZX bitstream.
  * This shim runs lzxd_decompress on that bitstream into a caller-owned
- * output buffer. Window_bits=17, reset_interval=0 — verified against
+ * output buffer. Window_bits=17, reset_interval=0 — verified across
  * every Forza FM4/FH1 archive. See docs/FORZA_LZX_FORMAT.md.
+ *
+ * Note: the encoder side will live in csrc/lzx_deflate.c against
+ * wimlib's lzx_compress. libmspack does not ship an LZX encoder
+ * (lzxc.c is a 22-year-old stub); wimlib does, but its decoder is the
+ * WIM-restricted LZX variant and was an awkward fit for CAB-LZX
+ * bitstreams. Two libs, each used for what it does well.
  */
 #include <stddef.h>
 #include <string.h>
