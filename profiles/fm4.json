@@ -1,0 +1,21 @@
+{
+  "id": "fm4",
+  "displayName": "Forza Motorsport 4",
+  "titleId": "4D530910",
+  "contentId": "33E7B39F",
+  "cars": "Media/cars",
+  "casing": "Mixed",
+  "carbinTypeId": 3,
+  "carbinHeaderLen": 920,
+  "requiresStripped": false,
+  "requiresPhysicsBin": false,
+  "requiresVersionData": true,
+  "extraXdsBuckets": [],
+  "gamedbPath": "Media/db/gamedb.slt",
+  "dbStrategy": "SqlitePatch",
+  "indexBufferVersion": 3,
+  "colVersion": 2,
+  "rmbBinVersion": 6,
+  "canUnbundle": true,
+  "canBundle": true
+}

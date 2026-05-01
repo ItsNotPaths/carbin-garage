@@ -68,5 +68,32 @@ else
     echo "  done."
 fi
 
+echo "==> stb (image_write + dxt)"
+mkdir -p "$VENDOR/stb"
+for h in stb_image_write.h stb_dxt.h; do
+    if [ -f "$VENDOR/stb/$h" ]; then
+        echo "  already present: $h"
+    else
+        echo "  downloading $h..."
+        curl -fsSL "https://raw.githubusercontent.com/nothings/stb/master/$h" \
+            -o "$VENDOR/stb/$h"
+        echo "  done."
+    fi
+done
+
+FONT="$VENDOR/fonts/SpaceMono-Regular.ttf"
+
+echo "==> SpaceMono-Regular.ttf"
+mkdir -p "$VENDOR/fonts"
+if [ ! -f "$FONT" ]; then
+    echo "  downloading..."
+    curl -fsSL \
+        "https://github.com/googlefonts/spacemono/raw/main/fonts/ttf/SpaceMono-Regular.ttf" \
+        -o "$FONT"
+    echo "  done."
+else
+    echo "  already present: SpaceMono-Regular.ttf"
+fi
+
 echo ""
 echo "All deps ready."

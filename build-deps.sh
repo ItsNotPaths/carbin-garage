@@ -93,7 +93,7 @@ build_one() {
 
     local bdir="$OUT/build-$name"
     echo "==> building $name ($TARGET)"
-    cmake -S "$src" -B "$bdir" -G Ninja "${CMAKE_BASE_FLAGS[@]}" "${extra[@]}"
+    cmake -S "$src" -B "$bdir" -G "Unix Makefiles" "${CMAKE_BASE_FLAGS[@]}" "${extra[@]}"
     cmake --build "$bdir" --parallel "$NCPU"
     cmake --install "$bdir"
 }

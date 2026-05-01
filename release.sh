@@ -7,11 +7,20 @@ RELEASE_DIR="$(cd "$PROJECT_DIR/.." && pwd)/${PROJECT_NAME}-release"
 
 usage() {
     cat <<EOF
-usage: $(basename "$0") --local [--target linux|windows]
+usage: $(basename "$0") --local [--target linux|windows] [--skip-deps] [--clear-working]
        $(basename "$0") --public --version vX.Y.Z [--notes "text"]
 
-  --local                       build locally into <project>-release/<target>/
+  --local                       build locally into <project>-release/<target>/.
+                                Overwrites the binary, LICENSE, README, and
+                                profiles/. Preserves working/ and any other
+                                user-side files in the release dir between runs.
   --target linux|windows        build target (default: linux). windows = mingw-w64 cross.
+  --skip-deps                   skip download-deps.sh + build-deps.sh (Phase-1
+                                builds don't link SDL3 yet, so the .a files
+                                aren't required).
+  --clear-working               wipe <project>-release/<target>/working/ before
+                                staging. Use when a code change makes existing
+                                working/ trees stale and you want a clean slate.
   --public                      trigger release.yml workflow via gh CLI
   --version <tag>               required when --public is used
   --notes <text>                optional release notes
@@ -23,15 +32,19 @@ DO_PUBLIC=0
 TARGET="linux"
 VERSION=""
 NOTES=""
+SKIP_DEPS=0
+CLEAR_WORKING=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --local)   DO_LOCAL=1; shift ;;
-        --public)  DO_PUBLIC=1; shift ;;
-        --target)  TARGET="${2:-}"; shift 2 ;;
-        --version) VERSION="${2:-}"; shift 2 ;;
-        --notes)   NOTES="${2:-}"; shift 2 ;;
-        -h|--help) usage; exit 0 ;;
+        --local)          DO_LOCAL=1; shift ;;
+        --public)         DO_PUBLIC=1; shift ;;
+        --target)         TARGET="${2:-}"; shift 2 ;;
+        --version)        VERSION="${2:-}"; shift 2 ;;
+        --notes)          NOTES="${2:-}"; shift 2 ;;
+        --skip-deps)      SKIP_DEPS=1; shift ;;
+        --clear-working)  CLEAR_WORKING=1; shift ;;
+        -h|--help)        usage; exit 0 ;;
         *) echo "unknown flag: $1" >&2; usage; exit 1 ;;
     esac
 done
@@ -48,20 +61,30 @@ if [ $DO_LOCAL -eq 1 ]; then
     DEST="$RELEASE_DIR/$TARGET"
     echo "==> Local build ($TARGET): $PROJECT_NAME -> $DEST"
 
-    # Fetch + build vendored deps if missing.
-    if [ ! -d "$PROJECT_DIR/vendor/sdl3" ]; then
-        echo "  vendor missing; running download-deps.sh"
-        "$PROJECT_DIR/download-deps.sh"
+    # Fetch + build vendored deps if missing. --skip-deps bypasses
+    # build-deps.sh entirely (Phase 1 doesn't link SDL3, so the .a's
+    # aren't needed yet).
+    if [ $SKIP_DEPS -eq 0 ]; then
+        if [ ! -d "$PROJECT_DIR/vendor/sdl3" ]; then
+            echo "  vendor missing; running download-deps.sh"
+            "$PROJECT_DIR/download-deps.sh"
+        fi
+        "$PROJECT_DIR/build-deps.sh" --target "$TARGET"
+    else
+        echo "  --skip-deps: not running build-deps.sh"
     fi
-    "$PROJECT_DIR/build-deps.sh" --target "$TARGET"
 
     # Enumerate every .a in vendor/build/<target>/lib/ and pass to the linker
     # inside --start-group/--end-group so circular references resolve.
+    # Empty if --skip-deps and the .a's haven't been built — that's fine for
+    # Phase-1 builds with no SDL3 imports.
     cd "$PROJECT_DIR"
     PASSL_ARGS=("--passL:-Wl,--start-group")
-    for lib in "vendor/build/$TARGET/lib"/*.a; do
-        PASSL_ARGS+=("--passL:$lib")
-    done
+    if [ -d "vendor/build/$TARGET/lib" ]; then
+        for lib in "vendor/build/$TARGET/lib"/*.a; do
+            [ -f "$lib" ] && PASSL_ARGS+=("--passL:$lib")
+        done
+    fi
     PASSL_ARGS+=("--passL:-Wl,--end-group")
 
     if [ "$TARGET" = "windows" ]; then
@@ -75,16 +98,28 @@ if [ $DO_LOCAL -eq 1 ]; then
         nimble -y build -d:release "${PASSL_ARGS[@]}"
     fi
 
-    # Stage release: binary + LICENSE + README + profiles + shaders.
-    # working/ and settings.json are NOT staged — the binary creates them on
-    # first run next to itself.
-    rm -rf "$DEST"
+    # Stage release: overwrite only the files we own (binary, LICENSE,
+    # README, profiles/, shaders/). Preserve working/ and any other
+    # user-side state — `rm -rf "$DEST"` would blow up imports between
+    # rebuilds. Use --clear-working to drop working/ explicitly.
     mkdir -p "$DEST"
-    cp "$PROJECT_DIR/build/${BIN_NAME}" "$DEST/"
-    [ -f "$PROJECT_DIR/README.md" ] && cp "$PROJECT_DIR/README.md" "$DEST/" || true
-    [ -f "$PROJECT_DIR/LICENSE" ]   && cp "$PROJECT_DIR/LICENSE"   "$DEST/" || true
-    [ -d "$PROJECT_DIR/profiles" ]  && cp -r "$PROJECT_DIR/profiles" "$DEST/" || true
-    [ -d "$PROJECT_DIR/shaders" ]   && cp -r "$PROJECT_DIR/shaders"  "$DEST/" || true
+    if [ $CLEAR_WORKING -eq 1 ] && [ -d "$DEST/working" ]; then
+        echo "  --clear-working: removing $DEST/working"
+        rm -rf "$DEST/working"
+    fi
+    cp -f "$PROJECT_DIR/build/${BIN_NAME}" "$DEST/"
+    [ -f "$PROJECT_DIR/README.md" ] && cp -f "$PROJECT_DIR/README.md" "$DEST/" || true
+    [ -f "$PROJECT_DIR/LICENSE" ]   && cp -f "$PROJECT_DIR/LICENSE"   "$DEST/" || true
+    # profiles/ and shaders/: refresh contents (overwrite same-named files,
+    # add new ones) without nuking unrelated files a user may have dropped in.
+    if [ -d "$PROJECT_DIR/profiles" ]; then
+        mkdir -p "$DEST/profiles"
+        cp -f "$PROJECT_DIR/profiles/"* "$DEST/profiles/" 2>/dev/null || true
+    fi
+    if [ -d "$PROJECT_DIR/shaders" ]; then
+        mkdir -p "$DEST/shaders"
+        cp -rf "$PROJECT_DIR/shaders/"* "$DEST/shaders/" 2>/dev/null || true
+    fi
 
     echo "==> Local done: $DEST"
 fi

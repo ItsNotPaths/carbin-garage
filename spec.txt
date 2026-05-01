@@ -5,3 +5,4 @@ SDL3_TTF
 libmspack
 cgltf
 bcdec
+space_mono

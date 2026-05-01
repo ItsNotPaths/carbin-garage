@@ -1,0 +1,21 @@
+{
+  "id": "fh1",
+  "displayName": "Forza Horizon 1",
+  "titleId": "4D5309C9",
+  "contentId": "2DC7007B",
+  "cars": "media/cars",
+  "casing": "Lower",
+  "carbinTypeId": 5,
+  "carbinHeaderLen": 1244,
+  "requiresStripped": true,
+  "requiresPhysicsBin": true,
+  "requiresVersionData": false,
+  "extraXdsBuckets": ["interior_emissive_LOD0", "zlights"],
+  "gamedbPath": "media/db/gamedb.slt",
+  "dbStrategy": "PerCarBin",
+  "indexBufferVersion": 3,
+  "colVersion": 4,
+  "rmbBinVersion": 6,
+  "canUnbundle": false,
+  "canBundle": false
+}
