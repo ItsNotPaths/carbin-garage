@@ -1,5 +1,4 @@
 vendor/
-docs/
 probe/*
 
 # Nim build outputs

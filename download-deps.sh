@@ -92,9 +92,9 @@ else
     echo "  done."
 fi
 
-echo "==> stb (image_write + dxt)"
+echo "==> stb (image + image_write + dxt)"
 mkdir -p "$VENDOR/stb"
-for h in stb_image_write.h stb_dxt.h; do
+for h in stb_image.h stb_image_write.h stb_dxt.h; do
     if [ -f "$VENDOR/stb/$h" ]; then
         echo "  already present: $h"
     else

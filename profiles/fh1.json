@@ -10,7 +10,7 @@
   "requiresStripped": true,
   "requiresPhysicsBin": true,
   "requiresVersionData": false,
-  "extraXdsBuckets": ["interior_emissive_LOD0", "zlights"],
+  "extraXdsBuckets": ["interior_emissive_LOD0", "zlights_LOD0", "zlights"],
   "gamedbPath": "media/db/gamedb.slt",
   "dbStrategy": "PerCarBin",
   "indexBufferVersion": 3,
