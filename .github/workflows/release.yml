@@ -1,0 +1,232 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        type: string
+      notes:
+        description: 'Release notes'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PROJECT_NAME: carbin-garage
+  NIM_VERSION: '2.2.8'
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Linux build (native).
+  # Runs inside ubuntu:20.04 to floor the binary at glibc 2.31. This covers
+  # Ubuntu 20.04+, Debian 11+, Steam Deck (glibc 2.33), and any rolling distro.
+  # Mirrors docker-build/Dockerfile — keep both in sync.
+  # ──────────────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        # SDL3 dlopen()s display/audio backends at runtime, but the cmake configure
+        # needs the dev headers to *enable* those backends. SDL3_image / SDL3_ttf
+        # use VENDORED=ON (libpng/freetype/etc. compiled inline as static libs)
+        # so we don't need any of those system libs.
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential cmake ninja-build curl git pkg-config ca-certificates xz-utils \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
+            libxi-dev libxfixes-dev libxcursor-dev libxss-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libdbus-1-dev libibus-1.0-dev libudev-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libglvnd-dev \
+            libvulkan-dev \
+            glslang-tools
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        run: |
+          curl -L "https://nim-lang.org/download/nim-${NIM_VERSION}-linux_x64.tar.xz" \
+            | tar xJ -C /opt
+          ln -sf /opt/nim-${NIM_VERSION}/bin/nim    /usr/local/bin/nim
+          ln -sf /opt/nim-${NIM_VERSION}/bin/nimble /usr/local/bin/nimble
+          nim --version
+
+      - name: Cache vendor/ (sources)
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-src-${{ hashFiles('download-deps.sh') }}
+
+      - name: Cache vendor/build/linux/ (compiled static libs)
+        uses: actions/cache@v4
+        with:
+          path: vendor/build/linux
+          key: vendor-build-linux-${{ hashFiles('build-deps.sh', 'download-deps.sh') }}
+
+      - name: Download deps
+        run: |
+          chmod +x ./download-deps.sh
+          ./download-deps.sh
+
+      - name: Build vendored C deps (SDL3 family, static, vendored sub-deps)
+        run: |
+          chmod +x ./build-deps.sh
+          ./build-deps.sh --target linux
+
+      - name: Build carbin-garage
+        # Enumerate every static .a inside vendor/build/linux/lib and pass them
+        # inside --start-group/--end-group so the linker resolves cycles.
+        run: |
+          PASSL_ARGS=("--passL:-Wl,--start-group")
+          for lib in vendor/build/linux/lib/*.a; do
+              PASSL_ARGS+=("--passL:$lib")
+          done
+          PASSL_ARGS+=("--passL:-Wl,--end-group")
+          nimble -y build -d:release "${PASSL_ARGS[@]}"
+
+      - name: Sanity check (binary type, glibc symbols)
+        run: |
+          file build/${PROJECT_NAME}
+          objdump -T build/${PROJECT_NAME} | grep GLIBC_ | sort -u || true
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp build/${PROJECT_NAME} dist/
+          [ -f README.md ] && cp README.md dist/ || true
+          [ -f LICENSE ]   && cp LICENSE   dist/ || true
+          [ -d profiles ]  && cp -r profiles dist/ || true
+          [ -d shaders ]   && cp -r shaders  dist/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-zip
+          path: dist
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Windows build via mingw-w64 cross-compile from Linux.
+  # Single CI image, deterministic. SDL3_image / SDL3_ttf use VENDORED=ON,
+  # so the .exe is fully self-contained.
+  # ──────────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential cmake ninja-build curl git pkg-config ca-certificates xz-utils \
+            mingw-w64 mingw-w64-tools
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        run: |
+          curl -L "https://nim-lang.org/download/nim-${NIM_VERSION}-linux_x64.tar.xz" \
+            | tar xJ -C /opt
+          ln -sf /opt/nim-${NIM_VERSION}/bin/nim    /usr/local/bin/nim
+          ln -sf /opt/nim-${NIM_VERSION}/bin/nimble /usr/local/bin/nimble
+          nim --version
+
+      - name: Cache vendor/ (sources)
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-src-${{ hashFiles('download-deps.sh') }}
+
+      - name: Cache vendor/build/windows/ (compiled static libs)
+        uses: actions/cache@v4
+        with:
+          path: vendor/build/windows
+          key: vendor-build-windows-${{ hashFiles('build-deps.sh', 'download-deps.sh') }}
+
+      - name: Download deps
+        run: |
+          chmod +x ./download-deps.sh
+          ./download-deps.sh
+
+      - name: Cross-build vendored C deps (Windows)
+        run: |
+          chmod +x ./build-deps.sh
+          ./build-deps.sh --target windows
+
+      - name: Cross-compile carbin-garage
+        run: |
+          PASSL_ARGS=("--passL:-Wl,--start-group")
+          for lib in vendor/build/windows/lib/*.a; do
+              PASSL_ARGS+=("--passL:$lib")
+          done
+          PASSL_ARGS+=("--passL:-Wl,--end-group")
+          nimble -y build -d:release --os:windows --cpu:amd64 -d:mingw \
+            --gcc.exe:x86_64-w64-mingw32-gcc \
+            --gcc.linkerexe:x86_64-w64-mingw32-gcc \
+            "${PASSL_ARGS[@]}"
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp build/${PROJECT_NAME}.exe dist/
+          [ -f README.md ] && cp README.md dist/ || true
+          [ -f LICENSE ]   && cp LICENSE   dist/ || true
+          [ -d profiles ]  && cp -r profiles dist/ || true
+          [ -d shaders ]   && cp -r shaders  dist/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Bundle both into a GitHub release.
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-zip
+          path: linux-zip
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+          path: windows-zip
+
+      - name: Package
+        run: |
+          (cd linux-zip   && zip -r "../${PROJECT_NAME}-linux.zip"   .)
+          (cd windows-zip && zip -r "../${PROJECT_NAME}-windows.zip" .)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${{ inputs.version }}" \
+              "${PROJECT_NAME}-linux.zip" \
+              "${PROJECT_NAME}-windows.zip" \
+              --title "${{ inputs.version }}" \
+              --notes "${{ inputs.notes }}" \
+              $PRERELEASE_FLAG

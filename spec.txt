@@ -1,0 +1,7 @@
+Nim GPLv3 public
+SDL3
+SDL3_IMAGE
+SDL3_TTF
+libmspack
+cgltf
+bcdec
