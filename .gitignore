@@ -5,5 +5,5 @@ probe/*
 build/
 nimcache/
 *.exe
-carbin-garage
-carbin_garage
+/carbin-garage
+/carbin_garage

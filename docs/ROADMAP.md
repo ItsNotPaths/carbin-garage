@@ -2,7 +2,23 @@
 
 Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01.
 
-**Latest (2026-05-01, end of day):** FH1 `<car>_lod0.carbin` and
+**Latest (2026-05-01, encode session):** Phase 2c.3 texture **encode**
++ structural **cross-game porting** complete. PNG → BC1/3/5 via
+`stb_dxt`, Xenon retile (inverse of decode), 8-in-16 endian swap, and
+`.xds` header rewriter all wired in `core/xds.nim`. Mip chain length is
+inferred from the original payload size so re-encoded files match
+byte-counts of the source — **190/190 paired sample .xds files
+round-trip with byte-equal file size and avg meanΔ = 0.134/255**
+(visually imperceptible). New CLI verbs `encode-xds` and
+`reencode-textures`; new module `core/texture_port.nim` planning
+cross-game splices. **`probe/nim_xds_port_validate.bin` confirms 16/16
+structurally-identical bucket sets** across FM4↔FH1 ports on the 8
+sample cars (donor = same-named car in target game). Phase 2c.3 +
+Phase 2c.4 (cross-game compat) both done structurally; the only
+remaining piece — splicing edited .xds back into the export zip — is
+gated on the LZX encoder (Phase 2b).
+
+**Earlier 2026-05-01:** FH1 `<car>_lod0.carbin` and
 `<car>_cockpit.carbin` parsing **complete** — the missing delta was an
 extra `lod0VCount × 4`-byte per-vertex stream (likely SHORT2N or
 DEC3N normals/tangents) after the §6 section tail. With it, all 8
@@ -40,17 +56,41 @@ architecture phases got reordered as we discovered things.
 - Per-subsection `m_UVOffsetScale` baked into the glTF; name-prefix
   shader → texture resolver in `core/texture_map.nim`.
 
-**Texture encode — deferred, not started**:
-- `stb_dxt.h` and `stb_image_write.h` are vendored.
-- PNG → BC1/BC3, Xenon retile (inverse of the import detile), and the
-  `.xds` header rewriter are NOT wired. Edits in
-  `working/<slug>/textures/*.xds.png` are currently invisible to
-  export — same-game `export-to` byte-equal-copies the original
-  `.archive/source.zip`, so PNG edits don't propagate.
-- Cross-game texture porting (FM4 ↔ FH1) is also not investigated.
-  Both games use the Xbox 360 `.xds` container with BC1/3/5, so the
-  byte container is *probably* directly interchangeable; verification
-  is part of the texture-porting work below.
+**Texture encode — done 2026-05-01**:
+- `stb_dxt.h` + `stb_image.h` + `stb_image_write.h` vendored;
+  `csrc/stb_dxt_impl.c` + `csrc/stb_image_impl.c` shim.
+- `core/xds.nim` carries the full encode pipeline: `encodePayload`
+  (one mip), `encodePayloadChain` (top + box-filter chain),
+  `inferMipCount` (back-derives chain length from original payload
+  size so byte parity holds), `rewriteXdsHeader` (preserves the
+  format-id literal — DXT4_5_AS_16 stays 53), and
+  `encodeXdsFromOriginal` (full splice).
+- New CLI verbs: `encode-xds <png> <orig.xds> [<out>] [--highqual]`
+  and `reencode-textures <working-car>` (sweeps a working tree for
+  PNG-newer-than-XDS).
+- Validated on 190 paired sample .xds across BC1/BC3/BC5 + their
+  AS_16 variants: 0 failures, 190/190 byte-size match, avg
+  meanΔ = 0.134/255, worst meanΔ = 0.332/255, max single-channel
+  delta = 50/255 (BC1 quantization edge case). See
+  `probe/nim_xds_roundtrip.nim`.
+- Splicing the re-encoded `.xds` back into the export zip is still
+  gated on the LZX encoder (Phase 2b). Until that lands, edits
+  update the working-tree `.xds` in place but `export-to` byte-copies
+  the original `.archive/source.zip`.
+
+**Cross-game texture porting — done structurally 2026-05-01**:
+- `probe/extract_xds_pairs.py` + `probe/probe_xds_pair_diff.py`:
+  empirical proof that the FM4 and FH1 `.xds` containers are
+  byte-compatible (0 HEADER deltas, 0 SIZE deltas across all 22
+  paired buckets and 8 sample cars).
+- `core/texture_port.nim`: builds a `TexturePortPlan` (copy-source /
+  splice-donor / drop-extra ops) using the target profile's
+  `extraXdsBuckets` to know which FH1-only buckets need a donor
+  splice (`interior_emissive_LOD0`, `zlights_LOD0`, `zlights`).
+- Validated end-to-end: `probe/nim_xds_port_validate.bin` runs the
+  planner across all 8 paired cars in both directions and verifies
+  the resulting bucket-name set equals what the target game
+  actually ships — **16/16 structurally identical**.
 
 **Mesh LOD parsing — complete (2026-05-01)**:
 - Main carbin's *internal* LOD pool + LOD0 pool: parse cleanly on both
