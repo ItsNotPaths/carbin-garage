@@ -2,7 +2,57 @@
 
 Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01.
 
-**Latest (2026-05-01, Slice A — port-to scaffolding):** End-to-end
+**>>> CROSS-GAME PORT-TO PIVOT (2026-05-01 EOD): see `docs/PLAN_DLC_PIVOT.md` <<<**
+
+After ~6 hours of in-game iteration, cross-game `port-to` via direct
+`gamedb.slt` edits has been **ruled out**. Autoshow + purchase + color picker
+work, but post-purchase open-world spawn nukes the global render pipeline
+(grey screen, 0 RPM, instant gear-up). Root cause is an undecodable SQL chain
+in the audio engine init that returns 0 rows for our new car and substitutes
+the SQL CE error string `"Attempt to access invalid field or record"` into
+asset paths. We could not identify the offending join from logs after
+extensive cloning across 30+ tables.
+
+**Decision**: cross-game `port-to` becomes a **DLC package emitter**. Same-game
+`export-to` (modifying cars that already exist in the target) keeps the
+direct-write approach that works today. UX stays flat — DLC mechanic is
+hidden behind the existing CLI verb.
+
+**Authoritative plan**: `docs/PLAN_DLC_PIVOT.md`. New code goes in
+`orchestrator/portto_dlc.nim` (replaces direct-edit logic in current
+`portto.nim` for cross-game ports). Phase 2b real transcode (Slice B) is
+deferred until the DLC port path proves in-game load.
+
+**Critical bug discovered en route**: `core/zip21_writer.nim` drops the
+FH1-required `0x1123` per-CDH extra field encoding compressed-data offset.
+Donor zips have it on every entry; ours don't. Fix needed for both same-game
+and DLC paths. See memory `project_zip21_extra_field.md`.
+
+The Slice A / Slice B / xex notes below are preserved for context but are
+**not the active work plan**. PLAN_DLC_PIVOT.md is.
+
+---
+
+**Earlier 2026-05-01 (xex integrity-bypass patcher):** Pure-Nim xex2
+unpacker + repacker landed at `src/carbin_garage/core/xex2/`
+(aes/format/basic/unpack/sha1) + `core/xex2_patches.nim` +
+`orchestrator/patchxex.nim`. CLI: `patch-xex <default.xex> [--restore]`.
+Output is **byte-equal to a community-patched reference xex** when
+given the same scramble values (sha256 verified). The patch disables
+FH1's integrity-check lookup table for 8 media files (gamedb.slt being
+the one we care about) by scrambling filename strings in .rdata; the
+loader's separate header_hash check is sidestepped by splicing a
+hardcoded 16 KiB known-good header from the reference (rsa_signature
+zeroed + header_hash recomputed for a restructured optional-header
+layout) — `vendor/xex2_templates/fh1_header.bin`, baked in via
+`staticRead`. Empirically scramble values of pure-alpha or
+alpha-with-hyphens load fine; `&` and `/` cause IO errors at runtime
+(unverified root cause but likely hash collision with a real lookup
+entry). This patcher is the missing layer that makes gamedb writes
+tolerated by the runtime — port-to deploys that INSERT new car rows
+now load cleanly.
+
+**Earlier (2026-05-01, Slice A — port-to scaffolding):** End-to-end
 `port-to` pipeline wired with a **stub carbin transcode** that returns
 donor bytes verbatim. New modules: `core/carbin/transcode.nim` (stub +
 `tmHybridSplice` placeholder that raises until Slice B implements the

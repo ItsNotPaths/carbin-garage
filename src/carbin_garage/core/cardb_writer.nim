@@ -1,5 +1,17 @@
 ## Per-car DB row patcher for `port-to`.
 ##
+## **STATUS 2026-05-01: Direct gamedb.slt edits ruled out for cross-
+## game ports.** In-game testing surfaced an undecodable SQL chain in
+## the audio engine init that crashes the global render pipeline on
+## open-world spawn (~30 tables of cloning didn't resolve it). The
+## DLC packaging path uses a separate per-DLC `<id>00_merge.slt`
+## that's merged into the live DB at boot — see `docs/PLAN_DLC_PIVOT.md`.
+## A new merge.slt builder will replace this writer's role for cross-
+## game ports. Same-game `export-to` may keep using a thinned-down
+## version of this writer for in-place row edits, but the FK-chain
+## clone logic should move to a merge-emitter that targets the 56
+## tables DLCs actually use (this writer only handles ~6 directly).
+##
 ## Counterpart to `core/cardb.nim` (the import-time reader). Takes a
 ## `cardb.json` snippet (captured at import) plus a donor's MediaName,
 ## and writes the rows into the target game's `gamedb.slt` so the

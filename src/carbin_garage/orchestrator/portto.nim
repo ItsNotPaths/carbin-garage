@@ -1,5 +1,15 @@
 ## port-to: cross-game car export.
 ##
+## **STATUS 2026-05-01: This direct-edit implementation is being replaced.**
+## Cross-game ports are pivoting to DLC packaging — see
+## `docs/PLAN_DLC_PIVOT.md` for the active roadmap and rationale. The
+## direct-edit approach below patches `gamedb.slt` and writes archives
+## under `<target>/Media/cars/`, but in-game testing surfaced an
+## undecodable SQL chain in the audio engine init that crashes the
+## global render pipeline on open-world spawn. New code goes in
+## `orchestrator/portto_dlc.nim`; leave this file in place until the
+## DLC path is wired and the CLI `port-to` verb dispatches to it.
+##
 ## Stage 2 of the locked two-stage workflow. Takes an already-imported
 ## working car (`working/<slug>/`) and produces a new archive in the
 ## target game's cars dir, using a donor car from the target game as

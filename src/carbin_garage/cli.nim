@@ -10,6 +10,7 @@ import ./orchestrator/scan
 import ./orchestrator/mount as mountop
 import ./orchestrator/exportto
 import ./orchestrator/portto
+import ./orchestrator/portto_dlc
 import ./orchestrator/patchxex
 import ./core/xex2_patches
 
@@ -115,6 +116,29 @@ usage:
                                             --replace-db deletes any
                                             existing rows for the new
                                             MediaName before insert.
+  carbin-garage port-to-dlc <working-car> <target-game-id> --donor <donor-slug>
+                                            --content <xenia-content-dir>
+                                            [--name <new-slug>] [--profile-id <hex>]
+                                            [--replace] [--skip-merge-slt]
+                                            [--dry-run] [--uninstall]
+                                            New-car port via DLC packaging.
+                                            Emits a complete xenia DLC tree
+                                            at <content>/<profile-id>/<title>/00000002/<package>/
+                                            with zipmount.xml + puboffer +
+                                            cars/wheels zips + merge.slt
+                                            (56 per-car-data tables cloned from
+                                            the donor with IDs rewritten).
+                                            UNLIKE port-to: does NOT touch
+                                            base gamedb.slt or zipmanifest.
+                                            --replace removes any existing
+                                            package at the same package-id
+                                            first. --skip-merge-slt writes
+                                            everything except the merge.slt —
+                                            useful for inspecting the package
+                                            tree shape without touching the DB.
+                                            --uninstall removes the package
+                                            tree for the given slug + content
+                                            and exits.
   carbin-garage patch-xex <path-to-default.xex> [--dry-run] [--restore]
                                             Patch the FH1 default.xex to disable
                                             integrity checks for moddable files
@@ -462,6 +486,67 @@ proc cmdPortTo(args: seq[string]) =
   if plan.targetGamedb.len > 0:
     echo "  patched ", plan.targetGamedb
 
+proc cmdPortToDlc(args: seq[string]) =
+  if args.len < 2:
+    echo "port-to-dlc: missing <working-car> <target-game-id>"; quit 1
+  let workingCar = args[0]
+  let gameId = args[1]
+  let donor = parseFlag(args, "--donor")
+  let contentRoot = parseFlag(args, "--content")
+  let newName = parseFlag(args, "--name")
+  let profileId = block:
+    let v = parseFlag(args, "--profile-id")
+    if v.len > 0: v else: "0000000000000000"
+  let replace = "--replace" in args
+  let skipMerge = "--skip-merge-slt" in args
+  let dryRun = "--dry-run" in args
+  let uninstall = "--uninstall" in args
+  let dlcIdOverride = block:
+    let v = parseFlag(args, "--dlc-id")
+    if v.len > 0:
+      try: parseInt(v)
+      except CatchableError:
+        echo "port-to-dlc: --dlc-id must be an integer"; quit 1
+    else: 0
+  if donor.len == 0:
+    echo "port-to-dlc: --donor <donor-slug> is required"; quit 1
+  if contentRoot.len == 0:
+    echo "port-to-dlc: --content <xenia-content-dir> is required"
+    echo "  (the directory that holds <profile-id>/<title-id>/...)"
+    quit 1
+  let all = loadMounts()
+  let i = findMount(all, gameId)
+  if i < 0:
+    echo "port-to-dlc: no mount registered for game-id '", gameId, "'"
+    echo "  (run: carbin-garage mount <game-folder>)"
+    quit 1
+  let prof = loadProfileById(gameId)
+  let plan =
+    try: planPortToDlc(workingCar, all[i], prof, contentRoot, donor,
+                        newName, profileId, dlcIdOverride)
+    except DlcPortError as e:
+      echo "port-to-dlc: ", e.msg; quit 1
+  echo "port-to-dlc [", gameId, "]: ", plan.sourceSlug, " -> ", plan.newSlug,
+       "  (donor: ", plan.donorSlug, ")"
+  stdout.write describePlan(plan)
+  if uninstall:
+    if plan.packageExists:
+      uninstallPortToDlc(plan)
+      echo "  uninstalled ", plan.packageDir
+    else:
+      echo "  no package at ", plan.packageDir, " — nothing to uninstall"
+    return
+  if dryRun:
+    echo "  (dry-run — no files touched)"
+    return
+  try:
+    executePortToDlc(plan, replace = replace, skipMergeSlt = skipMerge)
+  except DlcPortError as e:
+    echo "port-to-dlc: ", e.msg; quit 1
+  echo "  wrote package at ", plan.packageDir
+  if skipMerge:
+    echo "  (merge.slt skipped — car will not load until --skip-merge-slt is dropped)"
+
 proc cmdExportTo(args: seq[string]) =
   if args.len < 2:
     echo "export-to: missing <working-car> <game-id>"; quit 1
@@ -529,6 +614,8 @@ proc main*() =
     cmdExportTo(rest)
   of "port-to":
     cmdPortTo(rest)
+  of "port-to-dlc":
+    cmdPortToDlc(rest)
   of "patch-xex":
     cmdPatchXex(rest)
   else:

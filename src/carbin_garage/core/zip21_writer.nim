@@ -7,6 +7,15 @@
 ## Whether a Forza game runtime accepts a heavily-method-0 archive is
 ## **unverified** — that's the point of building this writer: it
 ## produces the smallest test artifact for an in-game smoke test.
+##
+## **0x1123 extra field — fixed 2026-05-01 (post-DLC pivot).** Every CDH
+## entry now carries the 8-byte Forza-required extra
+## `[u16 tag=0x1123][u16 len=4][u32 LE payloadOffset]`. FH1's zip21
+## reader uses this to seek directly to compressed bytes; without it,
+## method-21 LZX entries can't be located. The fix synthesizes the
+## extra unconditionally per-entry from the new payload offset, so
+## entries that were re-emitted as method-0, renamed, or copied
+## verbatim all carry coherent values.
 
 import std/[tables]
 
@@ -208,19 +217,27 @@ proc rewriteZipMixedMethod*(srcZipPath: string,
       # all 52 entries in our sample donors verify exl=0.
       payloadOffs[i] = lhos[i] + 30 + outName.len
 
-  # Rewrite the Forza tag-0x1123 cdir extra u32 to the new payload offset.
+  # Forza tag-0x1123 cdir extra: REQUIRED by FH1's zip21 reader.
   # Layout: [u16 tagId=0x1123][u16 dataLen=4][u32 LE payloadOffset].
-  # If the extra doesn't carry that exact tag, leave it alone.
+  # Synthesize unconditionally for every entry so freshly-rewritten /
+  # renamed / source-had-no-extra entries all get it. Source entries
+  # that already carried this extra are effectively just having their
+  # u32 refreshed against the new payload offset; entries without it
+  # gain it. If a source entry's `cdirExtra` carries other tags beyond
+  # 0x1123, those bytes are dropped — Forza zips we've inspected only
+  # carry 0x1123, so that's safe in practice.
   var rewrittenExtras = newSeq[seq[byte]](entries.len)
-  for i, e in entries:
-    var x = e.cdirExtra
-    if x.len == 8 and x[0] == 0x23'u8 and x[1] == 0x11'u8 and
-       x[2] == 0x04'u8 and x[3] == 0x00'u8:
-      let v = uint32(payloadOffs[i])
-      x[4] = byte(v and 0xFF'u32)
-      x[5] = byte((v shr 8)  and 0xFF'u32)
-      x[6] = byte((v shr 16) and 0xFF'u32)
-      x[7] = byte((v shr 24) and 0xFF'u32)
+  for i in 0 ..< entries.len:
+    var x = newSeq[byte](8)
+    x[0] = 0x23'u8
+    x[1] = 0x11'u8
+    x[2] = 0x04'u8
+    x[3] = 0x00'u8
+    let v = uint32(payloadOffs[i])
+    x[4] = byte(v and 0xFF'u32)
+    x[5] = byte((v shr 8)  and 0xFF'u32)
+    x[6] = byte((v shr 16) and 0xFF'u32)
+    x[7] = byte((v shr 24) and 0xFF'u32)
     rewrittenExtras[i] = x
 
   let cdirOff = result.len

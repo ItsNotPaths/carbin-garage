@@ -51,11 +51,11 @@ proc fh1HeaderTemplateBytes*(): seq[uint8] =
     result[i] = uint8(Fh1HeaderTemplate[i])
 
 # FH1 — disable integrity-check lookup for moddable files.
-# The patch scrambles the filename strings the integrity-check lookup
-# table reads, so lookups miss and the per-file hash check is skipped.
-# This lets us modify gamedb.slt + the listed media zips without
-# dirty-disc errors. Companion to the hardcoded header template above
-# (which handles the loader's separate header_hash check).
+# Scrambles the filename strings in the .rdata integrity-check lookup
+# table so lookups miss and the per-file hash check is skipped, letting
+# us modify gamedb.slt + the listed media zips without dirty-disc
+# errors. Companion to Fh1HeaderTemplate above which handles the
+# loader's separate header_hash check via splice.
 let Fh1IntegrityBypassPatch* = XexPatchSet(
   titleId: "4D5309C9",
   name: "fh1-integrity-bypass",
