@@ -183,18 +183,29 @@ LOD pool bytes
 
 ### LOD pool: 28-byte vertex stride (vs FM4's 32)
 
-FH1 drops the **UV1** field from the 32-byte FM4 layout. New layout:
+**Corrected 2026-05-01.** Earlier RE inferred from stride math that FH1
+"drops UV1" — wrong. Byte-level cross-game comparison
+(`probe/nim_vertex_byte_diff.nim`, 8 paired cars × multiple body
+sections, 3000+ matched vertices) shows `FH1 [0..24) == FM4 [0..24)`
+byte-equal in every case. FH1 KEEPS UV1; the 4-byte loss is at the END
+(extra8 → extra4):
 
 | Offset | Size | Field |
 |---|---|---|
 | 0x00 | 8 B | Position (`int16 × 4`, ShortN x/y/z + scale) — same as FM4 |
 | 0x08 | 4 B | UV0 (`uint16 × 2`, UShortN) — same as FM4 |
-| 0x0C | 8 B | Quaternion (`int16 × 4`, ShortN) — was at offset 0x10 in FM4 |
-| 0x14 | 8 B | extra8 (untouched; carry through verbatim) — was at 0x18 in FM4 |
+| 0x0C | 4 B | **UV1** (`uint16 × 2`, UShortN) — same as FM4 |
+| 0x10 | 8 B | Quaternion (`int16 × 4`, ShortN) — same offset as FM4 |
+| 0x18 | 4 B | extra4 — FM4 has 8 B here (extra8); FH1 truncates to 4. Byte 0 ~70% matches FM4's extra8[0]; bytes 1..3 are re-baked |
 
-The LOD0 pool (per-section `lod0VerticesSize` field) follows the same
-rule: stride determined by `lod0VerticesSize`, decoded with the matching
-table.
+The LOD0 pool follows the same rule: stride determined by
+`lod0VerticesSize`, decoded with the matching table.
+
+The Phase-2a "caliper quat partial encoding" mystery (high pair carries
+data, low pair zero) was an artifact of the wrong layout — calipers
+have UV1 = 0 because they don't sample texture, and the wrong decoder
+read those zero UV1 bytes as the quat low half. Real quat at 0x10 has
+full data.
 
 ### Subsection "version" field after name
 

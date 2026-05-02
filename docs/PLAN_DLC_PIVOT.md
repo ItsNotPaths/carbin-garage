@@ -1,11 +1,63 @@
 ---
-status: authoritative-roadmap
+status: SHIPPED 2026-05-01 EOD — except mesh transcode
 created: 2026-05-01
-context: cross-game `port-to` blocked by undecodable SQL chain in base gamedb;
-         DLC packaging is the working modding path for adding new cars
+last-updated: 2026-05-01 EOD
+context: original — cross-game `port-to` blocked by undecodable SQL chain in
+         base gamedb; DLC packaging is the working modding path. Now —
+         pipeline executed, FM4→FH1 cross-game port lands in autoshow,
+         drives, doesn't tear render pipeline. Mesh is still donor's;
+         Slice B carbin transcode is the remaining gap.
 ---
 
-# DLC pivot — cross-game ports become DLC packages
+# DLC pivot — cross-game ports become DLC packages — SHIPPED
+
+## End-of-day status (2026-05-01)
+
+Pipeline works end-to-end except mesh transcode. Test case: FM4 ALF_8C_08
+imported via `import`, ported via `port-to-dlc working/ALF_8C_08 fh1
+--donor ALF_8C_08 --content <xenia-content> --name ALF_8C_08_FM4PORT --dlc-id 730`.
+In-game (xenia + FH1):
+
+- New car appears in Autoshow under Alfa Romeo at $1.
+- Car drives, has audio, doesn't crash.
+- 12/14 texture buckets are FM4's; the 2 FH1-only buckets fall back to donor.
+- `merge.slt` rows reflect FM4's `cardb.json` overlay (verified by
+  marker test).
+- Mesh is donor's (FH1 ALF_8C_08) — Slice B mesh transcode is next.
+
+Empirical gotchas to making FH1 actually merge our content (memory:
+`project_dlc_pipeline_state.md`):
+
+1. **Data_Car.Id must fall in base game's range** (FH1: 249..1568).
+   IDs above max are silently ignored. Use `findUnusedCarId` /
+   `findUnusedEngineId` (gap-fill).
+2. **SQLite page_size = 1024** + **schema_format byte 0x2C = 1**.
+   Modern SQLite defaults (4096, format 4) are silently rejected.
+3. **xenia .header sidecar** at
+   `<contentRoot>/<profile>/<TitleID>/Headers/00000002/<packageId>.header`
+   (332 bytes; UTF-16BE display name + ASCII package id + title id).
+4. **Loose files at `cars_pri_<id>/<MediaName>/...`** — NOT a zip.
+   xbox 360's zipmount layer pre-extracts base zips at boot; DLC
+   overlays mount on the already-virtualized tree, no recursive
+   extraction.
+5. **Package id = `<TitleID-hex><dlcId-as-8-decimal-digits>`** (zero-padded
+   ASCII decimals, NOT hex-of-decimal).
+6. **Overlay dir = `<dlcId>_pri_99/`**, NOT `<packageId>_pri_99/`.
+   zipmount.xml only registers `cars_pri_<id>` + `wheels_pri_<id>`;
+   FH1 auto-discovers the merge overlay.
+
+## Code surface
+
+- `orchestrator/portto_dlc.nim` — emits package tree + sidecar header.
+- `core/dlc_merge.nim` — builds 56-table merge.slt with cardb.json overlay,
+  page_size + schema_format fixes, gap-fill ID allocation.
+- `cli.nim` — `port-to-dlc` verb.
+- `core/zip21_writer.nim` — 0x1123 CDH extra field on every entry (fixed).
+- `core/carbin/transcode.nim` — Slice B scaffold (default mode
+  `tmDonorVerbatim`; `tmHybridSplice` opt-in for v2 iteration). See
+  memory `project_carbin_transcode_handoff.md`.
+
+## Original plan (preserved below for context)
 
 ## TL;DR
 

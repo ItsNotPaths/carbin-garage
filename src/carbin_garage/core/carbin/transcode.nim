@@ -56,6 +56,8 @@ import ./parser
 import ./builders
 import ../profile
 
+const TranscodeTrace {.booldefine.} = false
+
 type
   TranscodeError* = object of CatchableError
 
@@ -117,12 +119,27 @@ const Fm4VertexStride = 32
 const Fh1VertexStride = 28
 
 proc fm4PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
-  ## Strip UV1 (bytes [0x0C..0x10) of each 32-byte FM4 vertex). Output
-  ## stride is 28 bytes/vertex matching FH1.
+  ## Truncate each 32-byte FM4 vertex to FH1's 28 bytes. Empirically
+  ## verified 2026-05-01 against 8 paired sample cars × multiple body
+  ## sections (3000+ vertices total): FH1 vertex bytes [0..24) are
+  ## byte-IDENTICAL to FM4 vertex bytes [0..24) in every case.
   ##
-  ## In-game effect: FH1 reads each vertex as the same pos+UV0+quat+extra
-  ## fields, just at the new offsets. UV1 had no consumer on FH1
-  ## (vertex shader never sampled it on the FH1 28-byte path).
+  ## Real FH1 vertex layout (correcting prior misdoc):
+  ##   pos[8]  uv0[4]  uv1[4]  quat[8]  extra4[4]   = 28 bytes
+  ## FH1 KEEPS uv1 (it was thought to be dropped). What FH1 drops is the
+  ## last 4 bytes of FM4's 8-byte extra8 trailing field.
+  ##
+  ## The trailing 4 bytes of FH1's extra4 vs FM4's extra8 first 4 bytes:
+  ## byte 0 matches ~70% of the time (likely a quantized AO or compact
+  ## tangent component); bytes 1..3 differ (re-baked tangent encoding).
+  ## We copy FM4's first 4 extra8 bytes — close enough for byte 0; bytes
+  ## 1..3 will be slightly off but aren't dominant for surface normals
+  ## (the quat at [16..24) carries the primary tangent space).
+  ##
+  ## **Why the prior "drop UV1 at [12..16)" was wrong**: it placed FM4's
+  ## quat (offset 16) at FH1's UV1 slot (offset 12) and FM4's extra8 at
+  ## FH1's quat slot (offset 16). Shader read garbage as the quaternion
+  ## → wrong normals on every vertex → in-game splotchy black body.
   if fm4Pool.len mod Fm4VertexStride != 0:
     raise newException(TranscodeError,
       "fm4PoolToFh1: input length " & $fm4Pool.len &
@@ -132,47 +149,8 @@ proc fm4PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
   for i in 0 ..< n:
     let src = i * Fm4VertexStride
     let dst = i * Fh1VertexStride
-    for j in 0 ..< 0x0C:
+    for j in 0 ..< Fh1VertexStride:
       result[dst + j] = fm4Pool[src + j]
-    for j in 0 ..< 0x14:
-      result[dst + 0x0C + j] = fm4Pool[src + 0x10 + j]
-
-# ---- section-pool helpers (shim source bytes to look like FH1 stride) ----
-
-proc convertedSourceData(sourceData: openArray[byte], srcInfo: CarbinInfo,
-                         section: SectionInfo,
-                         srcVer, dstVer: CarbinVersion): seq[byte] =
-  ## Return a copy of `sourceData` where this section's LOD pool and
-  ## LOD0 pool have been re-strided cvFour→cvFive (32→28). The returned
-  ## buffer's offsets DIFFER from sourceData's because the section bytes
-  ## shrink — but the builder reads the section bytes via `section.start
-  ## .. section.endPos`, and we adjust by passing a section copy with
-  ## updated offsets. Callers should NOT reuse `srcInfo.sections`
-  ## offsets after calling this.
-  ##
-  ## For srcVer == dstVer, returns a verbatim copy (no work).
-  if srcVer == dstVer:
-    result = newSeq[byte](sourceData.len)
-    for i in 0 ..< sourceData.len: result[i] = sourceData[i]
-    return
-  if srcVer == cvFour and dstVer == cvFive:
-    # The simplest reliable path: leave the section bytes alone and let
-    # the builder use the section's reported lodVSize=32 verbatim. FH1
-    # then sees a 32-byte stride which doesn't match its expected 28.
-    # That's known to render scrambled in-game — but the splice still
-    # exercises the codepath end-to-end and gives us a probe.
-    #
-    # The cleaner fix is to rewrite the section's lodVSize bytes to 28
-    # AND replace the pool with a re-strided pool. Doing that requires
-    # also knowing the section's vSize positions, which the SectionInfo
-    # already records (`lodVertexSizePos` / `vertexSizePos`). Implement
-    # in a follow-up; for v1 we ship the verbatim-stride approach to
-    # validate the surrounding pipeline.
-    result = newSeq[byte](sourceData.len)
-    for i in 0 ..< sourceData.len: result[i] = sourceData[i]
-    return
-  raise newException(TranscodeError,
-    "unsupported transcode direction " & $srcVer & "→" & $dstVer)
 
 # ---- the splice driver ----
 
@@ -184,6 +162,13 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   ## a source section by name; splice if possible, otherwise donor verbatim.
   ## Assemble the final file by concatenating donor's pre-section bytes,
   ## the rebuilt section blobs, and donor's post-section bytes.
+  ##
+  ## v2 splice (cvFour→cvFive): re-stride the source LOD pool (32→28)
+  ## via `fm4PoolToFh1`, force the rebuilt section's lodVSize field to 28,
+  ## and validate each rebuilt section by reparsing it. On any validation
+  ## failure (parse raise, vertex count mismatch, length mismatch,
+  ## subsection count mismatch) we fall back to donor's section bytes
+  ## verbatim — so partial transcode is automatic.
   var srcByName = initTable[string, int]()
   for i, s in srcInfo.sections: srcByName[s.name] = i
 
@@ -204,6 +189,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   let renames = initTable[string, string]()
   let allowed = none(HashSet[string])
 
+  let crossVersionStride = (srcVer == cvFour and donVer == cvFive)
+
   for donSec in donInfo.sections:
     let donorSecBytes = block:
       var b = newSeq[byte](donSec.endPos - donSec.start)
@@ -211,38 +198,90 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
       b
 
     if donSec.name notin srcByName:
+      when TranscodeTrace:
+        stderr.writeLine "    [splice] '" & donSec.name & "' fallback: no name match"
       newSecs.add(donorSecBytes)
       inc fallback
       continue
 
     let srcSec = srcInfo.sections[srcByName[donSec.name]]
 
-    # Pick a source LOD that has subsections to splice. v1 strategy:
-    # use donor's targetLod for the LOD pool; for LOD0 use 0 directly.
-    # We splice both LOD pool and the high-detail LOD0 pool.
     var thisSecBytes = donorSecBytes
     var thisSpliced = false
 
     if donSec.lodVerticesCount > 0'u32 and srcSec.lodVerticesCount > 0'u32:
       try:
-        # Use the donor's LOD as the target slot, source's LOD-with-
-        # subsections (1) as the donor of bytes. padToTargetVpool=false
-        # because cvFour and cvFive vSize differ (32 vs 28).
+        var forcedBlob = none(seq[byte])
+        var forcedSize = none(uint32)
+        if crossVersionStride and srcSec.lodVerticesSize == 32'u32:
+          let srcPool = block:
+            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
+            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
+            b
+          forcedBlob = some(fm4PoolToFh1(srcPool))
+          forcedSize = some(uint32(Fh1VertexStride))
         let r = buildSectionConvertedToTargetLodOnTargetTemplate(
           donorData, donSec, sourceData, srcSec,
           donorLod = 1'i32, targetLod = 1'i32,
           renameMap = renames, allowedSubparts = allowed,
-          upconvertIndices = true, padToTargetVpool = false)
-        thisSecBytes = r.bytes
-        thisSpliced = true
-      except CatchableError:
-        thisSecBytes = donorSecBytes  # already set; defensive
+          upconvertIndices = true, padToTargetVpool = false,
+          forcedDonorVertexBlob = forcedBlob,
+          forcedNewVertexSize = forcedSize,
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
+
+        # Per-section validation: reparse the rebuilt bytes against the
+        # target version. Reject on raise, on byte-count mismatch (parser
+        # consumed a different region than the splice produced), or on
+        # vertex/subsection-count drift.
+        let chk = tryParseSection(r.bytes, donVer)
+        var srcLodSubcount = 0
+        for ss in srcSec.subsections:
+          if ss.lod == 1'i32: inc srcLodSubcount
+        # cvFive sections end with 4..8 bytes of variable trailing pad
+        # that the parser only resolves via next-section marker probe.
+        # In single-section validation there is no next marker, so the
+        # parser's no-marker fallback consumes 4 bytes regardless of
+        # actual pad. Accept consumed within the rebuilt size minus the
+        # max known pad delta (8 bytes).
+        var ok = chk.ok and chk.consumed > 0 and
+                 chk.consumed >= r.bytes.len - 8 and
+                 chk.consumed <= r.bytes.len
+        if ok and chk.info.lodVerticesCount != srcSec.lodVerticesCount: ok = false
+        if ok and crossVersionStride and chk.info.lodVerticesSize != 28'u32: ok = false
+        if ok and chk.info.subsections.len != srcLodSubcount: ok = false
+        # LOD0 pool unchanged — must still match donor's counts.
+        if ok and chk.info.lod0VerticesCount != donSec.lod0VerticesCount: ok = false
+        if ok and chk.info.lod0VerticesSize != donSec.lod0VerticesSize: ok = false
+        if ok:
+          thisSecBytes = r.bytes
+          thisSpliced = true
+        else:
+          when TranscodeTrace:
+            stderr.writeLine "    [splice] '" & donSec.name &
+              "' validation reject: parseOk=" & $chk.ok &
+              " consumed=" & $chk.consumed & "/" & $r.bytes.len &
+              " lodVc(splice)=" & $chk.info.lodVerticesCount &
+              " lodVc(src)=" & $srcSec.lodVerticesCount &
+              " lodVs(splice)=" & $chk.info.lodVerticesSize &
+              " subs(splice)=" & $chk.info.subsections.len &
+              " subs(srcLod1)=" & $srcLodSubcount &
+              " lod0Vc(splice)=" & $chk.info.lod0VerticesCount &
+              " lod0Vc(donor)=" & $donSec.lod0VerticesCount
+      except CatchableError as e:
+        when TranscodeTrace:
+          stderr.writeLine "    [splice] '" & donSec.name &
+            "' raise: " & e.msg
+        thisSecBytes = donorSecBytes
+    else:
+      when TranscodeTrace:
+        stderr.writeLine "    [splice] '" & donSec.name &
+          "' skip: lodVc(don)=" & $donSec.lodVerticesCount &
+          " lodVc(src)=" & $srcSec.lodVerticesCount
 
     if thisSpliced: inc spliced
     else: inc fallback
     newSecs.add(thisSecBytes)
 
-  # Assemble: pre + sections + post.
   var outLen = preBytes.len + postBytes.len
   for s in newSecs: outLen += s.len
   result.bytes = newSeq[byte](outLen)
@@ -255,10 +294,6 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   for i in 0 ..< postBytes.len: result.bytes[off + i] = postBytes[i]
   result.spliced = spliced
   result.fallback = fallback
-  # convertedSourceData is a no-op stub for v1; reference it so the
-  # symbol stays warm for the v2 pass.
-  discard convertedSourceData(sourceData, srcInfo, donInfo.sections[0],
-                              srcVer, donVer)
 
 # ---- entry point ----
 
@@ -266,11 +301,13 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
                       targetProfile: GameProfile,
                       mode: TranscodeMode = tmDonorVerbatim
                      ): tuple[bytes: seq[byte]; report: TranscodeReport] =
-  ## Default mode is `tmDonorVerbatim` until the v1 splice handles
-  ## cvFour→cvFive vertex-stride conversion + per-section parse
-  ## validation. tmHybridSplice currently produces bytes that reparse
-  ## for lod0/cockpit but BREAK the main carbin's partCount scan —
-  ## verified empirically. Opt into tmHybridSplice for experimentation.
+  ## v2 splice (mode=tmHybridSplice): cvFour→cvFive stride conversion
+  ## (32→28) is plumbed via `fm4PoolToFh1`, the cvFive m_NumBoneWeights
+  ## pre-pool block is preserved, and each rebuilt section is reparsed
+  ## as a single-section validation gate — failures fall back to donor
+  ## bytes verbatim, so partial transcode (e.g. cockpit splices, main
+  ## falls back) is automatic. Default still `tmDonorVerbatim` for
+  ## stability; orchestrator opts in.
   let (srcVer, srcInfo) = validateSource(sourceData)
   let (donVer, donInfo) = validateDonor(donorData, targetProfile)
 

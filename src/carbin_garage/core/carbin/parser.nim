@@ -251,6 +251,25 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
     tailStart: tailStart
   )
 
+proc tryParseSection*(data: openArray[byte], ver: CarbinVersion):
+                      tuple[ok: bool; info: SectionInfo; consumed: int] =
+  ## Trial-parse a single section starting at `data[0]`. Returns ok=false
+  ## on any parse failure (ValueError / IndexDefect / overflow). Used by
+  ## the transcode splice path: per-section reparse the rebuilt bytes;
+  ## fall back to donor verbatim when the splice produced something the
+  ## live parser can't read.
+  ##
+  ## `consumed` is the byte length of the parsed section (= parser's
+  ## `secEnd - secStart`); compare to the section's expected `endPos -
+  ## start` to detect tail-marker mismatch even when the parse runs to
+  ## completion.
+  var r = newBEReader(data)
+  try:
+    let info = parseSection(r, 0, ver)
+    result = (true, info, r.tell())
+  except CatchableError:
+    result = (false, SectionInfo(), 0)
+
 proc parseFm4Carbin*(data: openArray[byte]): CarbinInfo =
   let ver = getVersion(data)
   # Accept cvThree as well — some FH1 per-corner carbins (TypeId 1) trip

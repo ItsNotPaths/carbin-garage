@@ -132,6 +132,8 @@ type
 
     # Synthesized package identity
     dlcId*:         int            # numeric DLC id (used in dir/filename suffixes)
+    forcedCarId*:   int            # 0 = auto via findUnusedCarId; >0 pins Data_Car.Id (save migration)
+    forcedEngineId*:int            # 0 = auto; >0 pins Data_Engine.EngineID
     packageId*:     string         # 16-hex: <TitleID><dlcId8hex>
     packageDir*:    string         # dlcSlot/packageId
 
@@ -233,7 +235,9 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
                     contentRoot: string, donorSlug: string,
                     newSlug: string = "",
                     profileId: string = DefaultProfileId,
-                    overrideDlcId: int = 0): DlcPortPlan =
+                    overrideDlcId: int = 0,
+                    forcedCarId: int = 0,
+                    forcedEngineId: int = 0): DlcPortPlan =
   let abs =
     if isAbsolute(workingCar): workingCar
     else: absolutePath(workingCar)
@@ -287,7 +291,8 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
     donorSlug: donorSlug, newSlug: finalSlug,
     contentRoot: contentRoot, profileId: profileId,
     titleIdDir: titleIdDir, dlcSlot: dlcSlot,
-    dlcId: dlcId, packageId: packageId, packageDir: packageDir,
+    dlcId: dlcId, forcedCarId: forcedCarId, forcedEngineId: forcedEngineId,
+    packageId: packageId, packageDir: packageDir,
     pubofferPath: packageDir / "Media" / ($dlcId & ".puboffer"),
     dlcZipsDir: dlcZipsDir,
     zipmountPath: dlcZipsDir / "zipmount.xml",
@@ -402,7 +407,8 @@ proc describePlan*(p: DlcPortPlan): string =
     of dgaDonorOnly: inc donorOnlyN
     of dgaSourceExtra: discard
   result.add "  geometry: transcode=" & $transcodeN &
-             " donor-only=" & $donorOnlyN & "  (v0: all output is donor bytes)\n"
+             " donor-only=" & $donorOnlyN &
+             "  (Slice B v2: main carbin spliced, LOD0-only sections donor-passthrough)\n"
 
 # ---- emit ----
 
@@ -448,10 +454,14 @@ proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
       var donorBytesEntry = extract(p.donorCarsZip, donorEntry)
       let sourceBytes = readFileBytes(ga.sourcePath)
       let r =
-        try: transcodeCarbin(sourceBytes, donorBytesEntry, p.targetProfile)
+        try: transcodeCarbin(sourceBytes, donorBytesEntry, p.targetProfile,
+                             mode = tmHybridSplice)
         except CatchableError as e:
           raise newException(DlcPortError,
             "transcode failed for " & ga.zipEntryName & ": " & e.msg)
+      stderr.writeLine "    [transcode] " & extractFilename(ga.zipEntryName) &
+        ": spliced=" & $r.report.sectionsSpliced &
+        " fallback=" & $r.report.sectionsFallback
       if r.report.mode != tmDonorVerbatim:
         result[ga.zipEntryName] = r.bytes
     of dgaDonorOnly, dgaSourceExtra:
@@ -496,13 +506,32 @@ proc emitMergeSltFile(p: DlcPortPlan): tuple[carId: int; engineId: int;
       try: parseJson(readFile(p.workingCar / "cardb.json"))
       except CatchableError: newJNull()
     else: newJNull()
+  # Gather every sibling DLC's merge.slt so the ID gap-fill avoids
+  # collisions with already-deployed DLCs (UDLC + earlier ports). Skip
+  # our own merge.slt path since that's the file we're rebuilding.
+  var siblingSlts: seq[string] = @[]
+  if dirExists(p.dlcSlot):
+    for kind, dlcDir in walkDir(p.dlcSlot):
+      if kind != pcDir: continue
+      let patchDir = dlcDir / "Media" / "DLCZips"
+      if not dirExists(patchDir): continue
+      for kind2, sub in walkDir(patchDir):
+        if kind2 != pcDir: continue
+        if not sub.extractFilename.endsWith("_pri_99"): continue
+        let mergeDir = sub / "Media" / "db" / "patch"
+        if not dirExists(mergeDir): continue
+        for f in walkFiles(mergeDir / "*.slt"):
+          if f != p.mergeSltPath: siblingSlts.add(f)
   result = buildMergeSlt(
     srcGamedb = p.targetGamedb,
     dstMergeSlt = p.mergeSltPath,
     donorMediaName = p.donorSlug,
     newMediaName = p.newSlug,
     dlcId = p.dlcId,
-    snippet = snippet)
+    snippet = snippet,
+    siblingDlcSlts = siblingSlts,
+    forcedCarId = p.forcedCarId,
+    forcedEngineId = p.forcedEngineId)
 
 proc extractZipToDir(srcZipPath, outDir: string,
                       renames: Table[string, string],

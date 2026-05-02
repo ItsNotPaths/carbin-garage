@@ -102,15 +102,20 @@ section_end
 
 ## 5. Vertex Format (28 bytes — TypeId 5, cvFive)
 
+**CORRECTED 2026-05-01**: byte-level RE confirmed `FH1 [0..24) == FM4
+[0..24)` across all paired body vertices. The 4-byte loss is at the
+END (extra8 → extra4), NOT at offset 0x0C. FH1 KEEPS UV1.
+
 | Offset | Size | Field | Decode | Delta from FM4 |
 |--------|------|-------|--------|----|
-| 0x00 | 8 B | Position | 4× int16 (x, y, z, scale). `ShortN(v) = v / 32767.0`. Final: `(x*s, y*s, z*s)` | same as FM4 |
-| 0x08 | 4 B | UV0 | 2× uint16. `UShortN(v) = v / 65535.0` | same as FM4 |
-| 0x0C | 8 B | Quaternion (normal/tangent) | 4× int16 ShortN | shifted from 0x10 in FM4 |
-| 0x14 | 8 B | extra8 | opaque, round-trip verbatim | shifted from 0x18 in FM4 |
-| ~~0x08~~ | ~~4 B~~ | ~~UV1~~ | **dropped in FH1** | UV2 is gone |
+| 0x00 | 8 B | Position | 4× int16 (x, y, z, scale). `ShortN(v) = v / 32767.0`. Final: `(x*s, y*s, z*s)` | same |
+| 0x08 | 4 B | UV0 | 2× uint16. `UShortN(v) = v / 65535.0` | same |
+| 0x0C | 4 B | UV1 | 2× uint16. UShortN normalized | same as FM4 (NOT dropped) |
+| 0x10 | 8 B | Quaternion (normal/tangent) | 4× int16 ShortN | same offset as FM4 |
+| 0x18 | 4 B | extra4 | opaque; byte 0 ~70% matches FM4 extra8[0]; bytes 1..3 re-baked | FM4 has 8 B here |
 
-`decodeVertex28` lives in `core/carbin/vertex.nim`. For the LOD0 pool of lod0 / cockpit carbins, see also §7's per-vertex stream — likely the second tangent / normal carrier that's bundled inline in FM4's 0x20 stride.
+`decodeVertex28` lives in `core/carbin/vertex.nim`. Cross-game splice
+truncates FM4's 32 bytes to 28 — no field shuffling.
 
 ### UV transform (no Y-flip in our bake)
 

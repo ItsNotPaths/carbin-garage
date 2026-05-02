@@ -1,35 +1,64 @@
 # Roadmap
 
-Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01.
+Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01 EOD.
 
-**>>> CROSS-GAME PORT-TO PIVOT (2026-05-01 EOD): see `docs/PLAN_DLC_PIVOT.md` <<<**
+**>>> DLC PIPELINE LANDED (2026-05-01 EOD): FM4→FH1 cross-game port works in-game <<<**
 
-After ~6 hours of in-game iteration, cross-game `port-to` via direct
-`gamedb.slt` edits has been **ruled out**. Autoshow + purchase + color picker
-work, but post-purchase open-world spawn nukes the global render pipeline
-(grey screen, 0 RPM, instant gear-up). Root cause is an undecodable SQL chain
-in the audio engine init that returns 0 rows for our new car and substitutes
-the SQL CE error string `"Attempt to access invalid field or record"` into
-asset paths. We could not identify the offending join from logs after
-extensive cloning across 30+ tables.
+End-of-day status: `port-to-dlc` lands an FM4 car in FH1's autoshow,
+drives, has FM4 textures, FM4 DB row content (donor mesh until Slice B
+ships). Test case: ALF_8C_08 ported as `ALF_8C_08_FM4PORT` to FH1's
+xenia content tree, dlcId=730. Code: `orchestrator/portto_dlc.nim` +
+`core/dlc_merge.nim` + `port-to-dlc` CLI verb.
 
-**Decision**: cross-game `port-to` becomes a **DLC package emitter**. Same-game
-`export-to` (modifying cars that already exist in the target) keeps the
-direct-write approach that works today. UX stays flat — DLC mechanic is
-hidden behind the existing CLI verb.
+Open work, ranked:
+1. **Slice B v2 real carbin transcode (mesh) — main carbin LANDED
+   2026-05-01.** `core/carbin/transcode.nim:tmHybridSplice` now produces
+   33/33 spliced sections in `<car>.carbin` (FM4 ALF_8C_08 → FH1 v2).
+   Output reparses cleanly with all-28 LOD strides; bytes byte-different
+   from donor; per-section validation gate auto-falls-back on any
+   failure. Four cross-version deltas implemented and documented in
+   `docs/CARBIN_TRANSCODE.md`: stride 32→28 strip, m_NumBoneWeights
+   pre-pool block preservation, +4 byte cvFour→cvFive subsection
+   upconvert, section-tail passthrough. **In-game test pending.**
+1a. **Slice C — LOD0-only sections** (`<car>_lod0.carbin`,
+    `<car>_cockpit.carbin`, caliper / rotor LOD0s). Splice driver
+    currently skips them because the gate keys off `lodVerticesCount > 0`.
+    Donor verbatim today; needs LOD0 stride hooks in builder + the same
+    subsection upconvert path enabled, then `lod0VerticesCount > 0`
+    becomes the new splice trigger. See `docs/CARBIN_TRANSCODE.md` §
+    *Limitations*.
+2. **Audio CMT/ET XML emit** — cheap; user gets correct engine sound
+   instead of donor's. Deferred.
+3. **`port-to-dlc` UX polish** — auto-detect xenia content root via a
+   convention; make `--content` optional once a `set-content` verb
+   exists.
 
-**Authoritative plan**: `docs/PLAN_DLC_PIVOT.md`. New code goes in
-`orchestrator/portto_dlc.nim` (replaces direct-edit logic in current
-`portto.nim` for cross-game ports). Phase 2b real transcode (Slice B) is
-deferred until the DLC port path proves in-game load.
+Empirical gotchas required for FH1 to merge our DLC content (now in
+memory `project_dlc_pipeline_state.md`):
+- `Data_Car.Id` MUST be in base range (FH1: 249..1568); IDs above are
+  silently ignored. Gap-fill.
+- merge.slt MUST use `page_size=1024` AND `schema_format_number=1`
+  (byte 0x2C). Modern defaults are silently rejected.
+- xenia `.header` sidecar (332 bytes) at
+  `Headers/00000002/<packageId>.header` is required for enumeration.
+- `cars_pri_<id>/<MediaName>/...` LOOSE files, NOT a `.zip`. xbox 360
+  zipmount layer doesn't recurse into DLC overlays.
+- Package id = `<TitleID-hex><dlcId-as-8-decimal-digits>`.
+- Overlay dir = `<dlcId>_pri_99/`, NOT `<packageId>_pri_99/`.
+- `0x1123` extra field on every CDH entry (fixed in
+  `core/zip21_writer.nim`).
 
-**Critical bug discovered en route**: `core/zip21_writer.nim` drops the
-FH1-required `0x1123` per-CDH extra field encoding compressed-data offset.
-Donor zips have it on every entry; ours don't. Fix needed for both same-game
-and DLC paths. See memory `project_zip21_extra_field.md`.
+**Why direct gamedb.slt edits were ruled out** (kept for reference):
+~6 hours of in-game iteration; the audio engine init's SQL chain
+returns 0 rows for the new car, SQL CE substitutes its error string
+into the asset path, and the renderer/audio pipeline tears on
+open-world spawn. ~30 tables cloned across two sessions didn't isolate
+the offending join. **DLC merge.slt loads via a different code path** —
+proven this session by the working ALF_8C_08_FM4PORT.
 
-The Slice A / Slice B / xex notes below are preserved for context but are
-**not the active work plan**. PLAN_DLC_PIVOT.md is.
+Authoritative plan: `docs/PLAN_DLC_PIVOT.md` (status banner updated to
+SHIPPED). The Slice A / Slice B / xex notes below are preserved for
+context.
 
 ---
 

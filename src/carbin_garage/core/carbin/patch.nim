@@ -64,6 +64,37 @@ proc patchSubsectionLod*(ssBytes: openArray[byte], ss: SubSectionInfo,
   let packed = bePackI32(newLod)
   for i in 0 .. 3: result[relLodPos + i] = packed[i]
 
+proc upconvertSubsectionCvFourToCvFive*(ssBytes: openArray[byte],
+                                         ss: SubSectionInfo):
+                                         tuple[bytes: seq[byte];
+                                               ss: SubSectionInfo] =
+  ## Cross-version subsection layout upconvert (FM4 cvFour → FH1 cvFive).
+  ## At offset (idxCountPos - 4) the cvFour subsection carries [u32=3];
+  ## cvFive replaces this with [u32=4][u32=0] (8 bytes instead of 4),
+  ## per `parseSubsection` and `docs/FH1_CARBIN_TYPEID5.md` §"subsections".
+  ## Patches the leading word from 3 → 4 and inserts a 4-byte zero word
+  ## immediately before idxCount. Returns the new bytes plus a
+  ## SubSectionInfo with offsets from idxCountPos onward shifted by +4.
+  let relIdxCountPos = ss.idxCountPos - ss.start
+  if relIdxCountPos < 4 or relIdxCountPos > ssBytes.len:
+    raise newException(ValueError,
+      "upconvertSubsectionCvFourToCvFive: bad idxCountPos " &
+      $relIdxCountPos & " (ssBytes.len=" & $ssBytes.len & ")")
+  let prefixEnd = relIdxCountPos - 4
+  var rebuilt = newSeqOfCap[byte](ssBytes.len + 4)
+  for i in 0 ..< prefixEnd: rebuilt.add(ssBytes[i])
+  for b in bePackU32(4'u32): rebuilt.add(b)
+  for b in bePackU32(0'u32): rebuilt.add(b)
+  for i in relIdxCountPos ..< ssBytes.len: rebuilt.add(ssBytes[i])
+  var ssNew = ss
+  ssNew.idxCountPos = ss.idxCountPos + 4
+  ssNew.idxSizePos = ss.idxSizePos + 4
+  ssNew.idxDataStart = ss.idxDataStart + 4
+  ssNew.idxDataEnd = ss.idxDataEnd + 4
+  ssNew.afterIdxPos = ss.afterIdxPos + 4
+  ssNew.endPos = ss.endPos + 4
+  result = (rebuilt, ssNew)
+
 proc upconvertSubsectionIndices_2_to_4*(ssBytes: openArray[byte],
                                         ss: SubSectionInfo): tuple[bytes: seq[byte]; changed: bool] =
   if ss.idxSize != 2: return (@ssBytes, false)

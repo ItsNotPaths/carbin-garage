@@ -277,16 +277,35 @@ The subsection "version" field after the name is FM4 `[u32 = 3]`; FH1 reads as `
 
 ## 9. Vertex Format (28-byte stride)
 
+**CORRECTED 2026-05-01**: Empirical RE via `probe/nim_vertex_byte_diff.nim`
+against 8 paired FM4/FH1 cars (3000+ matched body vertices) showed
+`FH1 [0..24) == FM4 [0..24)` byte-equal in every case. The earlier
+"drops UV1" claim was inferred from stride math without byte-level
+comparison and was wrong. FH1 drops 4 bytes from the END of the
+vertex (extra8 → extra4), NOT the middle.
+
 | Offset | Size | Field | Decode | Delta from FM4 |
 |--------|------|-------|--------|----|
 | 0x00 | 8 B | Position | 4× int16 (x, y, z, scale). `ShortN(v) = v / 32767.0`. Final: `(x*s, y*s, z*s)` | unchanged |
 | 0x08 | 4 B | UV0 | 2× uint16. `UShortN(v) = v / 65535.0` | unchanged |
-| 0x0C | 8 B | Quaternion (normal/tangent) | 4× int16 ShortN → matrix → row 0 = normal | shifted from 0x10 in FM4 |
-| 0x14 | 8 B | extra8 | opaque, round-trip verbatim | shifted from 0x18 in FM4 |
+| 0x0C | 4 B | UV1 | 2× uint16. UShortN normalized | unchanged (NOT dropped) |
+| 0x10 | 8 B | Quaternion (normal/tangent) | 4× int16 ShortN → matrix → row 0 = normal | unchanged offset |
+| 0x18 | 4 B | extra4 | opaque; byte 0 ~70% matches FM4's extra8[0] (likely AO / compact tangent), bytes 1..3 are re-baked | FM4 has 8 B here (extra8); FH1 truncates to 4 |
 
-UV1 (4 B at FM4's 0x0C) is **dropped** in FH1's 28-byte stride. The "second tangent / paint data" the FM4 master speculates lives in `extra8` may be encoded differently (or in the lod0/cockpit per-vertex stream — see §11).
+**The 4-byte difference vs FM4's 32-byte stride lives at the END.** No
+per-field shuffling; the cross-game splice just truncates.
 
-`decodeVertex28` lives in `core/carbin/vertex.nim`.
+`decodeVertex28` lives in `core/carbin/vertex.nim` (corrected 2026-05-01).
+
+### Caliper "high pair only" mystery — RESOLVED
+
+The Phase-2a observation that "FH1 caliper LOD0 vertex 0 has the
+8-byte quat field at offset 12..19 with bytes 12..15 zero, only the
+high pair (16..19) carrying data" was an artifact of the wrong
+decoder reading bytes 12..19 (UV1 + first half of quat) as the
+quaternion. Caliper subsections don't sample texture so UV1 is zero,
+which made bytes 12..15 look like "zeroed quat low half." Real quat is
+at offset 16..23 with full data; calipers just have UV1 = 0.
 
 ### Helper functions
 

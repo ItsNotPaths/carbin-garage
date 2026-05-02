@@ -38,7 +38,25 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     renameMap: Table[string, string],
     allowedSubparts: Option[HashSet[string]] = none(HashSet[string]),
     upconvertIndices: bool = true,
-    padToTargetVpool: bool = true): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
+    padToTargetVpool: bool = true,
+    forcedDonorVertexBlob: Option[seq[byte]] = none(seq[byte]),
+    forcedNewVertexSize: Option[uint32] = none(uint32),
+    upconvertSubsectionsCvFourToCvFive: bool = false
+   ): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
+  ## `forcedDonorVertexBlob` / `forcedNewVertexSize` override the donor's
+  ## raw LOD pool + vSize (cross-version splice path uses these to feed a
+  ## re-strided 28-byte FH1 pool when the donor is FM4 32-byte source).
+  ## Both must be Some together; their length must equal donorVCount *
+  ## forced size. They affect the LOD pool only (targetLod>0 path) — pass
+  ## via the LOD0 path is not currently wired since cross-version splice
+  ## targets the LOD pool slot.
+  ##
+  ## `upconvertSubsectionsCvFourToCvFive=true` runs each donor subsection
+  ## through `upconvertSubsectionCvFourToCvFive` first (insert 4 zero
+  ## bytes before idxCount, patch [u32=3]→[u32=4]) so that source FM4
+  ## subsection bytes spliced into an FH1 section template parse cleanly
+  ## as cvFive. All subsequent index conversion / restart-marker fixing
+  ## runs against the upconverted bytes + shifted SubSectionInfo.
 
   var donorVCount: int
   var donorVSize: int
@@ -72,8 +90,13 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
   var idxConverted = 0
   var rstFixed = 0
 
-  for ss in sel:
-    var b = sliceBytes(donorData, ss.start, ss.endPos)
+  for ssOrig in sel:
+    var b = sliceBytes(donorData, ssOrig.start, ssOrig.endPos)
+    var ss = ssOrig
+    if upconvertSubsectionsCvFourToCvFive:
+      let up = upconvertSubsectionCvFourToCvFive(b, ss)
+      b = up.bytes
+      ss = up.ss
     b = patchSubsectionLod(b, ss, targetLod)
 
     if desiredIdxSize == 4 and ss.idxSize == 2 and upconvertIndices:
@@ -146,6 +169,12 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     let betweenSubsAndVc = sliceBytes(tgtBytes,
       targetSec.subsectionsEnd - targetSec.start,
       targetSec.vertexCountPos - targetSec.start)
+    # cvFive sections carry m_NumBoneWeights [+ perSectionId] between the
+    # vSize field and the actual LOD0 pool start. Splat those donor bytes
+    # back in unchanged. Empty for cvFour (vertexSizePos+4 == lod0VerticesStart).
+    let betweenLod0SizeAndPool = sliceBytes(tgtBytes,
+      targetSec.vertexSizePos + 4 - targetSec.start,
+      targetSec.lod0VerticesStart - targetSec.start)
     let tail = sliceBytes(tgtBytes,
       targetSec.tailStart - targetSec.start, tgtBytes.len)
     let rebuilt = concatBytes(
@@ -155,6 +184,7 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
       betweenSubsAndVc,
       @(bePackI32(newVertexCount)),
       @(bePackU32(newVertexSize)),
+      betweenLod0SizeAndPool,
       poolBlob,
       tail)
     return (rebuilt, idxConverted, rstFixed)
@@ -165,7 +195,22 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
   var newLodCount: uint32
   var newLodSize: uint32
   var lodBlob: seq[byte]
-  if padToTargetVpool and tgtLodVCount > 0 and tgtLodVSize > 0:
+  if forcedDonorVertexBlob.isSome or forcedNewVertexSize.isSome:
+    if forcedDonorVertexBlob.isNone or forcedNewVertexSize.isNone:
+      raise newException(ValueError,
+        "forcedDonorVertexBlob and forcedNewVertexSize must be set together")
+    if padToTargetVpool:
+      raise newException(ValueError,
+        "forced-stride splice is incompatible with padToTargetVpool=true")
+    newLodCount = uint32(donorVCount)
+    newLodSize = forcedNewVertexSize.get
+    lodBlob = forcedDonorVertexBlob.get
+    if lodBlob.len != int(newLodCount) * int(newLodSize):
+      raise newException(ValueError,
+        "forcedDonorVertexBlob length " & $lodBlob.len &
+        " does not match newLodCount*newLodSize " &
+        $(int(newLodCount) * int(newLodSize)))
+  elif padToTargetVpool and tgtLodVCount > 0 and tgtLodVSize > 0:
     if donorVSize != tgtLodVSize:
       raise newException(ValueError,
         "VertexSize mismatch: donor LOD" & $donorLod & " stride=" & $donorVSize &
@@ -190,6 +235,12 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     lodBlob = donorVerticesBlob
 
   let prefixBeforeLod = sliceBytes(tgtBytes, 0, targetSec.lodVertexCountPos - targetSec.start)
+  # cvFive sections carry m_NumBoneWeights [+ perSectionId] between the
+  # vSize field and the actual LOD pool start. Splat those donor bytes
+  # back in unchanged. Empty for cvFour (lodVertexSizePos+4 == lodVerticesStart).
+  let betweenSizeAndPool = sliceBytes(tgtBytes,
+    targetSec.lodVertexSizePos + 4 - targetSec.start,
+    targetSec.lodVerticesStart - targetSec.start)
   let betweenLodAndSubcount = sliceBytes(tgtBytes,
     targetSec.lodVerticesEnd - targetSec.start,
     targetSec.subpartCountPos - targetSec.start)
@@ -203,6 +254,7 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     prefixBeforeLod,
     @(bePackU32(newLodCount)),
     @(bePackU32(newLodSize)),
+    betweenSizeAndPool,
     lodBlob,
     betweenLodAndSubcount,
     @(bePackU32(newSubcount)),

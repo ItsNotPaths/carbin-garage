@@ -119,8 +119,13 @@ Drop-in or near-drop-in:
 - Build metadata files
 
 Format-mapping required:
-- `carbin` (and `_lod0`, `_cockpit`): TypeId 2 → 5 transcode (see
-  FH1_CARBIN_TYPEID5.md)
+- `carbin` main: cvFour → cvFive transcode wired (Slice B v2,
+  FM4 main TypeId 3 → FH1 TypeId 5 main). See `CARBIN_TRANSCODE.md`
+  for the four byte-level deltas (stride 32→28, m_NumBoneWeights
+  pre-pool block, +4 byte subsection upconvert, section-tail
+  passthrough) and `FH1_CARBIN_TYPEID5.md` for the on-disk format.
+- `carbin` lod0 / cockpit / caliper / rotor LOD0: Slice C — splice
+  for LOD0-only sections not yet wired; donor passthrough today.
 - `carattribs.xml`: Version 16 → 21, mostly cosmetic textual drift
 - Lights / damage XDS: many differ — likely re-baked
 

@@ -67,7 +67,7 @@
 ##   not the merge.slt. Donor's FK values stay valid because they point
 ##   into base.
 
-import std/[json, os, strutils, tables]
+import std/[json, os, sets, strutils, tables]
 import db_connector/db_sqlite
 
 type
@@ -204,7 +204,14 @@ proc isLikelyIdColumn(name: string): bool =
   ## that *may* have been a sub-ID — safer than false positives that
   ## scramble static FKs. The pattern set was derived from inspecting
   ## row dumps in `probe/out/dlc_merge_recon.txt`.
-  if name == "Id" or name == "Ordinal" or name == "EngineID":
+  ##
+  ## "ID" (uppercase) added 2026-05-01: CarPartPositions, Combo_Colors,
+  ## List_TorqueCurve, List_UpgradeEngine etc. all use uppercase ID
+  ## as the sub-id column (donorCarId*1000+slot encoding). Previous
+  ## whitelist only had "Id" lowercase, leaving the uppercase variant
+  ## unchanged → ID/1000 stayed at donorCarId while Ordinal got
+  ## rewritten to newCarId. UDLC preserves the invariant; we should too.
+  if name == "Id" or name == "ID" or name == "Ordinal" or name == "EngineID":
     return true
   if name == "AntiSwayPhysicsID" or name == "SpringDamperPhysicsID":
     return true
@@ -245,11 +252,38 @@ proc rewriteId(v: string, rw: IdRewrite): string =
 proc rewriteCell(colName, value: string, rw: IdRewrite): string =
   ## Top-level per-cell rewrite. Handles MediaName, BaseCost, and any
   ## ID-shaped column.
+  ##
+  ## MediaName: force to newMediaName for ALL rows. We only copy rows
+  ## that are for this car (keyed by donorMediaName / donorCarId), so
+  ## any MediaName column in those rows refers to THIS car and must
+  ## carry the new name. Earlier logic only rewrote when value matched
+  ## donorMediaName — but the snippet (captured at source-game import)
+  ## carries the SOURCE car's name, which doesn't match donor when
+  ## donor and source are different cars (cross-game port with
+  ## non-matching slugs). That left snippet's source-name in place,
+  ## producing a Data_Car row that pointed at the wrong loose-files
+  ## dir → car silently dropped from autoshow. (2026-05-01 fix.)
   if colName == "MediaName":
-    if value == rw.donorMediaName: return rw.newMediaName
-    return value
+    return rw.newMediaName
   if colName == "BaseCost":
     return "1"  # locked policy from cardb_writer
+  if colName == "IsArcade":
+    # FH1's autoshow filters cars by IsArcade=1; donors carrying 0
+    # (e.g. AUD_R8GT_11, rare/non-arcade trims) silently hide the new
+    # car. Empirically observed 2026-05-01: alfa donor IsArcade=1 →
+    # car appears; R8 GT donor IsArcade=0 → car enumerated by
+    # XamContent but never resolved by FH1 (no autoshow listing,
+    # no asset loads in xenia.log). Force to 1 for ports.
+    return "1"
+  if colName == "BaseRarity":
+    # FH1's autoshow only lists cars with BaseRarity == 0; non-zero is
+    # the wheelspin / barn-find / gift gating tier. The snippet from a
+    # source-game cardb may carry the source's rarity (FM4 R8_08 = 7.8)
+    # even when the donor is a normal showroom car (R8 GT = 0). Force
+    # to 0 so ported cars always end up purchasable in autoshow at
+    # BaseCost=1. Empirically: 121/176 base cars are rarity 0 (the
+    # autoshow tier); the rest are unlock rewards.
+    return "0"
   if isLikelyIdColumn(colName):
     return rewriteId(value, rw)
   return value
@@ -294,47 +328,119 @@ proc snippetRowsForTable(snippet: JsonNode, tbl: string):
 ## base.max picking the first unused slot offset by `dlcId mod gap`
 ## so re-running the same port gets the same Id deterministically.
 
-proc findUnusedCarId(srcDb: DbConn, dlcId: int): int =
-  var used: seq[int] = @[]
-  for r in srcDb.fastRows(sql"SELECT Id FROM Data_Car ORDER BY Id"):
-    try: used.add(parseInt(r[0]))
+proc collectUsedIds(srcDb: DbConn, table, idCol: string,
+                    extraSlts: openArray[string]): HashSet[int] =
+  ## Used IDs across base gamedb + every sibling DLC merge.slt. UDLC
+  ## and our own previously-shipped DLCs add rows via merge.slt that
+  ## aren't in base — colliding on those IDs produces silent dedup at
+  ## runtime. Walk all known overlays so the gap-fill is conflict-safe.
+  result = initHashSet[int]()
+  for r in srcDb.fastRows(sql("SELECT " & idCol & " FROM " & table)):
+    try: result.incl(parseInt(r[0]))
     except CatchableError: discard
-  if used.len == 0: return 1500
-  let lo = used[0]
-  let hi = used[^1]
-  # Walk top-down so we don't collide with the sample DLC's preferred
-  # range (small Ids 257..600). Hash dlcId to bias the start point.
+  for path in extraSlts:
+    try:
+      let db = open(path, "", "", "")
+      defer: db.close()
+      # Some DLC merge.slts may not carry every table; tolerate that.
+      let hasTbl = db.getValue(sql"SELECT name FROM sqlite_master WHERE type='table' AND name=?", table)
+      if hasTbl.len == 0: continue
+      for r in db.fastRows(sql("SELECT " & idCol & " FROM " & table)):
+        try: result.incl(parseInt(r[0]))
+        except CatchableError: discard
+    except CatchableError:
+      # Skip unreadable .slt rather than failing the whole port.
+      discard
+
+proc collectAliasCarSlots(srcDb: DbConn,
+                          extraSlts: openArray[string]): HashSet[int] =
+  ## CarId slots occupied by shared-FK tables that key sub-IDs at
+  ## carId*1000+slot but aren't owned by the carId on Data_Car.Id.
+  ## Empirical: List_AeroPhysics has 256 rows in 112 distinct buckets,
+  ## of which ~50 are orphan slots (no Data_Car at that id) — base FH1
+  ## uses them as a shared aero catalog referenced by other cars'
+  ## bumper/wing FKs. Picking newCarId in such a slot collides on the
+  ## sub-id space and triggers cascading SQL CE FK failures during
+  ## car_animations / car_skeleton / wheel asset lookups. Confirmed
+  ## empirically: carId 1486 → broken; 1486000+ holds AST_V12Zagato_12's
+  ## front-bumper aero rows. Bug isolated 2026-05-02.
+  ##
+  ## List_TorqueCurve also aliases (TorqueCurveID/1000 has buckets in
+  ## 0..200 not matching any carId) but those low buckets are well
+  ## below the active carId range, so they don't pollute our search.
+  ## Including for defensive completeness.
+  const ALIAS_TABLES = [
+    ("List_AeroPhysics", "AeroPhysicsID"),
+    ("List_TorqueCurve", "TorqueCurveID"),
+  ]
+  result = initHashSet[int]()
+  for (tbl, col) in ALIAS_TABLES:
+    let hasTbl = srcDb.getValue(sql"SELECT name FROM sqlite_master WHERE type='table' AND name=?", tbl)
+    if hasTbl.len == 0: continue
+    for r in srcDb.fastRows(sql("SELECT DISTINCT " & col & "/1000 FROM " & tbl)):
+      try: result.incl(parseInt(r[0]))
+      except CatchableError: discard
+  for path in extraSlts:
+    try:
+      let db = open(path, "", "", "")
+      defer: db.close()
+      for (tbl, col) in ALIAS_TABLES:
+        let hasTbl = db.getValue(sql"SELECT name FROM sqlite_master WHERE type='table' AND name=?", tbl)
+        if hasTbl.len == 0: continue
+        for r in db.fastRows(sql("SELECT DISTINCT " & col & "/1000 FROM " & tbl)):
+          try: result.incl(parseInt(r[0]))
+          except CatchableError: discard
+    except CatchableError:
+      discard
+
+proc baseRange(srcDb: DbConn, table, idCol: string): tuple[lo, hi: int] =
+  ## Min/max Id from BASE gamedb only. Sibling DLC merge.slts can carry
+  ## IDs outside this range (UDLC has Data_Car ids in the 51000s) but
+  ## those IDs are silently ignored by FH1's runtime — the active range
+  ## is what base ships. Search must stay inside [lo..hi].
+  result.lo = -1; result.hi = -1
+  for r in srcDb.fastRows(sql("SELECT MIN(" & idCol & "), MAX(" & idCol & ") FROM " & table)):
+    if r.len >= 2:
+      try: result.lo = parseInt(r[0]) except CatchableError: discard
+      try: result.hi = parseInt(r[1]) except CatchableError: discard
+
+proc findUnusedCarId(srcDb: DbConn, dlcId: int,
+                     extraSlts: openArray[string] = []): int =
+  ## Picks a carId that's not in Data_Car.Id AND not aliased as a
+  ## sub-id bucket in shared-FK tables (List_AeroPhysics et al). The
+  ## alias check is essential — otherwise picking eg 1486 produces a
+  ## merge.slt whose List_UpgradeCarBodyFrontBumper / List_UpgradeRearWing
+  ## rows reference AeroPhysicsIDs that ALREADY EXIST in base gamedb and
+  ## belong to a different car, breaking FK joins at car-load time.
+  let usedSet = collectUsedIds(srcDb, "Data_Car", "Id", extraSlts)
+  let aliasSet = collectAliasCarSlots(srcDb, extraSlts)
+  let blocked = usedSet + aliasSet
+  let (lo, hi) = baseRange(srcDb, "Data_Car", "Id")
+  if hi < 0: return 1500
   var freeSlots: seq[int] = @[]
-  var idx = used.len - 1
   for i in countdown(hi, lo):
-    while idx >= 0 and used[idx] > i: dec idx
-    if idx < 0 or used[idx] != i:
+    if i notin blocked:
       freeSlots.add(i)
       if freeSlots.len >= 64: break
   if freeSlots.len == 0:
     raise newException(DlcMergeError,
-      "no free Data_Car.Id slot in base range [" & $lo & ", " & $hi & "]")
+      "no free Data_Car.Id slot in base range [" & $lo & ", " & $hi & "] " &
+      "(used=" & $usedSet.len & " alias=" & $aliasSet.len & ")")
   result = freeSlots[dlcId mod freeSlots.len]
 
-proc findUnusedEngineId(srcDb: DbConn, dlcId: int): int =
-  var used: seq[int] = @[]
-  for r in srcDb.fastRows(sql"SELECT EngineID FROM Data_Engine ORDER BY EngineID"):
-    try: used.add(parseInt(r[0]))
-    except CatchableError: discard
-  if used.len == 0: return 500
-  let lo = used[0]
-  let hi = used[^1]
+proc findUnusedEngineId(srcDb: DbConn, dlcId: int,
+                        extraSlts: openArray[string] = []): int =
+  let usedSet = collectUsedIds(srcDb, "Data_Engine", "EngineID", extraSlts)
+  let (lo, hi) = baseRange(srcDb, "Data_Engine", "EngineID")
+  if hi < 0: return 500
   var freeSlots: seq[int] = @[]
-  var idx = used.len - 1
   for i in countdown(hi, lo):
-    while idx >= 0 and used[idx] > i: dec idx
-    if idx < 0 or used[idx] != i:
+    if i notin usedSet:
       freeSlots.add(i)
       if freeSlots.len >= 64: break
   if freeSlots.len == 0:
     raise newException(DlcMergeError,
       "no free Data_Engine.EngineID slot in base range [" & $lo & ", " & $hi & "]")
-  # Different hash bias from car so a single dlcId picks distinct slots.
   result = freeSlots[(dlcId * 7919) mod freeSlots.len]
 
 # Kept for back-compat with the smoke test; both now defer to the
@@ -409,10 +515,26 @@ proc insertRow(dstDb: DbConn, tbl: string, colNames: seq[string],
   var bound: seq[string] = @[]
   for i, c in colNames:
     var v = if i < row.len: row[i] else: ""
-    if c in overlay:
+    # Snippet overlay applies to descriptive columns only. ID-shaped
+    # columns must come from donor's value (which then runs through
+    # rewriteId to become the new car's allocated ID); the snippet
+    # carries the SOURCE game's Id, which is meaningless in target
+    # space and would otherwise stomp on rw.newCarId mapping. Bug
+    # symptom 2026-05-01: Data_Car.Id ended up == source FM4 Id while
+    # per-car tables' Ordinal got rewriteId(donorCarId) == newCarId,
+    # the two diverged, FH1 couldn't JOIN them, car silently dropped.
+    if c in overlay and not isLikelyIdColumn(c):
       v = jsonToSqlString(overlay[c])
     bound.add(rewriteCell(c, v, rw))
   dstDb.exec(sql(q), bound)
+
+## Tables where snippet overlay is suppressed entirely (donor wins).
+## Rationale: cross-game cross-engine ports inherit donor's audio config
+## (CMT/ET XMLs are donor passthrough), so the DB row needs to MATCH
+## donor's audio assumptions. Snippet (source-game cardb) overlaying
+## these fields produced V8 vs V10 mismatches that broke audio init
+## (broken RPM gauge + grey shaders observed on R8 port 2026-05-01).
+const SnippetOverlaySuppressed: array[1, string] = ["Data_Engine"]
 
 proc cloneTable(srcDb, dstDb: DbConn, tbl: string, rw: IdRewrite,
                 snippet: JsonNode): int =
@@ -426,7 +548,9 @@ proc cloneTable(srcDb, dstDb: DbConn, tbl: string, rw: IdRewrite,
   let cols = tableColumnNames(srcDb, tbl)
   let keyCol = keyColFor(srcDb, tbl)
   let donorRows = selectDonorRows(srcDb, tbl, keyCol, rw)
-  let snippetRows = snippetRowsForTable(snippet, tbl)
+  let snippetRows =
+    if tbl in SnippetOverlaySuppressed: @[]
+    else: snippetRowsForTable(snippet, tbl)
   for i, r in donorRows:
     # Pair donor row[i] with snippet row[i] when both exist. v0:
     # positional pairing — works for the typical 1-row tables
@@ -442,7 +566,10 @@ proc cloneTable(srcDb, dstDb: DbConn, tbl: string, rw: IdRewrite,
 
 proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string,
                     dlcId: int,
-                    snippet: JsonNode = newJNull()):
+                    snippet: JsonNode = newJNull(),
+                    siblingDlcSlts: openArray[string] = [],
+                    forcedCarId: int = 0,
+                    forcedEngineId: int = 0):
                     tuple[carId: int; engineId: int;
                           perTableRows: Table[string, int]] =
   ## Driver. `dlcId` is used to allocate stable new car/engine IDs.
@@ -467,8 +594,12 @@ proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string
     raise newException(DlcMergeError,
       "donor MediaName not in source Data_Engine: " & donorMediaName)
 
-  let newCarId = findUnusedCarId(srcDb, dlcId)
-  let newEngineId = findUnusedEngineId(srcDb, dlcId)
+  let newCarId =
+    if forcedCarId > 0: forcedCarId
+    else: findUnusedCarId(srcDb, dlcId, siblingDlcSlts)
+  let newEngineId =
+    if forcedEngineId > 0: forcedEngineId
+    else: findUnusedEngineId(srcDb, dlcId, siblingDlcSlts)
   let rw = IdRewrite(
     donorCarId: donorIds.carId,
     donorEngineId: donorIds.engineId,

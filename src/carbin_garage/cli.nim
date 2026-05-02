@@ -508,6 +508,20 @@ proc cmdPortToDlc(args: seq[string]) =
       except CatchableError:
         echo "port-to-dlc: --dlc-id must be an integer"; quit 1
     else: 0
+  let forcedCarId = block:
+    let v = parseFlag(args, "--car-id")
+    if v.len > 0:
+      try: parseInt(v)
+      except CatchableError:
+        echo "port-to-dlc: --car-id must be an integer"; quit 1
+    else: 0
+  let forcedEngineId = block:
+    let v = parseFlag(args, "--engine-id")
+    if v.len > 0:
+      try: parseInt(v)
+      except CatchableError:
+        echo "port-to-dlc: --engine-id must be an integer"; quit 1
+    else: 0
   if donor.len == 0:
     echo "port-to-dlc: --donor <donor-slug> is required"; quit 1
   if contentRoot.len == 0:
@@ -523,7 +537,8 @@ proc cmdPortToDlc(args: seq[string]) =
   let prof = loadProfileById(gameId)
   let plan =
     try: planPortToDlc(workingCar, all[i], prof, contentRoot, donor,
-                        newName, profileId, dlcIdOverride)
+                        newName, profileId, dlcIdOverride,
+                        forcedCarId, forcedEngineId)
     except DlcPortError as e:
       echo "port-to-dlc: ", e.msg; quit 1
   echo "port-to-dlc [", gameId, "]: ", plan.sourceSlug, " -> ", plan.newSlug,

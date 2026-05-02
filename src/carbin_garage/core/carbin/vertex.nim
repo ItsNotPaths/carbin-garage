@@ -115,8 +115,18 @@ proc encodeVertex*(pos: Vec3, uv0, uv1: array[2, float32], normal: Vec3,
   for i in 0 ..< VERTEX_SIZE: result[i] = buf[i]
 
 proc decodeVertex28*(blob: openArray[byte], off: int): Vertex =
-  ## FH1 28-byte vertex layout: pos(8) + UV0(4) + quat(8) + extra8(8).
-  ## Drops FM4's UV1 field. Otherwise identical decode rules.
+  ## FH1 28-byte vertex layout (corrected 2026-05-01):
+  ##   pos(8) + UV0(4) + UV1(4) + quat(8) + extra4(4)
+  ##
+  ## Empirically verified vs paired FM4 cars: FH1 [0..24) ==
+  ## FM4 [0..24) byte-equal across 3000+ matched body vertices. FH1
+  ## KEEPS UV1 (prior docs claimed it was dropped — that was wrong).
+  ## The 4-byte loss vs FM4's 32-byte stride lives at the END of the
+  ## vertex (extra8 → extra4), NOT in the middle.
+  ##
+  ## extra4: byte 0 ~70% matches FM4 extra8[0] (likely AO or compact
+  ## tangent component); bytes 1..3 are re-baked. extra8[4..8) of the
+  ## Vertex result is zero-filled because FH1 doesn't carry those bytes.
   let rx = readI16BE(blob, off)
   let ry = readI16BE(blob, off + 2)
   let rz = readI16BE(blob, off + 4)
@@ -129,14 +139,18 @@ proc decodeVertex28*(blob: openArray[byte], off: int): Vertex =
   result.texture0 = [
     float32(float64(readU16BE(blob, off + 8))  / 65535.0),
     float32(float64(readU16BE(blob, off + 10)) / 65535.0)]
-  result.texture1 = [0.0'f32, 0.0'f32]   # not present in 28-byte layout
-  let q: Quat = [shortn(readI16BE(blob, off + 12)),
-                 shortn(readI16BE(blob, off + 14)),
-                 shortn(readI16BE(blob, off + 16)),
-                 shortn(readI16BE(blob, off + 18))]
+  result.texture1 = [
+    float32(float64(readU16BE(blob, off + 12)) / 65535.0),
+    float32(float64(readU16BE(blob, off + 14)) / 65535.0)]
+  let q: Quat = [shortn(readI16BE(blob, off + 16)),
+                 shortn(readI16BE(blob, off + 18)),
+                 shortn(readI16BE(blob, off + 20)),
+                 shortn(readI16BE(blob, off + 22))]
   result.normal = quatToMatrixRow0(q)
-  for i in 0 .. 7:
-    result.extra8[i] = blob[off + 20 + i]
+  for i in 0 .. 3:
+    result.extra8[i] = blob[off + 24 + i]
+  for i in 4 .. 7:
+    result.extra8[i] = 0
 
 proc decodePool*(blob: openArray[byte], stride: int = VERTEX_SIZE): seq[Vertex] =
   ## Decode an entire vertex pool. Picks the FM4 (32-byte) or FH1
