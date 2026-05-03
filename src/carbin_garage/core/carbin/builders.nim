@@ -41,7 +41,8 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     padToTargetVpool: bool = true,
     forcedDonorVertexBlob: Option[seq[byte]] = none(seq[byte]),
     forcedNewVertexSize: Option[uint32] = none(uint32),
-    upconvertSubsectionsCvFourToCvFive: bool = false
+    upconvertSubsectionsCvFourToCvFive: bool = false,
+    remappedDamageTable: Option[seq[byte]] = none(seq[byte])
    ): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
   ## `forcedDonorVertexBlob` / `forcedNewVertexSize` override the donor's
   ## raw LOD pool + vSize (cross-version splice path uses these to feed a
@@ -247,8 +248,40 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
   let betweenSubsAndVc = sliceBytes(tgtBytes,
     targetSec.subsectionsEnd - targetSec.start,
     targetSec.vertexCountPos - targetSec.start)
-  let suffixFromVc = sliceBytes(tgtBytes,
-    targetSec.vertexCountPos - targetSec.start, tgtBytes.len)
+  # Slice D: when a remapped damage table is provided, splice it in over
+  # donor's tail a*b region and patch the `a` field to match srcVCount.
+  # `a` (donor's = donVCount) and the table size (donVCount * 4) must agree
+  # for FH1's tail walk to land on c/d / post-pool / trailing — so changing
+  # the table to srcVCount * 4 bytes requires patching `a` too. When
+  # remappedDamageTable is None (same-game splice or empty donor table),
+  # fall back to the verbatim suffix copy. The donor's aFieldPos /
+  # aTableStart / aTableEnd were captured by the parser tail walk; if
+  # they're zero (cvFour parser without the new fields, defensive), also
+  # fall back.
+  let canRemap = remappedDamageTable.isSome and
+                 targetSec.aFieldPos > 0 and
+                 targetSec.aTableEnd > targetSec.aTableStart
+  let suffix =
+    if canRemap:
+      let beforeAField = sliceBytes(tgtBytes,
+        targetSec.vertexCountPos - targetSec.start,
+        targetSec.aFieldPos - targetSec.start)
+      let bAndReserved = sliceBytes(tgtBytes,
+        targetSec.aFieldPos + 4 - targetSec.start,
+        targetSec.aTableStart - targetSec.start)
+      let afterATable = sliceBytes(tgtBytes,
+        targetSec.aTableEnd - targetSec.start, tgtBytes.len)
+      let remap = remappedDamageTable.get
+      let newACount = uint32(remap.len div 4)
+      concatBytes(
+        beforeAField,
+        @(bePackU32(newACount)),
+        bAndReserved,
+        remap,
+        afterATable)
+    else:
+      sliceBytes(tgtBytes,
+        targetSec.vertexCountPos - targetSec.start, tgtBytes.len)
 
   let rebuilt = concatBytes(
     prefixBeforeLod,
@@ -260,7 +293,7 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     @(bePackU32(newSubcount)),
     ssBlob,
     betweenSubsAndVc,
-    suffixFromVc)
+    suffix)
   return (rebuilt, idxConverted, rstFixed)
 
 proc buildSectionConvertedToLod0OnTargetTemplate*(

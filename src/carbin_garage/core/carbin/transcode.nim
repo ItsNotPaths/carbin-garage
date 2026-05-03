@@ -54,9 +54,22 @@ import std/[options, sets, tables]
 import ./model
 import ./parser
 import ./builders
+import ./damage_remap
 import ../profile
 
 const TranscodeTrace {.booldefine.} = false
+const SliceDDamageRemap {.booldefine.} = false
+  ## Experimental: NN-remap donor's per-vertex damage table (a*b) onto
+  ## source's vertex order. Empirically does NOT fix cross-game spike
+  ## artifacts on collision in FH1 — its deformation engine doesn't
+  ## read this table. Off by default. The eventual UI toggle for
+  ## "experimental damage export" will flip this; until then users
+  ## should rely on FH1's in-game "no visual damage" setting.
+const SliceDExtra4Zero {.booldefine.} = true
+  ## Zero `extra4` bytes 1..3 in each cross-version vertex. Empirically
+  ## fixes cross-game paint splotchiness — those bytes carry FM4 tangent
+  ## encoding that FH1 reads as something else, producing per-vertex
+  ## shading garbage. Byte 0 (~70% match with FM4 extra8[0]) is preserved.
 
 type
   TranscodeError* = object of CatchableError
@@ -75,6 +88,12 @@ type
     donorSections*: int
     sectionsSpliced*: int
     sectionsFallback*: int
+    gapsPreserved*: int  ## Slice C: donor byte ranges between parsed
+                          ## sections (LOD0-only sections in main carbin)
+                          ## emitted verbatim so partCount stays consistent.
+    damageRemapped*: int ## Slice D: spliced sections whose a*b damage
+                          ## table was remapped by spatial-NN over donor's
+                          ## vertex order (cvFour→cvFive only).
     note*: string
 
 proc expectedDonorVersion(targetProfile: GameProfile): CarbinVersion =
@@ -151,13 +170,18 @@ proc fm4PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
     let dst = i * Fh1VertexStride
     for j in 0 ..< Fh1VertexStride:
       result[dst + j] = fm4Pool[src + j]
+    if SliceDExtra4Zero:
+      result[dst + 25] = 0
+      result[dst + 26] = 0
+      result[dst + 27] = 0
 
 # ---- the splice driver ----
 
 proc spliceCarbin(sourceData, donorData: openArray[byte],
                   srcInfo, donInfo: CarbinInfo,
                   srcVer, donVer: CarbinVersion):
-                  tuple[bytes: seq[byte]; spliced: int; fallback: int] =
+                  tuple[bytes: seq[byte]; spliced: int; fallback: int;
+                        gapsPreserved: int; damageRemapped: int] =
   ## Donor's part list is authoritative. For each donor section, look up
   ## a source section by name; splice if possible, otherwise donor verbatim.
   ## Assemble the final file by concatenating donor's pre-section bytes,
@@ -185,13 +209,33 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   var newSecs: seq[seq[byte]] = @[]
   var spliced = 0
   var fallback = 0
+  var gapsPreserved = 0
+  var damageRemapped = 0
 
   let renames = initTable[string, string]()
   let allowed = none(HashSet[string])
 
   let crossVersionStride = (srcVer == cvFour and donVer == cvFive)
 
-  for donSec in donInfo.sections:
+  for kIdx, donSec in donInfo.sections:
+    # Slice C: preserve donor bytes between consecutive parsed sections.
+    # Cars like R8 carry LOD0-only sections inside the main carbin (no
+    # LOD pool, only LOD0). Their layout differs from regular sections
+    # — e.g. no `m_NumBoneWeights` block before a non-existent LOD pool
+    # — and the body parser raises on them, then scans forward for the
+    # next `[u32=5][9 sane floats]` marker. The skipped byte range IS
+    # the LOD0-only section. Emitting that gap verbatim preserves the
+    # section so FH1's main-thread walk hits real bytes at every slot
+    # the partCount field promises (R8 declares 49; this lets us emit
+    # all 49 even though the parser only resolved 37).
+    if kIdx > 0:
+      let prev = donInfo.sections[kIdx - 1]
+      if prev.endPos < donSec.start:
+        var gap = newSeq[byte](donSec.start - prev.endPos)
+        for i in 0 ..< gap.len: gap[i] = donorData[prev.endPos + i]
+        newSecs.add(gap)
+        inc gapsPreserved
+
     let donorSecBytes = block:
       var b = newSeq[byte](donSec.endPos - donSec.start)
       for i in 0 ..< b.len: b[i] = donorData[donSec.start + i]
@@ -220,6 +264,31 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
             b
           forcedBlob = some(fm4PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
+        # Slice D: when crossVersion and donor section has a non-empty
+        # a*b damage table, remap it by spatial nearest-neighbor so source
+        # vertex i inherits donor vertex j_best's per-vertex skinning
+        # record (where j_best minimizes ||srcPos[i] - donPos[j]||²). For
+        # same-game splices or empty-table sections, leave donor's table
+        # verbatim — the bytes are correct as-is.
+        var remap = none(seq[byte])
+        if SliceDDamageRemap and crossVersionStride and
+           donSec.aTableEnd > donSec.aTableStart:
+          let srcPool = block:
+            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
+            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
+            b
+          let donPool = block:
+            var b = newSeq[byte](donSec.lodVerticesEnd - donSec.lodVerticesStart)
+            for i in 0 ..< b.len: b[i] = donorData[donSec.lodVerticesStart + i]
+            b
+          let donATable = block:
+            var b = newSeq[byte](donSec.aTableEnd - donSec.aTableStart)
+            for i in 0 ..< b.len: b[i] = donorData[donSec.aTableStart + i]
+            b
+          remap = some(remapDamageTable(
+            srcPool, int(srcSec.lodVerticesSize), int(srcSec.lodVerticesCount),
+            donPool, int(donSec.lodVerticesSize), int(donSec.lodVerticesCount),
+            donATable, recordSize = 4))
         let r = buildSectionConvertedToTargetLodOnTargetTemplate(
           donorData, donSec, sourceData, srcSec,
           donorLod = 1'i32, targetLod = 1'i32,
@@ -227,7 +296,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           upconvertIndices = true, padToTargetVpool = false,
           forcedDonorVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
+          remappedDamageTable = remap)
 
         # Per-section validation: reparse the rebuilt bytes against the
         # target version. Reject on raise, on byte-count mismatch (parser
@@ -255,6 +325,7 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
         if ok:
           thisSecBytes = r.bytes
           thisSpliced = true
+          if remap.isSome: inc damageRemapped
         else:
           when TranscodeTrace:
             stderr.writeLine "    [splice] '" & donSec.name &
@@ -294,6 +365,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   for i in 0 ..< postBytes.len: result.bytes[off + i] = postBytes[i]
   result.spliced = spliced
   result.fallback = fallback
+  result.gapsPreserved = gapsPreserved
+  result.damageRemapped = damageRemapped
 
 # ---- entry point ----
 
@@ -334,6 +407,8 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
       donorVersion: donVer, donorTypeId: donInfo.typeId,
       donorSections: donInfo.sections.len,
       sectionsSpliced: r.spliced, sectionsFallback: r.fallback,
+      gapsPreserved: r.gapsPreserved,
+      damageRemapped: r.damageRemapped,
       note: "v1: per-section splice with donor-fallback on failure")
     result = (r.bytes, report)
 

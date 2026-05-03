@@ -78,8 +78,10 @@ type
     ## donor-specific PKs and the new IDs to substitute in.
     donorCarId*:    int
     donorEngineId*: int
+    donorWheelId*:  int    ## donor's StockWheelID (= List_Wheels.ID); 0 if absent
     newCarId*:      int
     newEngineId*:   int
+    newWheelId*:    int    ## fresh List_Wheels.ID; 0 if no remap requested
     donorMediaName*: string
     newMediaName*:   string
 
@@ -196,35 +198,43 @@ proc keyColFor(db: DbConn, tbl: string): string =
   if hasColumn(db, tbl, "CarID"):   return "CarID"
   return ""
 
-proc isLikelyIdColumn(name: string): bool =
-  ## Whitelist of column names that may carry IDs subject to rewrite.
-  ## Conservative: keeps generic-looking columns (Year, Sequence, Level,
-  ## Price, MassDiff, MakeID, ManufacturerID, RegionID, ColorClassId,
-  ## etc.) untouched. False negatives here just mean we copy a value
-  ## that *may* have been a sub-ID — safer than false positives that
-  ## scramble static FKs. The pattern set was derived from inspecting
-  ## row dumps in `probe/out/dlc_merge_recon.txt`.
+const RewritableIdColumnsLower = [
+  ## Column names (lowercased for case-insensitive match) carrying IDs
+  ## that may be donor PKs or sub-id-encoded FKs (donorCarId*1000+slot,
+  ## donorEngineId*1000+slot). Anything else is copied verbatim — safer
+  ## to leave a static FK alone than to scramble it.
   ##
-  ## "ID" (uppercase) added 2026-05-01: CarPartPositions, Combo_Colors,
-  ## List_TorqueCurve, List_UpgradeEngine etc. all use uppercase ID
-  ## as the sub-id column (donorCarId*1000+slot encoding). Previous
-  ## whitelist only had "Id" lowercase, leaving the uppercase variant
-  ## unchanged → ID/1000 stayed at donorCarId while Ordinal got
-  ## rewritten to newCarId. UDLC preserves the invariant; we should too.
-  if name == "Id" or name == "ID" or name == "Ordinal" or name == "EngineID":
-    return true
-  if name == "AntiSwayPhysicsID" or name == "SpringDamperPhysicsID":
-    return true
-  if name == "FrontSpringDamperPhysicsID" or name == "RearSpringDamperPhysicsID":
-    return true
-  if name == "TorqueCurveID" or name == "TorqueCurveFullThrottleID":
-    return true
-  if name == "CarBodyID" or name == "DrivetrainID":
-    return true
-  if name == "CarId" or name == "CarID":
-    return true
-  if name == "ModelId":
-    return true
+  ## Casing is normalized to lowercase because FH1's schema is
+  ## inconsistent across tables: same logical FK appears as `CarBodyID`
+  ## in some tables and `CarBodyId` / `CarbodyId` in others. Comparing
+  ## case-insensitively means future schema-casing variants don't
+  ## reintroduce the same class of bug.
+  ##
+  ## Audit basis: scanned every INT column in every merge-table against
+  ## base gamedb; any column whose values are >50% sub-id-encoded
+  ## (col/1000 ∈ Data_Car.Id or Data_Engine.EngineID) is in this list.
+  "id", "ordinal", "engineid",
+  # Per-car physics FKs
+  "antiswayphysicsid", "springdamperphysicsid",
+  "frontspringdamperphysicsid", "rearspringdamperphysicsid",
+  "aerophysicsid",  # 2026-05-03: missing entry caused RAD_SR8LM_10 port to
+                    # carry donor's `List_UpgradeRearWing.AeroPhysicsID`
+                    # value verbatim → SQL CE join failure → garbage MediaName
+                    # passed downstream → grey shaders on load.
+  # Engine FKs
+  "torquecurveid", "torquecurvefullthrottleid",
+  # Body FK (CarBodyID/CarBodyId/CarbodyId — all three casings exist in FH1's schema)
+  "carbodyid", "drivetrainid",
+  # Car / model FKs
+  "carid", "modelid",
+  # Stock wheel FK (paired with findUnusedWheelId)
+  "stockwheelid",
+]
+
+proc isLikelyIdColumn(name: string): bool =
+  let lower = name.toLowerAscii
+  for entry in RewritableIdColumnsLower:
+    if lower == entry: return true
   return false
 
 proc rewriteId(v: string, rw: IdRewrite): string =
@@ -236,6 +246,8 @@ proc rewriteId(v: string, rw: IdRewrite): string =
   # Exact match: car-id
   if i == rw.donorCarId: return $rw.newCarId
   if i == rw.donorEngineId: return $rw.newEngineId
+  if rw.donorWheelId > 0 and rw.newWheelId > 0 and i == rw.donorWheelId:
+    return $rw.newWheelId
   # Sub-ID encoding: parentId * 1000 + slot, slot in 0..999
   if rw.donorCarId > 0 and
      i >= rw.donorCarId * 1000 and
@@ -443,6 +455,33 @@ proc findUnusedEngineId(srcDb: DbConn, dlcId: int,
       "no free Data_Engine.EngineID slot in base range [" & $lo & ", " & $hi & "]")
   result = freeSlots[(dlcId * 7919) mod freeSlots.len]
 
+proc findUnusedWheelId(srcDb: DbConn, dlcId: int,
+                       extraSlts: openArray[string] = []): int =
+  ## Allocates a List_Wheels.ID that's not in base AND not in any sibling
+  ## DLC merge.slt's List_Wheels. Same-game ports otherwise emit a
+  ## List_Wheels row at donor's ID, shadowing donor's wheel definition
+  ## with the new car's MediaName — donor's car then resolves to a
+  ## wheels_pri_<dlc>/<NEW_NAME>/ path that doesn't exist for it,
+  ## triggering the SQL CE "attempt to access invalid field or record"
+  ## that gets passed through into a HostPathDevice path lookup → infinite
+  ## load on free-roam resume. Bug isolated 2026-05-02 PM (RAD_SR8LM_10
+  ## TEST DLC).
+  let usedSet = collectUsedIds(srcDb, "List_Wheels", "ID", extraSlts)
+  let (lo, hi) = baseRange(srcDb, "List_Wheels", "ID")
+  if hi < 0: return 100000
+  # Search above base's max — wheel IDs aren't in carId*1000 alias space,
+  # so anywhere outside the existing range is safe. Stay near base for
+  # debuggability; bias by (dlcId * 9007) so sibling DLCs don't collide.
+  var freeSlots: seq[int] = @[]
+  for i in countdown(hi, lo):
+    if i notin usedSet:
+      freeSlots.add(i)
+      if freeSlots.len >= 64: break
+  if freeSlots.len == 0:
+    raise newException(DlcMergeError,
+      "no free List_Wheels.ID slot in base range [" & $lo & ", " & $hi & "]")
+  result = freeSlots[(dlcId * 9007) mod freeSlots.len]
+
 # Kept for back-compat with the smoke test; both now defer to the
 # in-base-range allocators above when called with a real srcDb context.
 proc allocateCarId*(dlcId: int): int = 1600 + (dlcId mod 400)
@@ -451,13 +490,17 @@ proc allocateEngineId*(dlcId: int): int = 1100 + (dlcId mod 400)
 # ---- main builder ----
 
 proc lookupDonorIds(srcDb: DbConn, donorMediaName: string):
-                  tuple[carId: int; engineId: int] =
+                  tuple[carId: int; engineId: int; wheelId: int] =
   result.carId = -1
   result.engineId = -1
+  result.wheelId = 0  # 0 = absent, treated as "no wheel rewrite needed"
   for r in srcDb.fastRows(
-    sql"SELECT Id FROM Data_Car WHERE MediaName=? LIMIT 1", donorMediaName):
+    sql"SELECT Id, StockWheelID FROM Data_Car WHERE MediaName=? LIMIT 1",
+    donorMediaName):
     if r.len > 0:
       try: result.carId = parseInt(r[0]) except CatchableError: discard
+    if r.len > 1:
+      try: result.wheelId = parseInt(r[1]) except CatchableError: discard
     break
   for r in srcDb.fastRows(
     sql"SELECT EngineID FROM Data_Engine WHERE MediaName=? LIMIT 1",
@@ -466,19 +509,53 @@ proc lookupDonorIds(srcDb: DbConn, donorMediaName: string):
       try: result.engineId = parseInt(r[0]) except CatchableError: discard
     break
 
+## Tables with no MediaName / Ordinal / CarId / CarID / EngineID column
+## that key their rows by a sub-id-encoded PK (`donorCarId * 1000 + slot`
+## or `donorEngineId * 1000 + slot`). Without explicit handling these
+## fall through `keyColFor` to "" and `selectDonorRows` returns empty,
+## leaving the new car's merge.slt missing rows that other tables FK
+## into — empirically traced via UDLC parity diff against
+## `4D5309C900000729/72900_merge.slt`. Each tuple is
+## (table, PK column, "carId"|"engineId").
+const SubIdKeyedTables: array[11, tuple[tbl, idCol, scope: string]] = [
+  # Per-car body / chassis
+  ("Data_CarBody",                          "Id",             "carId"),
+  ("List_UpgradeCarBodyChassisStiffness",   "Id",             "carId"),
+  ("List_UpgradeCarBodyFrontBumper",        "Id",             "carId"),
+  ("List_UpgradeCarBodyHood",               "Id",             "carId"),
+  ("List_UpgradeCarBodyRearBumper",         "Id",             "carId"),
+  ("List_UpgradeCarBodySideSkirt",          "Id",             "carId"),
+  ("List_UpgradeCarBodyTireWidthFront",     "Id",             "carId"),
+  ("List_UpgradeCarBodyTireWidthRear",      "Id",             "carId"),
+  ("List_UpgradeCarBodyWeight",             "Id",             "carId"),
+  # Per-car aero (List_UpgradeRearWing.AeroPhysicsID FKs into here;
+  # without this entry the FK dangles → SQL CE error → "Attempt to access
+  # invalid field or record" propagated as a MediaName, which is the
+  # 2026-05-03 RAD_SR8LM_10 grey-shader bug).
+  ("List_AeroPhysics",                      "AeroPhysicsID",  "carId"),
+  # Per-engine torque curve (already-known special case; folded in here
+  # so all sub-id-keyed tables live in one list).
+  ("List_TorqueCurve",                      "TorqueCurveID",  "engineId"),
+]
+
 proc selectDonorRows(srcDb: DbConn, tbl, keyCol: string, rw: IdRewrite):
                     seq[seq[string]] =
   ## Pull donor rows from base gamedb keyed by the table's per-car key.
-  ## Special case: List_TorqueCurve has no per-car key column — fetch
-  ## all rows in TorqueCurveID range [donorEngineId*1000, +1000).
-  if tbl == "List_TorqueCurve":
-    let lo = $(rw.donorEngineId * 1000)
-    let hi = $((rw.donorEngineId + 1) * 1000)
-    let q = "SELECT * FROM " & qIdent(tbl) &
-            " WHERE TorqueCurveID >= ? AND TorqueCurveID < ?"
-    for r in srcDb.fastRows(sql(q), lo, hi):
-      result.add(r)
-    return
+  ## Sub-id-keyed tables (no Ordinal/MediaName column) are dispatched
+  ## via `SubIdKeyedTables`; the rest go through the keyCol-based path.
+  for entry in SubIdKeyedTables:
+    if tbl == entry.tbl:
+      let parentId =
+        if entry.scope == "engineId": rw.donorEngineId
+        else: rw.donorCarId
+      let lo = $(parentId * 1000)
+      let hi = $((parentId + 1) * 1000)
+      let q = "SELECT * FROM " & qIdent(tbl) &
+              " WHERE " & qIdent(entry.idCol) & " >= ? AND " &
+              qIdent(entry.idCol) & " < ?"
+      for r in srcDb.fastRows(sql(q), lo, hi):
+        result.add(r)
+      return
   if keyCol.len == 0: return
   var keyVal = ""
   case keyCol
@@ -600,11 +677,17 @@ proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string
   let newEngineId =
     if forcedEngineId > 0: forcedEngineId
     else: findUnusedEngineId(srcDb, dlcId, siblingDlcSlts)
+  let newWheelId =
+    if donorIds.wheelId > 0:
+      findUnusedWheelId(srcDb, dlcId, siblingDlcSlts)
+    else: 0
   let rw = IdRewrite(
     donorCarId: donorIds.carId,
     donorEngineId: donorIds.engineId,
+    donorWheelId: donorIds.wheelId,
     newCarId: newCarId,
     newEngineId: newEngineId,
+    newWheelId: newWheelId,
     donorMediaName: donorMediaName,
     newMediaName: newMediaName)
 
@@ -630,6 +713,26 @@ proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string
     for tbl in DlcTables:
       let n = cloneTable(srcDb, dstDb, tbl, rw, snippet)
       result.perTableRows[tbl] = n
+    # ContentOffers + ContentOffersMapping aren't donor-derived — they
+    # describe THIS DLC's purchase offer and bind it to the new carId.
+    # Without these rows the runtime won't surface the car in autoshow
+    # (XamContentCreateEnumerator finds the package, but the autoshow
+    # query joins ContentOffers/Mapping → no offer → no listing).
+    # Was previously hand-applied via /tmp/merge_compare/post_port.sh;
+    # wired in here so re-running port-to-dlc --replace doesn't drop it.
+    # Format mirrors the sample DLC (4D5309C900000729) row shape.
+    let offerId = 5571807927127299000 + dlcId
+    let offerPk = "4D5309C90" & $dlcId & "FFFF"
+    dstDb.exec(sql"""
+      INSERT INTO "ContentOffers" VALUES
+      (?, ?, '_&3100663008', '_&3100649066',
+       ?, 2, 0, 1, '', '', 1, 1, 0, 0, 0, 0)""",
+      offerPk, $offerId, $dlcId)
+    dstDb.exec(sql"""
+      INSERT INTO "ContentOffersMapping" VALUES (?, ?, ?, 1)""",
+      $(dlcId * 1000 + newCarId), $offerId, $newCarId)
+    result.perTableRows["ContentOffers"] = 1
+    result.perTableRows["ContentOffersMapping"] = 1
     dstDb.exec(sql"COMMIT")
   except CatchableError as e:
     dstDb.exec(sql"ROLLBACK")

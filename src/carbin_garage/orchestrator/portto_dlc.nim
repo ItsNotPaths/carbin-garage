@@ -461,7 +461,9 @@ proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
             "transcode failed for " & ga.zipEntryName & ": " & e.msg)
       stderr.writeLine "    [transcode] " & extractFilename(ga.zipEntryName) &
         ": spliced=" & $r.report.sectionsSpliced &
-        " fallback=" & $r.report.sectionsFallback
+        " fallback=" & $r.report.sectionsFallback &
+        " gaps=" & $r.report.gapsPreserved &
+        " damageRemap=" & $r.report.damageRemapped
       if r.report.mode != tmDonorVerbatim:
         result[ga.zipEntryName] = r.bytes
     of dgaDonorOnly, dgaSourceExtra:

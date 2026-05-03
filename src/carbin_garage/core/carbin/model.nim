@@ -42,6 +42,15 @@ type
     subsectionsStart*, subsectionsEnd*: int
     vertexCountPos*, vertexSizePos*: int
     tailStart*: int
+    # Section tail positions captured during the cvFour / cvFive tail walk.
+    # `aFieldPos` points at the `a` u32 itself (cvFive: tailStart+13;
+    # cvFour: tailStart+9). aTable / cTable spans cover the table bytes
+    # only — not the surrounding length / reserved fields. Used by Slice D
+    # damage-table remap to splice a srcVCount-sized table over donor's
+    # donVCount-sized one without disturbing other tail bytes.
+    aFieldPos*: int
+    aTableStart*, aTableEnd*: int
+    cTableStart*, cTableEnd*: int
 
   CarbinVersion* = enum
     cvUnknown = "Unknown"

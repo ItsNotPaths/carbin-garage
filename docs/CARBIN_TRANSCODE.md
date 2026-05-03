@@ -20,6 +20,12 @@ This means:
 - **LOD0 pool, lod0/cockpit per-vertex stream, post-pool stream** stays
   donor-verbatim — those slots aren't synthesized yet (see
   *Limitations* below).
+- **LOD0-only sections inside the main carbin** stay donor-verbatim
+  via the *gap-preservation* pass (Slice C, see below). The body
+  parser raises on these and skips forward; we copy the donor bytes
+  between consecutive parsed sections so the LOD0-only data lands in
+  the output even though the parser never resolved them as discrete
+  `SectionInfo` entries.
 
 Per-section name match drives the splice; on any failure the section
 falls back to donor verbatim, so partial transcode (e.g. main spliced,
@@ -148,26 +154,134 @@ there's no next-section marker, so the parser's no-marker fallback
 consumes a fixed 4 bytes regardless of actual pad. Allow up to 8 bytes
 of slack between `consumed` and `r.bytes.len`.
 
-## Limitations (Slice C and beyond)
+## Slice C — gap preservation (LANDED 2026-05-02 PM)
 
-- **LOD0-only sections in main carbin (R8 BLOCKER, 2026-05-02)**:
-  alfa's main carbin had zero LOD0-only sections (every part has a
-  real LOD), so it shipped clean. R8's main carbin has 12 LOD0-only
-  sections. The current splice driver's per-section donor-fallback
-  path emits empty / malformed bytes at those slots — `nim_parse_dump`
-  on the output reports `parts: 49 parsed: 37` with the first 4
-  sections coming back as `hasUnk=false unk=-1 off=(0,0,0)`. FH1
-  enters autoshow OK (LOD0 fallback chain renders something) but
-  throws C++ exception E06D7363 on autoshow→drive transition when the
-  renderer/physics dereferences the malformed section data.
+Cars with LOD0-only sections inside the main carbin (R8GT_11 has 12;
+alfa has 0) ship a section layout the parser can't fully resolve. The
+body parser walks `partCount` iterations, and on each iteration's
+`parseSection` raise it scans forward for the next valid
+`[u32=5][9 sane floats]` marker and resumes. The bytes it scans past
+ARE the LOD0-only sections — the layout differs (e.g. no
+`m_NumBoneWeights` block before a non-existent LOD pool) and the
+parser's structural walk drifts through them.
 
-  **Fix scope**: in `core/carbin/transcode.nim:tmHybridSplice`,
-  detect `donSec.lod0VerticesCount > 0 and donSec.lodVerticesCount == 0`
-  and emit donor's section bytes verbatim into the output buffer at
-  the section's slot. Track sections-end so the parts-count footer
-  stays consistent. Validate via `probe/nim_parse_dump` on the
-  output: should report `parts: 49 parsed: 49`, all sections show
-  non-zero name + `unk=5` + correct off/tgt fields.
+R8GT_11's parse: `parts: 49 parsed: 37`. Indices 0, 5, 39..48 fail.
+Indices 1..4 parse as garbage (zero unk / empty name); 6..38 are real.
+
+Pre-Slice-C, the splice driver only emitted donor bytes for the 37
+parsed sections, dropping the bytes between them (where the LOD0-only
+sections live). Output declared `partCount=49` but contained byte
+ranges for ~37 sections, so FH1's main thread walked off into the
+file footer at section 38 → C++ exception E06D7363 at
+autoshow→drive transition.
+
+**Fix** (`core/carbin/transcode.nim:spliceCarbin`): inside the
+per-section emit loop, before emitting section `k`, check the gap
+between `donInfo.sections[k-1].endPos` and `donInfo.sections[k].start`.
+If non-zero, copy donor bytes for that range into the output verbatim.
+Combined with `preBytes` (donor[0..sections[0].start)) and `postBytes`
+(donor[sections[^1].endPos..end)), this preserves donor bytes for
+EVERY range between/before/after parsed sections. The unparsed
+LOD0-only sections survive byte-for-byte in those ranges.
+
+Spliced sections still get rebuilt from source vertex/index data into
+donor's section template; the gap fix only affects bytes the parser
+couldn't resolve. Output is structurally identical to donor (same
+parsed-section indices, same `partCount`) and byte-different from
+donor (real splice).
+
+The transcode log now reports `gaps=N` alongside `spliced` / `fallback`
+counts; `R8GT_11.carbin` shows `spliced=31 fallback=6 gaps=1` — the
+single mid-list gap between sec[4] and sec[6] (k=5 failed); the
+trailing 10 unparsed sections (k=39..48) live inside `postBytes`
+already.
+
+## Slice D — damage table cross-game translation (OPEN, 2026-05-02)
+
+After Slice C landed, R8 boots through autoshow→drive in-game without
+crash. New issue surfaced: collision deformation produces multi-meter
+spike artifacts in body sections. Pristine model renders correctly;
+crash deformation explodes.
+
+### Mechanism
+
+Each carbin section's tail (post-§6 c*d region) carries an `a*b table`
+of `vCount × 4` bytes — one 4-byte record per vertex. For body
+sections this is the per-vertex skinning / damage-zone payload the
+deform system reads on impact. For non-deformable sections (seat,
+glass non-window, wheel, steering_wheel) `a == 0, b == 0` — table is
+absent and FH1 renders the section static-with-skin-scaffold.
+
+`probe/nim_slice_d_probe.nim` across 7 paired FM4↔FH1 cars (184
+sections) shows:
+
+- **a/b SHAPE matches 100%** between FM4 and FH1 (always same record
+  count and stride).
+- **byteEq splits 50/50**: empty tables vacuously equal; body tables
+  CONTENT differs between games. Each game's deform model encodes
+  different payloads in the 4 bytes (FM4: per-vertex displacement;
+  FH1: skeleton-driven skinning indices+weights).
+- The docs claim "round-trips verbatim" applies to same-game
+  round-trips, NOT cross-game equivalence.
+
+`extra4 bytes 1..3` in the vertex stream are NOT bone weights —
+entropy patterns match DEC3N tangent/normal encoding. Slice D doesn't
+need to touch the vertex stream.
+
+`perSectionId` is a unique-random 32-bit hash per section; donor's
+value is fine to keep for any spliced section.
+
+### Why current code fails
+
+`builders.nim:buildSectionConvertedToTargetLodOnTargetTemplate` line
+~250 copies `suffixFromVc = donor[vertexCountPos..end)` verbatim. That
+includes donor's a*b table indexed by **donor's vertex order**. We
+splice source's vertex pool in source's order. Donor record at slot 0
+says "vertex 0 attaches to bone X with weight W" — but source's
+vertex 0 lives at a different world-position. Impact moves bone X →
+source vertex 0 deflects to wrong world-space → multi-meter spike.
+
+### Slice D plan — translation, not bypass
+
+User explicitly rejected the cop-out (zero out the table). FH1 has an
+in-game "no visual damage" toggle as a SAFETY NET, not the strategy.
+Implement actual translation via spatial nearest-neighbor remap:
+
+1. **Probe v2**: dump donor `body` section a*b table — slot-by-slot
+   histograms + first 16 records + each record paired with its
+   vertex's decoded world-position. Confirm slot[0] is a small int
+   (bone index, ~20-50 unique values) and adjacent vertices in
+   world-space share bone IDs (spatial coherence).
+2. **`core/carbin/damage_remap.nim`**: for each src vertex i, decode
+   srcPos from vertex bytes, find donor vertex j with min squared
+   distance to srcPos, output `donATable[bestJ*4 ..< (bestJ+1)*4]`
+   into row i. Naive O(N×M); body has ~12k verts, runs in seconds.
+3. **Parser**: extend `SectionInfo` with `aTableStart`, `aTableEnd`,
+   `cTableStart`, `cTableEnd`. Currently transient locals in
+   `parseSection`.
+4. **Builder**: split `suffixFromVc` into `donor[vertexCountPos..tailStart)`
+   + `donor[tailStart..aTableStart)` + **remapped a*b table** +
+   `donor[aTableEnd..end)`. Add new builder param
+   `remappedDamageTable: Option[seq[byte]]`.
+5. **Transcode**: in `spliceCarbin`, for each spliced body section
+   (a > 0), call remapDamageTable + pass to builder.
+6. **In-game test**: crash R8, expect approximately-correct crumple
+   instead of spikes.
+7. **Escalation**: if NN remap is too lossy at bone-region edges,
+   RE FH1 bone hierarchy from physicsdefinition.bin and synthesize
+   the table from bone region maps directly.
+
+### What NOT to do
+
+- Don't take Path A "zero out the table" — user explicitly rejected.
+- Don't translate FM4's a*b bytes into FH1 form — different deform
+  models, bytes are not interchangeable.
+- Don't change `mNbw` or `perSectionId` — scaffold metadata, FH1
+  expects donor-shaped.
+
+## Limitations (post-Slice C)
+
+- **Cross-game damage deformation**: see Slice D above.
 
 - **LOD0-only sections in standalone carbins** (lod0.carbin,
   cockpit.carbin, caliper / rotor LOD0s): splice driver currently
@@ -201,12 +315,16 @@ build/carbin-garage port-to-dlc working/ALF_8C_08 fh1 \
 nim c -r --hints:off -d:release --out:/tmp/check.bin probe/nim_transcode_v1_check.nim
 ```
 
-Expected output (post-Slice B v2, FM4 → FH1):
+Expected output (post-Slice C, FM4 → FH1):
 
-- `[transcode] <CAR>.carbin: spliced=33 fallback=0`
-- `[transcode] <CAR>_lod0.carbin: spliced=0 fallback=20` (Slice C)
-- `[transcode] <CAR>_cockpit.carbin: spliced=0 fallback=20` (Slice C)
-- All caliper / rotor LOD0s: `spliced=0 fallback=1` (Slice C)
+- `[transcode] <CAR>.carbin: spliced=N fallback=M gaps=K`
+  - alfa: `spliced=33 fallback=0 gaps=0` (no LOD0-only in main)
+  - R8: `spliced=31 fallback=6 gaps=1` (12 LOD0-only sections, one
+    mid-list gap + trailing 10 absorbed into postBytes)
+- `[transcode] <CAR>_lod0.carbin: spliced=0 fallback=20 gaps=0` (next
+  splice target — see *Limitations* below)
+- `[transcode] <CAR>_cockpit.carbin: spliced=0 fallback=20 gaps=0`
+- All caliper / rotor LOD0s: `spliced=0 fallback=1 gaps=0`
 
 Probe shows main carbin reparses with all-28 LOD strides; rebuilt
 output is byte-different from donor, confirming real splice.
@@ -230,6 +348,14 @@ By symmetry of each delta:
    SubSectionInfo offsets by `-4`.
 4. **Section tail**: cvFour tail is 12 bytes shorter; reuse donor's
    cvFour template tail via `suffixFromVc`.
+
+**Slice C symmetry (FH1 → FM4)**: gap preservation is direction-
+agnostic — `spliceCarbin` always emits donor bytes for ranges between
+parsed sections, regardless of which version is donor. FM4 cars don't
+typically carry LOD0-only sections in main carbin (cvFour layout is
+simpler), so for FH1→FM4 the FM4 donor will likely yield zero gaps and
+the loop is a no-op. If a future FM4 donor turns out to have its own
+parser-skipped regions, the same gap-emit machinery preserves them.
 
 Donor selection: pick an FM4 car with the same part topology
 (matching sections / subsection counts, similar vCounts to allow

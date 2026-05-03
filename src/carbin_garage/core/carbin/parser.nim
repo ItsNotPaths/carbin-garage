@@ -169,6 +169,11 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
   let lod0VerticesEnd = r.tell()
   let tailStart = r.tell()
 
+  var aFieldPos = 0
+  var aTableStart = 0
+  var aTableEnd = 0
+  var cTableStart = 0
+  var cTableEnd = 0
   if ver == cvFive:
     # FH1 tail layout, RE'd in docs/FH1_CARBIN_TYPEID5.md §6:
     #   [13 init][a u32][b u32][4 reserved=1][a*b table][4 mid-skip]
@@ -183,16 +188,21 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
     # without the extra stream and picking whichever lands on a valid
     # next-section marker.
     r.seek(13, 1)
+    aFieldPos = r.tell()
     let a = r.u32(); let b = r.u32()
     if a > 1_000_000'u32 or b > 256'u32:
       raise newException(ValueError, "section tail a/b insane")
     r.seek(4, 1)
+    aTableStart = r.tell()
     r.seek(int(a) * int(b), 1)
+    aTableEnd = r.tell()
     r.seek(4, 1)
     let c = r.u32(); let d = r.u32()
     if c > 1_000_000'u32 or d > 256'u32:
       raise newException(ValueError, "section tail c/d insane")
+    cTableStart = r.tell()
     r.seek(int(c) * int(d), 1)
+    cTableEnd = r.tell()
     let probeStart = r.tell()
     let extraStream = int(lod0VCount) * 4
     var snapped = false
@@ -226,11 +236,16 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
         r.seek(4, 1)
   else:
     r.seek(9, 1)
+    aFieldPos = r.tell()
     let a = r.u32(); let b = r.u32()
+    aTableStart = r.tell()
     r.seek(int(a) * int(b), 1)
+    aTableEnd = r.tell()
     r.seek(4, 1)
     let c = r.u32(); let d = r.u32()
+    cTableStart = r.tell()
     r.seek(int(c) * int(d), 1)
+    cTableEnd = r.tell()
 
   let secEnd = r.tell()
 
@@ -248,7 +263,10 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
     subpartCountPos: subpartCountPos,
     subsectionsStart: subsectionsStart, subsectionsEnd: subsectionsEnd,
     vertexCountPos: vertexCountPos, vertexSizePos: vertexSizePos,
-    tailStart: tailStart
+    tailStart: tailStart,
+    aFieldPos: aFieldPos,
+    aTableStart: aTableStart, aTableEnd: aTableEnd,
+    cTableStart: cTableStart, cTableEnd: cTableEnd
   )
 
 proc tryParseSection*(data: openArray[byte], ver: CarbinVersion):
