@@ -13,6 +13,7 @@ import ./orchestrator/portto
 import ./orchestrator/portto_dlc
 import ./orchestrator/patchxex
 import ./core/xex2_patches
+import ./core/carbin/emitter as carbin_emitter
 
 const
   NAME = "carbin-garage"
@@ -412,6 +413,40 @@ proc cmdMounts(args: seq[string]) =
     let exists = dirExists(m.folder)
     echo "  ", m.gameId, "  ", m.folder, (if exists: "" else: "  [missing]")
 
+proc cmdExportCarbin(args: seq[string]) =
+  ## Stage 2: glTF → carbin re-emit. Today's scope: round-trip every
+  ## carbin from `working/<slug>/.archive/source.zip` to
+  ## `working/<slug>/geometry/<name>.carbin.regen`. Edit-emission is
+  ## the deferred follow-up; today the emitter passes donor bytes
+  ## verbatim (so byte-equal round-trip is trivial).
+  ##
+  ##   carbin-garage export-carbin <slug-or-working-dir> [--strict]
+  if args.len == 0:
+    echo "export-carbin: missing <slug-or-working-dir>"; quit 1
+  let arg = args[0]
+  let strict = "--strict" in args
+  # Accept both a bare slug (resolved relative to ./working/) and an
+  # absolute / relative working-car path.
+  var workDir = ""
+  if dirExists(arg): workDir = arg
+  elif dirExists("working" / arg): workDir = "working" / arg
+  else:
+    echo "export-carbin: not a working dir: ", arg
+    quit 1
+  try:
+    let report = exportCarbinsFromWorking(workDir, strict = strict)
+    echo "export-carbin -> ", workDir / "geometry"
+    echo "  carbins written: ", report.carbinsWritten,
+         " (", report.bytesWritten, " bytes)"
+    echo "  fell through to donor: ", report.fellThroughToDonor,
+         " / edited: ", report.sectionsEdited
+    if report.warnings.len > 0:
+      echo "  warnings:"
+      for w in report.warnings: echo "    - ", w
+  except IOError as e:
+    echo "export-carbin: ", e.msg
+    quit 1
+
 proc cmdPatchXex(args: seq[string]) =
   if args.len == 0:
     echo "patch-xex: missing <path-to-default.xex>"; quit 1
@@ -633,6 +668,8 @@ proc mainWithArgs*(args: openArray[string]) =
     cmdPortToDlc(rest)
   of "patch-xex":
     cmdPatchXex(rest)
+  of "export-carbin":
+    cmdExportCarbin(rest)
   else:
     echo "TODO: command '" & cmd & "' not yet implemented"
     quit(1)

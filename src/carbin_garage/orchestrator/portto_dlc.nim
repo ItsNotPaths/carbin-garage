@@ -437,16 +437,49 @@ proc buildRenames(donorEntries: seq[Entry], donorSlug, newSlug: string):
 
 proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
   ## Build the edits table for `rewriteZipMixedMethod`. Mirrors
-  ## `portto.nim:collectEdits` but trimmed to geometry only — the texture
-  ## splice path is intentionally not wired yet (the working tree's
-  ## per-bucket re-encoded `.xds` files come in via the same mechanism;
-  ## leaving it on the TODO list keeps this scaffold focused on package-
-  ## tree shape).
+  ## `portto.nim:collectEdits`. Both texture splice and geometry
+  ## transcode produce edits keyed on the donor zip's entry names so
+  ## the rewriter can match-and-replace.
+  ##
+  ## Texture plan handling:
+  ##   - topCopySource: read source's `.xds` from working/<slug>/textures/
+  ##     and replace donor's same-bucket entry. Bucket is matched by
+  ##     lowercased basename (donor may carry the entry under a different
+  ##     casing — e.g. FH1 `headlight_LOD0.xds` vs FM4 `headlight_lod0.xds`).
+  ##   - topSpliceDonor: donor passthrough — rewriter does this for free.
+  ##   - topDropExtra: same — source-only buckets aren't in donor, nothing
+  ##     to drop.
   result = initTable[string, seq[byte]]()
   let donorIdx = indexZipEntries(p.donorCarsZip)
   var donorEntryByBase = initTable[string, Entry]()
   for e in donorIdx.entries:
     donorEntryByBase[extractFilename(e.name).toLowerAscii()] = e
+
+  # Textures (Stage 3 § 3.3): wire texture splice into emit. The plan's
+  # `ops` list was built by planTexturePort during planPortToDlc; here
+  # we consume it. CANONICAL bytes live at working/<slug>/textures/<bucket>.xds
+  # — the .png sidecars from Stage 1 are for inspection only and are NOT
+  # used here.
+  let workingTexDir = p.workingCar / "textures"
+  for op in p.texturePlan.ops:
+    case op.kind
+    of topCopySource:
+      let srcPath = workingTexDir / op.sourceName
+      if not fileExists(srcPath):
+        stderr.writeLine "    [texture] missing source: " & srcPath & " (skipped)"
+        continue
+      let bytes = readFileBytes(srcPath)
+      let donorKey = op.targetName.toLowerAscii()
+      let donorEntryName =
+        if donorKey in donorEntryByBase: donorEntryByBase[donorKey].name
+        else: op.targetName  # donor lacks it; rewriter doesn't add new
+                              # entries, so this falls through silently.
+                              # Tracked: same Slice B concern as portto.nim.
+      result[donorEntryName] = bytes
+    of topSpliceDonor, topDropExtra:
+      discard
+
+  # Geometry.
   for ga in p.geometryActions:
     case ga.kind
     of dgaTranscode:

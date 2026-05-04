@@ -61,6 +61,54 @@ proc validateGltf*(path: string): tuple[ok: bool; step: GltfValidateStep; rc: in
   cgltf_free(data)
   result = (valRc == 0, vsValidate, valRc.int)
 
+proc validateRoundtripExtras*(gltfPath: string): seq[string] =
+  ## Stage 2 pre-flight gate. Returns a list of missing extras keys that
+  ## the round-trip emitter requires. Empty list means the glTF is ready
+  ## for `export-carbin`. The emitter's CLI verb checks this and refuses
+  ## to run if the list is non-empty (with a pointer to the Stage 1
+  ## refactor plan).
+  ##
+  ## Required keys (per stage1-importwc-refactor.md § 1.6):
+  ##   - top-level extras.carbin.version
+  ##   - per-mesh extras.carbin.bbox.{offset,targetMin,targetMax}
+  ##   - per-mesh extras.carbin.rawQuatLod or rawQuatLod0 (at least one)
+  ##   - per-primitive extras.carbin.{uvXScale,uvYScale,uvXOffset,uvYOffset,
+  ##                                  uv1XScale,uv1YScale,uv1XOffset,uv1YOffset}
+  result = @[]
+  let j = parseFile(gltfPath)
+
+  let topVer = j{"extras", "carbin", "version"}
+  if topVer == nil or topVer.kind != JString or topVer.getStr.len == 0:
+    result.add("top-level extras.carbin.version")
+
+  if not j.hasKey("meshes"):
+    result.add("meshes[]"); return
+  for mi, m in j["meshes"].getElems:
+    let mc = m{"extras", "carbin"}
+    if mc == nil or mc.kind != JObject:
+      result.add("meshes[" & $mi & "].extras.carbin"); continue
+    let bb = mc{"bbox"}
+    if bb == nil or bb.kind != JObject:
+      result.add("meshes[" & $mi & "].extras.carbin.bbox")
+    else:
+      for f in ["offset", "targetMin", "targetMax"]:
+        let v = bb{f}
+        if v == nil or v.kind != JArray or v.len < 3:
+          result.add("meshes[" & $mi & "].extras.carbin.bbox." & f)
+    if mc{"rawQuatLod"} == nil and mc{"rawQuatLod0"} == nil:
+      result.add("meshes[" & $mi & "].extras.carbin.rawQuat{Lod,Lod0}")
+
+    if not m.hasKey("primitives"): continue
+    for pi, p in m["primitives"].getElems:
+      let pc = p{"extras", "carbin"}
+      if pc == nil or pc.kind != JObject:
+        result.add("meshes[" & $mi & "].primitives[" & $pi & "].extras.carbin"); continue
+      for f in ["uvXScale", "uvYScale", "uvXOffset", "uvYOffset",
+                "uv1XScale", "uv1YScale", "uv1XOffset", "uv1YOffset"]:
+        let v = pc{f}
+        if v == nil or v.kind notin {JFloat, JInt}:
+          result.add("meshes[" & $mi & "].primitives[" & $pi & "].extras.carbin." & f)
+
 # ----- glTF constants -----
 
 const
@@ -87,6 +135,10 @@ type
     materialByKey*: Table[string, int]   # spec-cache key → material index
     imageByUri*: Table[string, int]      # uri → image index (dedupe)
     bufferUri*: string
+    cgVersion*: string                   # carbin-version tag for top-level
+                                          # extras.carbin.version (Stage 2
+                                          # round-trip prereq). "" means
+                                          # don't emit the field.
     # Per-mesh placement overrides for finish().
     # If a mesh index appears in `instances`, finish() emits one node per
     # listed translation instead of the default single node at origin.
@@ -173,6 +225,38 @@ proc addBufferView(b: var GltfBuilder, byteLen: int, target: int): int =
     "target": target}
   b.bufferViews.add(view)
   result = b.bufferViews.high
+
+proc addRawBufferView(b: var GltfBuilder, bytes: openArray[byte]): int =
+  ## Untyped (no-target) bufferView for arbitrary binary blobs. Used by
+  ## Stage 2 round-trip prereq emit to park raw int16[4] quaternion
+  ## streams in car.bin without exposing them as glTF accessors (they
+  ## have no standard component layout in the spec). Caller stores the
+  ## bufferView index in extras and decodes it itself.
+  alignTo4(b.binBuf)
+  let off = b.binBuf.len
+  b.binBuf.setLen(off + bytes.len)
+  if bytes.len > 0:
+    copyMem(addr b.binBuf[off], unsafeAddr bytes[0], bytes.len)
+  let view = %*{
+    "buffer": 0,
+    "byteOffset": off,
+    "byteLength": bytes.len}
+  b.bufferViews.add(view)
+  result = b.bufferViews.high
+
+proc extractRawQuat(pool: openArray[byte], stride: int): seq[byte] =
+  ## Pull the per-vertex int16[4] quaternion bytes ([16..24) within each
+  ## stride) from a vertex pool. Both FM4 (stride 32) and FH1 (stride 28)
+  ## carry the quat at the same byte offset; only the trailing extra
+  ## bytes differ. Returns an 8 * vertexCount byte stream, big-endian as
+  ## stored on disk.
+  if pool.len == 0 or stride <= 0: return @[]
+  if pool.len mod stride != 0: return @[]
+  let n = pool.len div stride
+  result = newSeq[byte](n * 8)
+  for i in 0 ..< n:
+    for j in 0 ..< 8:
+      result[i*8 + j] = pool[i*stride + 16 + j]
 
 proc writeFloatsAt(b: var GltfBuilder, off: int, vals: openArray[float32]) =
   for i, v in vals:
@@ -448,7 +532,19 @@ proc emitSection*(b: var GltfBuilder, data: openArray[byte], sec: SectionInfo,
           "lod":       int(ss.lod),
           "indexType": int(ss.indexType),
           "idxSize":   int(ss.idxSize),
-          "subName":   ss.name
+          "subName":   ss.name,
+          # Raw per-subsection UV transform from m_UVOffsetScale. The
+          # writer bakes these into TEXCOORD_0/1 above, so consumers get
+          # baked UVs by default; Stage 2 inverse-emit reads these to
+          # un-bake before re-quantizing back into the carbin pool.
+          "uvXScale":   ss.uvXScale,
+          "uvYScale":   ss.uvYScale,
+          "uvXOffset":  ss.uvXOffset,
+          "uvYOffset":  ss.uvYOffset,
+          "uv1XScale":  ss.uv1XScale,
+          "uv1YScale":  ss.uv1YScale,
+          "uv1XOffset": ss.uv1XOffset,
+          "uv1YOffset": ss.uv1YOffset
         }}}
     let spec = resolveMaterial(ss.name, availableTextures)
     # If the subsection's UV scale is effectively zero, the shader is
@@ -473,14 +569,42 @@ proc emitSection*(b: var GltfBuilder, data: openArray[byte], sec: SectionInfo,
   # Blender add-ons, etc.) can filter "show only lod0" without re-parsing
   # the carbin metadata. All LODs ride into one glTF for porting; the UI
   # displays lod0-tagged meshes and edits flow back into geometry/<part>.carbin.
+  #
+  # Stage 2 round-trip extras (added 2026-05-04):
+  #   - bbox: per-section offset/targetMin/targetMax floats. Stage 2's
+  #     ShortN re-quantize uses this to map float positions back into
+  #     int16 pool entries.
+  #   - rawQuatLod / rawQuatLod0: bufferView indices into car.bin holding
+  #     the original int16[4] quaternion bytes verbatim. Lossless tangent-
+  #     space preservation for un-edited geometry. Either field may be
+  #     absent if the corresponding pool was empty.
+  var carbinExtras = %*{
+    "lodKind":      lodKind,
+    "sourceCarbin": sourceCarbin,
+    "bbox": {
+      "offset":    [xform.offset[0],    xform.offset[1],    xform.offset[2]],
+      "targetMin": [xform.targetMin[0], xform.targetMin[1], xform.targetMin[2]],
+      "targetMax": [xform.targetMax[0], xform.targetMax[1], xform.targetMax[2]]
+    }}
+  if lodPool.len > 0 and sec.lodVerticesSize > 0'u32:
+    let raw = extractRawQuat(lodPool, int(sec.lodVerticesSize))
+    if raw.len > 0:
+      let bv = addRawBufferView(b, raw)
+      carbinExtras["rawQuatLod"] = %*{
+        "bufferView": bv,
+        "count":      raw.len div 8}
+  if lod0Pool.len > 0 and sec.lod0VerticesSize > 0'u32:
+    let raw = extractRawQuat(lod0Pool, int(sec.lod0VerticesSize))
+    if raw.len > 0:
+      let bv = addRawBufferView(b, raw)
+      carbinExtras["rawQuatLod0"] = %*{
+        "bufferView": bv,
+        "count":      raw.len div 8}
   let mesh = %*{
     "name": sec.name,
     "primitives": primitives,
     "extras": {
-      "carbin": {
-        "lodKind":      lodKind,
-        "sourceCarbin": sourceCarbin
-      }}}
+      "carbin": carbinExtras}}
   b.meshes.add(mesh)
   result = b.meshes.high
 
@@ -522,4 +646,9 @@ proc finish*(b: GltfBuilder, gltfPath, binPath: string) =
   if b.textures.len > 0:  root["textures"]  = %b.textures
   if b.samplers.len > 0:  root["samplers"]  = %b.samplers
   if b.materials.len > 0: root["materials"] = %b.materials
+  # Top-level carbin extras: version tag tells Stage 2 which target's
+  # vertex/section layout to emit (cvFour = FM4, cvFive = FH1, cvTwo /
+  # cvThree = FM2/FM3 read-only).
+  if b.cgVersion.len > 0:
+    root["extras"] = %*{"carbin": {"version": b.cgVersion}}
   writeFile(gltfPath, $root)

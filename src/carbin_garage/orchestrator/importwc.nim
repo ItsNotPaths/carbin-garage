@@ -108,6 +108,13 @@ proc emitCarbinFile(b: var GltfBuilder, path, label: string,
   let baseName = extractFilename(path)
   try:
     let info = parseFm4Carbin(data)
+    # Stamp the glTF builder with the source carbin's version on first
+    # parse so finish() can emit extras.carbin.version for Stage 2's
+    # round-trip emitter. All carbins in one car archive should agree on
+    # the version (FM4 family vs FH1 family); successive calls overwrite,
+    # but values match in practice since the archive is single-game.
+    if b.cgVersion.len == 0:
+      b.cgVersion = $info.version
     var added = 0
     for sec in info.sections:
       let hasLod  = sec.lodVerticesCount > 0'u32  and sec.lodVerticesSize > 0'u32
