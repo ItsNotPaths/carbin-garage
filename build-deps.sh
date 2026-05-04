@@ -83,7 +83,7 @@ fi
 # SDL3_ttf bundle libpng/libjpeg/libwebp/libtiff/dav1d/avif/freetype/etc. as
 # static .a files alongside their own.
 SDL3_IMAGE_FLAGS=("-DSDL3IMAGE_VENDORED=ON" "-DSDL3IMAGE_BACKEND_STB=ON")
-SDL3_TTF_FLAGS=("-DSDL3TTF_VENDORED=ON")
+SDL3_TTF_FLAGS=("-DSDLTTF_VENDORED=ON" "-DSDLTTF_HARFBUZZ=OFF" "-DSDLTTF_PLUTOSVG=OFF")
 
 build_one() {
     local name="$1"
@@ -99,7 +99,12 @@ build_one() {
 }
 
 build_one sdl3       "$VENDOR/sdl3"       -DSDL_STATIC=ON -DSDL_SHARED=OFF
-build_one sdl3_image "$VENDOR/sdl3_image" "${SDL3_IMAGE_FLAGS[@]}" "-DSDL3_DIR=$PREFIX/lib/cmake/SDL3"
+# SDL3_image skipped: nothing in Nim code calls IMG_Load yet (we use stb_image
+# from csrc/ for our own decoders). Re-enable once a real consumer needs it —
+# its 3.4.2 CMake hits an upstream bug querying SDL_FULL_VERSION on the
+# imported INTERFACE target. The Nim FFI bindings still compile because the
+# headers live independently in vendor/sdl3_image/include/.
+# build_one sdl3_image "$VENDOR/sdl3_image" "${SDL3_IMAGE_FLAGS[@]}" "-DSDL3_DIR=$PREFIX/lib/cmake/SDL3"
 build_one sdl3_ttf   "$VENDOR/sdl3_ttf"   "${SDL3_TTF_FLAGS[@]}"   "-DSDL3_DIR=$PREFIX/lib/cmake/SDL3"
 
 echo "==> $TARGET deps installed at $PREFIX"

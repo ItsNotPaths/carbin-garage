@@ -116,6 +116,21 @@ proc allTableNames(db: DbConn): seq[string] =
   for r in db.fastRows(sql"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
     if r.len > 0: result.add(r[0])
 
+proc listMediaNames*(gamedbPath: string): seq[string] =
+  ## Enumerate every `Data_Car.MediaName` in the game DB. Used by the GUI
+  ## bottom-dropup row to show every car the game knows about (including
+  ## ones whose carbin is bundled in a base-game .CAB rather than a loose
+  ## .zip in `cars/`). Returns [] if the DB is missing or the table doesn't
+  ## have a MediaName column.
+  if not fileExists(gamedbPath): return @[]
+  let db =
+    try: open(gamedbPath, "", "", "")
+    except CatchableError: return @[]
+  defer: db.close()
+  for r in db.fastRows(sql"SELECT MediaName FROM Data_Car ORDER BY MediaName"):
+    if r.len > 0 and r[0].len > 0:
+      result.add(r[0])
+
 proc extractCarDb*(gamedbPath: string, mediaName: string,
                    originGame: string = ""): JsonNode =
   ## Read every per-car row across the game DB into a JSON snippet.

@@ -593,13 +593,13 @@ proc cmdExportTo(args: seq[string]) =
   else:
     echo "  wrote ", plan.targetZip
 
-proc main*() =
-  if paramCount() == 0:
+proc mainWithArgs*(args: openArray[string]) =
+  if args.len == 0:
     usage(); quit(0)
-  let cmd = paramStr(1).toLowerAscii()
+  let cmd = args[0].toLowerAscii()
   var rest: seq[string] = @[]
-  for i in 2 .. paramCount():
-    rest.add(paramStr(i))
+  for i in 1 ..< args.len:
+    rest.add(args[i])
   case cmd
   of "version", "--version", "-v":
     echo VERSION
@@ -636,3 +636,9 @@ proc main*() =
   else:
     echo "TODO: command '" & cmd & "' not yet implemented"
     quit(1)
+
+proc main*() =
+  var args: seq[string] = @[]
+  for i in 1 .. paramCount():
+    args.add(paramStr(i))
+  mainWithArgs(args)

@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y \
     # X11 / Wayland display backends
     libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
     libxi-dev libxfixes-dev libxcursor-dev libxss-dev libxtst-dev \
-    libwayland-dev libxkbcommon-dev wayland-protocols libdecor-0-dev \
+    libwayland-dev libxkbcommon-dev wayland-protocols \
     # Audio backends (dlopen()d at runtime)
-    libasound2-dev libpulse-dev libpipewire-0.3-dev \
+    libasound2-dev libpulse-dev \
     # DBus / IME / input
     libdbus-1-dev libibus-1.0-dev libudev-dev \
     # OpenGL / EGL / Vulkan headers (loader is dynamic at runtime)

@@ -37,9 +37,16 @@ fetch "sdl3_image" \
     "$VENDOR/sdl3_image"
 
 echo "==> sdl3_ttf"
-fetch "sdl3_ttf" \
-    "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-3.2.2.tar.gz" \
-    "$VENDOR/sdl3_ttf"
+# Use git clone --recurse-submodules so VENDORED=ON gets freetype source.
+# Release tarballs don't include external/* submodule contents.
+if [ -d "$VENDOR/sdl3_ttf" ] && [ -n "$(ls -A "$VENDOR/sdl3_ttf" 2>/dev/null)" ]; then
+    echo "  already present: sdl3_ttf"
+else
+    echo "  cloning sdl3_ttf (with submodules)..."
+    git clone --depth=1 --branch release-3.2.2 --recurse-submodules \
+        "https://github.com/libsdl-org/SDL_ttf.git" "$VENDOR/sdl3_ttf"
+    echo "  done."
+fi
 
 PATCHES_DIR="$(cd "$(dirname "$0")" && pwd)/patches"
 
