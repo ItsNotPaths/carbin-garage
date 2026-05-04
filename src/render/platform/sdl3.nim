@@ -366,7 +366,9 @@ const
   SDL_GPU_CULLMODE_NONE*                  : SDL_GPUCullMode = 0
   SDL_GPU_CULLMODE_BACK*                  : SDL_GPUCullMode = 2
   SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE*    : SDL_GPUFrontFace = 0
+  SDL_GPU_LOADOP_LOAD*                    : SDL_GPULoadOp  = 0
   SDL_GPU_LOADOP_CLEAR*                   : SDL_GPULoadOp  = 1
+  SDL_GPU_LOADOP_DONT_CARE*               : SDL_GPULoadOp  = 2
   SDL_GPU_STOREOP_STORE*                  : SDL_GPUStoreOp = 0
   SDL_GPU_STOREOP_DONT_CARE*              : SDL_GPUStoreOp = 1
   SDL_GPU_TEXTURETYPE_2D*                 : SDL_GPUTextureType = 0

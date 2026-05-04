@@ -92,7 +92,11 @@ proc resolveMaterial*(subsectionName: string,
                      baseColor: fc(1, 1, 1), metallic: 0.05, roughness: 0.7)
 
   # ---- Glass (translucent) ----
-  if n.contains("glass"):
+  # `window` / `windshield` are the actual glass panes (windshield, door
+  # windows, backglass). `glass` etc. are the surrounding trim, lights, and
+  # detail glass parts. All translucent.
+  if n.contains("glass") or n == "window" or n.contains("windshield") or
+     n == "windscreen":
     var col = fc(0.20, 0.20, 0.22, 0.35)
     if n.contains("red"): col = fc(0.55, 0.10, 0.10, 0.45)
     return MatSpec(name: n, textureBase: "",

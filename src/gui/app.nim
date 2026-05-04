@@ -13,6 +13,7 @@ import ui/button
 import ui/modal
 import ui/dropup
 import ui/settings
+import scene3d
 import state
 
 const
@@ -38,6 +39,8 @@ type
     settingsFrac: float32
     settings: SettingsState
     prevMouseDown: array[3, bool]
+    prevMouseX, prevMouseY: float32
+    mouseInited: bool
 
 proc sampleMouse(ctx: var UiContext; frame: var AppFrame) =
   var mx, my: cfloat
@@ -95,6 +98,7 @@ proc buildFrame(ctx: var UiContext; cache: var TextCache;
 proc renderFrame(dev: ptr SDL_GPUDevice; win: ptr SDL_Window;
                  pipes: UiPipelines; ctx: var UiContext;
                  cache: var TextCache; frame: var AppFrame;
+                 scene: var Scene3D;
                  dtSecs: float32; app: var AppState) =
   let cmd = SDL_AcquireGPUCommandBuffer(dev)
   if cmd.isNil: return
@@ -111,16 +115,36 @@ proc renderFrame(dev: ptr SDL_GPUDevice; win: ptr SDL_Window;
   ctx.winH = float32(swapH)
   ctx.dt = dtSecs
   ctx.reset()
+  let prevMouseDown = frame.prevMouseDown   # snapshot before sampleMouse overwrites it
   sampleMouse(ctx, frame)
   buildFrame(ctx, cache, frame, app)
 
-  var colorTarget: SDL_GPUColorTargetInfo
-  colorTarget.texture     = swapTex
-  colorTarget.clear_color = SDL_FColor(r: 0.06, g: 0.07, b: 0.09, a: 1.0)
-  colorTarget.load_op     = SDL_GPU_LOADOP_CLEAR
-  colorTarget.store_op    = SDL_GPU_STOREOP_STORE
+  # Hand whatever wheelY the UI didn't consume + mouse delta to the orbit
+  # camera. `inputBlocked` while the settings modal is animating gates new
+  # drags from starting (an in-progress drag stays alive — see scene3d).
+  if not frame.mouseInited:
+    frame.prevMouseX = ctx.mouseX
+    frame.prevMouseY = ctx.mouseY
+    frame.mouseInited = true
+  let dx = ctx.mouseX - frame.prevMouseX
+  let dy = ctx.mouseY - frame.prevMouseY
+  let blocked = frame.settingsFrac > 0
+  scene.handleMouseInput(dx, dy,
+                         rmb = ctx.mouseDown[2], mmb = ctx.mouseDown[1],
+                         rmbPrev = prevMouseDown[2], mmbPrev = prevMouseDown[1],
+                         wheelY = ctx.wheelY, blocked = blocked)
+  frame.prevMouseX = ctx.mouseX
+  frame.prevMouseY = ctx.mouseY
 
-  let rp = SDL_BeginGPURenderPass(cmd, addr colorTarget, 1, nil)
+  # 3D pass — clears swapchain to RoomColor, writes depth, draws scene.
+  scene.render(dev, cmd, swapTex, swapW, swapH)
+
+  # UI pass — load existing color, no depth, alpha-blend the draw list on top.
+  var uiColor: SDL_GPUColorTargetInfo
+  uiColor.texture  = swapTex
+  uiColor.load_op  = SDL_GPU_LOADOP_LOAD
+  uiColor.store_op = SDL_GPU_STOREOP_STORE
+  let rp = SDL_BeginGPURenderPass(cmd, addr uiColor, 1, nil)
   submitDrawList(cmd, rp, ctx, pipes)
   SDL_EndGPURenderPass(rp)
 
@@ -148,6 +172,9 @@ proc main*() =
   var pipes = setupUiPipelines(dev, win)
   defer: releaseUiPipelines(dev, pipes)
 
+  var scene = scene3d.init(dev, win)
+  defer: scene3d.release(dev, scene)
+
   # Font lifetime: keep the bytes alive for as long as the font handle.
   var fontBytes = FontData
   let font = rendertext.openFontFromBytes(fontBytes, FontPtSize)
@@ -159,6 +186,24 @@ proc main*() =
   stderr.writeLine &"workingRoot: {app.workingRoot}"
   for i, src in app.sources:
     stderr.writeLine &"  source[{i}]: {src.label} ({src.cars.len} cars, kind={src.kind})"
+
+  block:
+    # Phase 3b stand-in: drop the first car.gltf we find under the working
+    # root onto the pedestal. Wiring to the active dropup row comes next.
+    var loaded = false
+    for kind, path in walkDir(app.workingRoot):
+      if kind != pcDir: continue
+      let gltfPath = path / "car.gltf"
+      if not fileExists(gltfPath): continue
+      try:
+        if scene.loadCar(dev, gltfPath):
+          stderr.writeLine &"loaded car: {gltfPath}"
+          loaded = true
+          break
+      except CatchableError as e:
+        stderr.writeLine &"loadCar failed for {gltfPath}: {e.msg}"
+    if not loaded:
+      stderr.writeLine &"no car loaded (looked under {app.workingRoot})"
 
   var ctx: UiContext
   var frame: AppFrame
@@ -182,5 +227,5 @@ proc main*() =
     let dt = float32(now - lastTicks) / 1000.0'f32
     lastTicks = now
 
-    renderFrame(dev, win, pipes, ctx, cache, frame, dt, app)
+    renderFrame(dev, win, pipes, ctx, cache, frame, scene, dt, app)
     sleep(TickIdleMs)
