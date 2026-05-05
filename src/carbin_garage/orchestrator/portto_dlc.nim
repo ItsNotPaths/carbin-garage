@@ -540,11 +540,35 @@ proc emitMergeSltFile(p: DlcPortPlan): tuple[carId: int; engineId: int;
   createDir(p.mergeSltPath.parentDir)
   if fileExists(p.mergeSltPath):
     removeFile(p.mergeSltPath)
-  let snippet =
+  var snippet =
     if fileExists(p.workingCar / "cardb.json"):
       try: parseJson(readFile(p.workingCar / "cardb.json"))
       except CatchableError: newJNull()
     else: newJNull()
+  # Overlay carslot.json's user-edited stats onto the snippet's
+  # Data_Car row. The L-pane writes by gamedb column name (CurbWeight,
+  # NumGears, BaseCost, ...), so each entry is a direct cell override.
+  # Without this step the user's edits persist to disk but never reach
+  # the merge.slt — the export quietly used the source-import values
+  # instead.
+  let carslotPath = p.workingCar / "carslot.json"
+  if fileExists(carslotPath):
+    try:
+      let cs = parseJson(readFile(carslotPath))
+      if cs.hasKey("stats") and cs["stats"].kind == JObject and
+         cs["stats"].len > 0:
+        if snippet.isNil or snippet.kind != JObject: snippet = newJObject()
+        if not snippet.hasKey("tables"): snippet["tables"] = newJObject()
+        let tables = snippet["tables"]
+        if not tables.hasKey("Data_Car"):
+          tables["Data_Car"] = %*{"rows": [newJObject()]}
+        let dcEntry = tables["Data_Car"]
+        if not dcEntry.hasKey("rows") or dcEntry["rows"].kind != JArray or
+           dcEntry["rows"].len == 0:
+          dcEntry["rows"] = %*[newJObject()]
+        let row0 = dcEntry["rows"][0]
+        for col, v in cs["stats"].pairs: row0[col] = v
+    except CatchableError: discard
   # Gather every sibling DLC's merge.slt so the ID gap-fill avoids
   # collisions with already-deployed DLCs (UDLC + earlier ports). Skip
   # our own merge.slt path since that's the file we're rebuilding.

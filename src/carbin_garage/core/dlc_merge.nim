@@ -261,7 +261,8 @@ proc rewriteId(v: string, rw: IdRewrite): string =
     return $(rw.newEngineId * 1000 + slot)
   return v
 
-proc rewriteCell(colName, value: string, rw: IdRewrite): string =
+proc rewriteCell(colName, value: string, rw: IdRewrite,
+                 wasOverlaid: bool = false): string =
   ## Top-level per-cell rewrite. Handles MediaName, BaseCost, and any
   ## ID-shaped column.
   ##
@@ -275,10 +276,20 @@ proc rewriteCell(colName, value: string, rw: IdRewrite): string =
   ## non-matching slugs). That left snippet's source-name in place,
   ## producing a Data_Car row that pointed at the wrong loose-files
   ## dir → car silently dropped from autoshow. (2026-05-01 fix.)
+  ##
+  ## `wasOverlaid` = the value came from the snippet overlay (cardb.json
+  ## or carslot.json stats edit), so the user explicitly chose it and
+  ## the autoshow-friendly defaults below should step aside.
   if colName == "MediaName":
     return rw.newMediaName
   if colName == "BaseCost":
-    return "1"  # locked policy from cardb_writer
+    # Default policy: ports drop into autoshow at BaseCost=1 so test
+    # cars are buyable. If the user explicitly set BaseCost via the
+    # L-pane (overlay carries it), honor that — otherwise the slider
+    # would be a no-op and writing 67 credits would silently re-export
+    # as 1 credit.
+    if wasOverlaid: return value
+    return "1"
   if colName == "IsArcade":
     # FH1's autoshow filters cars by IsArcade=1; donors carrying 0
     # (e.g. AUD_R8GT_11, rare/non-arcade trims) silently hide the new
@@ -294,7 +305,9 @@ proc rewriteCell(colName, value: string, rw: IdRewrite): string =
     # even when the donor is a normal showroom car (R8 GT = 0). Force
     # to 0 so ported cars always end up purchasable in autoshow at
     # BaseCost=1. Empirically: 121/176 base cars are rarity 0 (the
-    # autoshow tier); the rest are unlock rewards.
+    # autoshow tier); the rest are unlock rewards. L-pane override
+    # wins so users can opt cars back into the gated tiers.
+    if wasOverlaid: return value
     return "0"
   if isLikelyIdColumn(colName):
     return rewriteId(value, rw)
@@ -600,9 +613,10 @@ proc insertRow(dstDb: DbConn, tbl: string, colNames: seq[string],
     # symptom 2026-05-01: Data_Car.Id ended up == source FM4 Id while
     # per-car tables' Ordinal got rewriteId(donorCarId) == newCarId,
     # the two diverged, FH1 couldn't JOIN them, car silently dropped.
-    if c in overlay and not isLikelyIdColumn(c):
+    let overlaid = (c in overlay) and (not isLikelyIdColumn(c))
+    if overlaid:
       v = jsonToSqlString(overlay[c])
-    bound.add(rewriteCell(c, v, rw))
+    bound.add(rewriteCell(c, v, rw, overlaid))
   dstDb.exec(sql(q), bound)
 
 ## Tables where snippet overlay is suppressed entirely (donor wins).
