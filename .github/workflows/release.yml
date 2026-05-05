@@ -88,6 +88,9 @@ jobs:
       - name: Build carbin-garage
         # Enumerate every static .a inside vendor/build/linux/lib and pass them
         # inside --start-group/--end-group so the linker resolves cycles.
+        # `shell: bash` because the ubuntu:20.04 container defaults run-steps
+        # to /bin/sh (dash), which doesn't speak bash arrays.
+        shell: bash
         run: |
           PASSL_ARGS=("--passL:-Wl,--start-group")
           for lib in vendor/build/linux/lib/*.a; do
@@ -167,6 +170,7 @@ jobs:
           ./build-deps.sh --target windows
 
       - name: Cross-compile carbin-garage
+        shell: bash
         run: |
           PASSL_ARGS=("--passL:-Wl,--start-group")
           for lib in vendor/build/windows/lib/*.a; do

@@ -109,7 +109,10 @@ SDL3_OPTOUT_FLAGS=()
 if [ "$TARGET" = "linux" ]; then
     SDL3_OPTOUT_FLAGS+=("-DSDL_WAYLAND_LIBDECOR=OFF" "-DSDL_PIPEWIRE=OFF")
 elif [ "$TARGET" = "windows" ]; then
-    SDL3_OPTOUT_FLAGS+=("-DSDL_RENDER_D3D11=OFF" "-DSDL_RENDER_D3D12=OFF")
+    # mingw-w64 7.x on focal also lacks newer audioclient.h fields
+    # (AudioClientProperties.Options, AUDCLNT_STREAMOPTIONS_RAW) used by
+    # SDL3's WASAPI backend. DirectSound covers Windows audio output.
+    SDL3_OPTOUT_FLAGS+=("-DSDL_RENDER_D3D11=OFF" "-DSDL_RENDER_D3D12=OFF" "-DSDL_WASAPI=OFF")
 fi
 
 build_one sdl3       "$VENDOR/sdl3"       -DSDL_STATIC=ON -DSDL_SHARED=OFF "${SDL3_OPTOUT_FLAGS[@]}"
