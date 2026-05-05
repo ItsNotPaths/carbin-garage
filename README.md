@@ -10,6 +10,12 @@ DLC package — without touching the base game.
 > translation still open). GUI is hand-rolled on raw SDL3 and rough
 > around the edges. Expect sharp corners.
 
+# SPECIAL THANKS TO:
+Mike Davis - pioneer of forza re and creator of Forza Studio. His methods where invaluble at game exports
+Warshack - UDLC creator, dlc structure and documentation
+SoulBrix - FM4 exporter tool - reference
+
+
 ## What it does
 
 - **Import** an FM4 or FH1 car archive (`.zip`) into a working tree

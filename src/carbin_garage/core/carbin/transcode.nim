@@ -94,6 +94,10 @@ type
     damageRemapped*: int ## Slice D: spliced sections whose a*b damage
                           ## table was remapped by spatial-NN over donor's
                           ## vertex order (cvFour→cvFive only).
+    lod0Spliced*: int    ## LOD0-only sections (lod0/cockpit carbins,
+                          ## caliper/rotor) whose LOD0 pool was rebuilt
+                          ## from source. Visible in autoshow / close
+                          ## camera; prior behavior was donor verbatim.
     note*: string
 
 proc expectedDonorVersion(targetProfile: GameProfile): CarbinVersion =
@@ -175,13 +179,21 @@ proc fm4PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
       result[dst + 26] = 0
       result[dst + 27] = 0
 
+proc fm4Lod0PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
+  ## LOD0 pool stride conversion. Same 32→28 truncation as the LOD pool —
+  ## FM4 lod0/cockpit carbins ship 32-byte vertices in the same layout
+  ## (pos+uv0+uv1+quat+extra8). FH1 keeps pos+uv0+uv1+quat+extra4. Same
+  ## extra4-bytes-1..3 zero (paint fix) applies under SliceDExtra4Zero.
+  fm4PoolToFh1(fm4Pool)
+
 # ---- the splice driver ----
 
 proc spliceCarbin(sourceData, donorData: openArray[byte],
                   srcInfo, donInfo: CarbinInfo,
                   srcVer, donVer: CarbinVersion):
                   tuple[bytes: seq[byte]; spliced: int; fallback: int;
-                        gapsPreserved: int; damageRemapped: int] =
+                        gapsPreserved: int; damageRemapped: int;
+                        lod0Spliced: int] =
   ## Donor's part list is authoritative. For each donor section, look up
   ## a source section by name; splice if possible, otherwise donor verbatim.
   ## Assemble the final file by concatenating donor's pre-section bytes,
@@ -211,6 +223,7 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   var fallback = 0
   var gapsPreserved = 0
   var damageRemapped = 0
+  var lod0Spliced = 0
 
   let renames = initTable[string, string]()
   let allowed = none(HashSet[string])
@@ -343,11 +356,72 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           stderr.writeLine "    [splice] '" & donSec.name &
             "' raise: " & e.msg
         thisSecBytes = donorSecBytes
+    elif donSec.lod0VerticesCount > 0'i32 and srcSec.lod0VerticesCount > 0'i32:
+      # LOD0-only section (lod0/cockpit body sections — visible in
+      # autoshow / close camera). Today's behavior with the LOD-only
+      # splice gate above was donor verbatim → autoshow showed donor's
+      # body. Splice source's LOD0 pool onto donor's section template;
+      # for cvFour→cvFive, re-stride 32→28 the same way the LOD path
+      # does. The builder regenerates the post-pool 4B/v stream with
+      # zero bytes of length srcLod0VCount*4 so the tail length matches.
+      try:
+        var forcedBlob = none(seq[byte])
+        var forcedSize = none(uint32)
+        if crossVersionStride and srcSec.lod0VerticesSize == 32'u32:
+          let srcPool = block:
+            var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
+            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
+            b
+          forcedBlob = some(fm4Lod0PoolToFh1(srcPool))
+          forcedSize = some(uint32(Fh1VertexStride))
+        let r = buildSectionConvertedToTargetLodOnTargetTemplate(
+          donorData, donSec, sourceData, srcSec,
+          donorLod = 0'i32, targetLod = 0'i32,
+          renameMap = renames, allowedSubparts = allowed,
+          upconvertIndices = true, padToTargetVpool = false,
+          forcedDonorVertexBlob = forcedBlob,
+          forcedNewVertexSize = forcedSize,
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
+          remappedDamageTable = none(seq[byte]))
+
+        let chk = tryParseSection(r.bytes, donVer)
+        var srcLod0Subcount = 0
+        for ss in srcSec.subsections:
+          if ss.lod == 0'i32: inc srcLod0Subcount
+        var ok = chk.ok and chk.consumed > 0 and
+                 chk.consumed >= r.bytes.len - 8 and
+                 chk.consumed <= r.bytes.len
+        if ok and chk.info.lod0VerticesCount != srcSec.lod0VerticesCount: ok = false
+        if ok and crossVersionStride and chk.info.lod0VerticesSize != 28'u32: ok = false
+        if ok and chk.info.subsections.len != srcLod0Subcount: ok = false
+        # LOD pool unchanged — must still match donor's counts (= 0 here).
+        if ok and chk.info.lodVerticesCount != donSec.lodVerticesCount: ok = false
+        if ok:
+          thisSecBytes = r.bytes
+          thisSpliced = true
+          inc lod0Spliced
+        else:
+          when TranscodeTrace:
+            stderr.writeLine "    [splice-lod0] '" & donSec.name &
+              "' validation reject: parseOk=" & $chk.ok &
+              " consumed=" & $chk.consumed & "/" & $r.bytes.len &
+              " lod0Vc(splice)=" & $chk.info.lod0VerticesCount &
+              " lod0Vc(src)=" & $srcSec.lod0VerticesCount &
+              " lod0Vs(splice)=" & $chk.info.lod0VerticesSize &
+              " subs(splice)=" & $chk.info.subsections.len &
+              " subs(srcLod0)=" & $srcLod0Subcount
+      except CatchableError as e:
+        when TranscodeTrace:
+          stderr.writeLine "    [splice-lod0] '" & donSec.name &
+            "' raise: " & e.msg
+        thisSecBytes = donorSecBytes
     else:
       when TranscodeTrace:
         stderr.writeLine "    [splice] '" & donSec.name &
           "' skip: lodVc(don)=" & $donSec.lodVerticesCount &
-          " lodVc(src)=" & $srcSec.lodVerticesCount
+          " lodVc(src)=" & $srcSec.lodVerticesCount &
+          " lod0Vc(don)=" & $donSec.lod0VerticesCount &
+          " lod0Vc(src)=" & $srcSec.lod0VerticesCount
 
     if thisSpliced: inc spliced
     else: inc fallback
@@ -367,6 +441,7 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   result.fallback = fallback
   result.gapsPreserved = gapsPreserved
   result.damageRemapped = damageRemapped
+  result.lod0Spliced = lod0Spliced
 
 # ---- entry point ----
 
@@ -409,6 +484,7 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
       sectionsSpliced: r.spliced, sectionsFallback: r.fallback,
       gapsPreserved: r.gapsPreserved,
       damageRemapped: r.damageRemapped,
+      lod0Spliced: r.lod0Spliced,
       note: "v1: per-section splice with donor-fallback on failure")
     result = (r.bytes, report)
 

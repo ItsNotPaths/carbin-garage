@@ -174,6 +174,8 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
   var aTableEnd = 0
   var cTableStart = 0
   var cTableEnd = 0
+  var postPoolStart = 0
+  var postPoolEnd = 0
   if ver == cvFive:
     # FH1 tail layout, RE'd in docs/FH1_CARBIN_TYPEID5.md §6:
     #   [13 init][a u32][b u32][4 reserved=1][a*b table][4 mid-skip]
@@ -205,16 +207,27 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
     cTableEnd = r.tell()
     let probeStart = r.tell()
     let extraStream = int(lod0VCount) * 4
+    postPoolStart = probeStart
+    postPoolEnd = probeStart    # no-stream default; revised below
     var snapped = false
+    var snappedExtra = 0
     # Prefer WITH-stream candidates over without-stream ones — vertex
     # noise inside the LOD0 pool can fluke a `[0 0 0 5][9 small floats]`
     # at the no-stream offset, but matching at the with-stream offset
-    # can't happen without the stream actually being present.
+    # can't happen without the stream actually being present. Section
+    # markers can be `[u32=5]` or `[u32=2]` (parser.nim:94 accepts both)
+    # — the snap probe must accept both, otherwise sections whose next
+    # neighbour starts with a 2 will fail WITH-stream and may falsely
+    # win WITHOUT-stream (vertex-noise fluke), making the parser miss
+    # the post-pool stream entirely. Empirically observed on R8GT_11
+    # _lod0.carbin's wheel / body sections.
     for extra in [extraStream, 0]:
       for tryOff in [0, 4, 8]:
         let k = probeStart + extra + tryOff
         if k + 40 > r.data.len: break
-        if r.data[k] == 0 and r.data[k+1] == 0 and r.data[k+2] == 0 and r.data[k+3] == 5:
+        let m = r.data[k+3]
+        if r.data[k] == 0 and r.data[k+1] == 0 and r.data[k+2] == 0 and
+           (m == 5 or m == 2):
           var rr = newBEReader(r.data)
           rr.seek(k + 4)
           var floats: array[9, float32]
@@ -223,8 +236,10 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
           for f in floats:
             if abs(f) < 100.0'f32: inc sane
           if sane == 9 and floats[3] <= floats[6] + 1e-3'f32:
-            r.seek(k); snapped = true; break
+            r.seek(k); snapped = true; snappedExtra = extra; break
       if snapped: break
+    if snapped:
+      postPoolEnd = probeStart + snappedExtra
     if not snapped:
       # No marker found ahead. If lod0VCount > 0, this is likely the
       # last section in a lod0/cockpit carbin — skip the extra stream
@@ -232,6 +247,11 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
       # at the start of the per-vertex stream.
       if lod0VCount > 0'i32:
         r.seek(extraStream, 1)
+        # BEReader seek clamps to data.len; cap postPoolEnd at the
+        # actual position so callers slicing on `postPoolEnd..endPos`
+        # never go negative when the stream would have run past EOF
+        # (last section in a lod0/cockpit carbin).
+        postPoolEnd = r.tell()
       else:
         r.seek(4, 1)
   else:
@@ -266,7 +286,8 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
     tailStart: tailStart,
     aFieldPos: aFieldPos,
     aTableStart: aTableStart, aTableEnd: aTableEnd,
-    cTableStart: cTableStart, cTableEnd: cTableEnd
+    cTableStart: cTableStart, cTableEnd: cTableEnd,
+    postPoolStart: postPoolStart, postPoolEnd: postPoolEnd
   )
 
 proc tryParseSection*(data: openArray[byte], ver: CarbinVersion):

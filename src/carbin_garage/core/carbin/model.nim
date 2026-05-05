@@ -51,6 +51,12 @@ type
     aFieldPos*: int
     aTableStart*, aTableEnd*: int
     cTableStart*, cTableEnd*: int
+    # cvFive lod0/cockpit-only: per-vertex 4B post-pool stream after the
+    # c*d table. `postPoolStart` always = cTableEnd; `postPoolEnd` =
+    # postPoolStart + lod0VCount*4 when the snap probe placed the next
+    # marker after a stream-sized gap, else = postPoolStart (no stream).
+    # `postPoolEnd == postPoolStart` ⇒ no stream in this section.
+    postPoolStart*, postPoolEnd*: int
 
   CarbinVersion* = enum
     cvUnknown = "Unknown"

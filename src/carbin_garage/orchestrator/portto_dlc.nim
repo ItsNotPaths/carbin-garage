@@ -500,7 +500,8 @@ proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
         ": spliced=" & $r.report.sectionsSpliced &
         " fallback=" & $r.report.sectionsFallback &
         " gaps=" & $r.report.gapsPreserved &
-        " damageRemap=" & $r.report.damageRemapped
+        " damageRemap=" & $r.report.damageRemapped &
+        " lod0Spliced=" & $r.report.lod0Spliced
       if r.report.mode != tmDonorVerbatim:
         result[ga.zipEntryName] = r.bytes
     of dgaDonorOnly, dgaSourceExtra:

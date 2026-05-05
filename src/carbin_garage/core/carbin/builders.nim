@@ -45,12 +45,18 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     remappedDamageTable: Option[seq[byte]] = none(seq[byte])
    ): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
   ## `forcedDonorVertexBlob` / `forcedNewVertexSize` override the donor's
-  ## raw LOD pool + vSize (cross-version splice path uses these to feed a
-  ## re-strided 28-byte FH1 pool when the donor is FM4 32-byte source).
+  ## raw vertex pool + vSize (cross-version splice path uses these to feed
+  ## a re-strided 28-byte FH1 pool when the donor is FM4 32-byte source).
   ## Both must be Some together; their length must equal donorVCount *
-  ## forced size. They affect the LOD pool only (targetLod>0 path) — pass
-  ## via the LOD0 path is not currently wired since cross-version splice
-  ## targets the LOD pool slot.
+  ## forced size. Wired for both the LOD pool (targetLod>0) and the LOD0
+  ## pool (targetLod==0) paths. When forced into the LOD0 path with the
+  ## section carrying a per-vertex post-pool 4B stream (FH1 lod0/cockpit
+  ## body sections — `postPoolEnd > postPoolStart`), the donor's stream
+  ## is replaced by `donorVCount * 4` zero bytes so the rebuilt section's
+  ## tail length matches the new lod0VCount. Stream zero-fill loses the
+  ## supplemental tangent encoding (likely SHORT2N/DEC3N); the dominant
+  ## tangent space is in the 28-byte vertex's quaternion, so this only
+  ## costs minor shading fidelity in close-camera views.
   ##
   ## `upconvertSubsectionsCvFourToCvFive=true` runs each donor subsection
   ## through `upconvertSubsectionCvFourToCvFive` first (insert 4 zero
@@ -143,7 +149,22 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     var newVertexCount: int32
     var newVertexSize: uint32
     var poolBlob: seq[byte]
-    if padToTargetVpool:
+    if forcedDonorVertexBlob.isSome or forcedNewVertexSize.isSome:
+      if forcedDonorVertexBlob.isNone or forcedNewVertexSize.isNone:
+        raise newException(ValueError,
+          "forcedDonorVertexBlob and forcedNewVertexSize must be set together")
+      if padToTargetVpool:
+        raise newException(ValueError,
+          "forced-stride splice is incompatible with padToTargetVpool=true")
+      newVertexCount = int32(donorVCount)
+      newVertexSize = forcedNewVertexSize.get
+      poolBlob = forcedDonorVertexBlob.get
+      if poolBlob.len != int(newVertexCount) * int(newVertexSize):
+        raise newException(ValueError,
+          "forcedDonorVertexBlob length " & $poolBlob.len &
+          " does not match newVertexCount*newVertexSize " &
+          $(int(newVertexCount) * int(newVertexSize)))
+    elif padToTargetVpool:
       if donorVSize != tgtVSize:
         raise newException(ValueError,
           "VertexSize mismatch: donor LOD" & $donorLod & " stride=" & $donorVSize &
@@ -176,8 +197,24 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     let betweenLod0SizeAndPool = sliceBytes(tgtBytes,
       targetSec.vertexSizePos + 4 - targetSec.start,
       targetSec.lod0VerticesStart - targetSec.start)
-    let tail = sliceBytes(tgtBytes,
-      targetSec.tailStart - targetSec.start, tgtBytes.len)
+    # Tail rewrite: when the section carries a per-vertex post-pool 4B
+    # stream (cvFive lod0/cockpit body sections — postPoolEnd >
+    # postPoolStart) AND we changed lod0VCount (forced path), replace the
+    # donor stream with `newVertexCount * 4` zero bytes so the tail length
+    # matches. Otherwise emit the donor tail verbatim.
+    let hasPostPool = targetSec.postPoolEnd > targetSec.postPoolStart
+    let tail =
+      if hasPostPool and forcedDonorVertexBlob.isSome:
+        let preStream = sliceBytes(tgtBytes,
+          targetSec.tailStart - targetSec.start,
+          targetSec.postPoolStart - targetSec.start)
+        let zeroStream = newSeq[byte](int(newVertexCount) * 4)
+        let trailingPad = sliceBytes(tgtBytes,
+          targetSec.postPoolEnd - targetSec.start, tgtBytes.len)
+        concatBytes(preStream, zeroStream, trailingPad)
+      else:
+        sliceBytes(tgtBytes,
+          targetSec.tailStart - targetSec.start, tgtBytes.len)
     let rebuilt = concatBytes(
       prefix,
       @(bePackU32(newSubcount)),
