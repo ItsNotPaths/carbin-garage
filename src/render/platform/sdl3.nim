@@ -606,6 +606,12 @@ proc SDL_GetRelativeMouseState*(x, y: ptr cfloat): uint32
 proc SDL_GetMouseState*(x, y: ptr cfloat): uint32
   {.importc, header: SDL_Header.}
 
+proc SDL_HasClipboardText*(): bool {.importc, header: SDL_Header.}
+proc SDL_GetClipboardText*(): cstring {.importc, header: SDL_Header.}
+  ## Caller must `SDL_free` the returned string. Always non-nil ("" on
+  ## empty / failure) per SDL3 contract.
+proc SDL_free*(p: pointer) {.importc, header: SDL_Header.}
+
 # ---------------------------------------------------------------------------
 # SDL3_image
 

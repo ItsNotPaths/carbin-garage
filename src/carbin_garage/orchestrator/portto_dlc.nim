@@ -164,12 +164,16 @@ type
 # ---- helpers ----
 
 const
-  DefaultProfileId = "0000000000000000"
+  DefaultProfileId* = "0000000000000000"
     ## Xenia's "no profile / global" slot. DLCs placed here apply for any
     ## profile; the example DLC at `4D5309C900000729` lives here.
-  DlcContentTypeDir = "00000002"
+  DlcContentTypeDir* = "00000002"
     ## Xenia content type for "Marketplace Content" (DLC). Sibling to
     ## `00000001` (saved games). Always 8 hex.
+  CarbinGarageHeaderPrefix* = "Carbin Garage: "
+    ## Display-name prefix written into every header sidecar by
+    ## `emitXeniaHeader`. Also used by `dlc_clear` to recognise our
+    ## packages on disk so bulk-clear never touches third-party DLC.
   DefaultMergePriority = 99
     ## Priority for the per-package overlay. Sample DLC uses 99; higher
     ## values win on collision in zipmount mounting order.
@@ -664,7 +668,7 @@ proc buildXeniaHeader(displayName, packageId, titleIdHex: string): seq[byte] =
 
 proc emitXeniaHeader(p: DlcPortPlan) =
   createDir(p.headerPath.parentDir)
-  let displayName = "Carbin Garage: " & p.newSlug
+  let displayName = CarbinGarageHeaderPrefix & p.newSlug
   let bytes = buildXeniaHeader(displayName, p.packageId,
                                 p.targetProfile.titleId.toUpperAscii())
   writeAllBytes(p.headerPath, bytes)
@@ -678,9 +682,24 @@ proc emitMergeSlt(p: DlcPortPlan) =
 
 proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
                        skipMergeSlt: bool = false) =
+  ## Atomic install: full-delete then full-write. `synthDlcId(finalSlug)`
+  ## is a deterministic hash of the lower-cased slug, so re-exporting the
+  ## same car-name targets the *same* `packageDir` and the *same*
+  ## `headerPath` every time — that's what makes "our DLC for car X in
+  ## game Y" a stable, addressable thing. Replacing means we own that
+  ## slot completely, not just whichever files happen to overlap on a
+  ## per-name basis.
+  ##
   ## Order:
   ##   1. Refuse if package dir exists and replace=false.
-  ##   2. (replace) wipe package dir.
+  ##   2. (replace) wipe BOTH:
+  ##        - `packageDir` (everything under
+  ##          `<contentRoot>/<profileId>/<TitleID>/00000002/<packageId>/`)
+  ##        - `headerPath` (the sidecar at
+  ##          `<contentRoot>/<profileId>/<TitleID>/Headers/00000002/<packageId>.header`)
+  ##      This guarantees no orphan state from a previous build —
+  ##      stale puboffer markers, partial zipmount.xml, half-written
+  ##      merge.slt, all gone before the new layout lands.
   ##   3. Mkdir tree, emit puboffer + zipmount.
   ##   4. Emit cars zip + wheels zip.
   ##   5. Emit merge.slt (skippable for scaffold inspection).
@@ -692,8 +711,9 @@ proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
     raise newException(DlcPortError,
       "package already exists at " & p.packageDir &
       " (pass replace=true to overwrite, or call uninstallPortToDlc first)")
-  if p.packageExists and replace:
-    removeDir(p.packageDir)
+  if replace:
+    if dirExists(p.packageDir): removeDir(p.packageDir)
+    if fileExists(p.headerPath): removeFile(p.headerPath)
   createDir(p.packageDir)
   emitXeniaHeader(p)
   emitPuboffer(p)

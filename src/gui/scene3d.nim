@@ -17,12 +17,12 @@ const
   SceneVertSpv = staticRead("../../shaders/scene.vert.spv")
   SceneFragSpv = staticRead("../../shaders/scene.frag.spv")
 
-  RoomHalfX*  = 8.0'f32
-  RoomHalfY*  = 8.0'f32
-  RoomHalfZ*  = 4.5'f32
-  RoomCenterZ = 4.5'f32  # floor at z=0, ceiling at z=9
+  RoomHalfX*  = 12.0'f32
+  RoomHalfY*  = 12.0'f32
+  RoomHalfZ*  = 6.75'f32
+  RoomCenterZ = 6.75'f32  # floor at z=0, ceiling at z=13.5
 
-  PedestalRadius*    = 1.5'f32
+  PedestalRadius*    = 2.25'f32
   PedestalHeight*    = 0.5'f32
   PedestalSegments   = 48
 
@@ -30,7 +30,7 @@ const
   PedestalColor = [0.88'f32, 0.88'f32, 0.90'f32]
 
   RoomCornerStrength = 0.55'f32
-  RoomCornerFalloff  = 1.6'f32
+  RoomCornerFalloff  = 1.6'f32 / 3.0'f32
 
   FloorRingStrength = 0.45'f32
   FloorRingInner    = PedestalRadius - 0.05'f32

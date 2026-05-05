@@ -11,6 +11,7 @@ import scroll
 import button
 import text_input
 import ../state
+import ../car_names
 import ../../carbin_garage/core/profile
 import ../../render/platform/sdl3
 
@@ -68,7 +69,8 @@ proc drawLPane*(ctx: var UiContext; cache: var TextCache;
   let header = rect(pane.x, pane.y, pane.w, HeaderH)
   let (hr, hg, hb, ha) = HeaderBg
   ctx.pushSolid(header, color(hr, hg, hb, ha))
-  let title = if app.lpane.slug.len > 0: "stats — " & app.lpane.slug
+  let title = if app.lpane.slug.len > 0:
+                "stats — " & prettyDisplayName(app.lpane.slug)
               else: "stats"
   ctx.pushLabel(cache, title,
                 header.x + RowPadX,

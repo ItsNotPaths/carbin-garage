@@ -19,6 +19,7 @@ import ui/lpane
 import ui/palette
 import scene3d
 import state
+import car_names
 import ../carbin_garage/core/[workspace, part_swap, profile, mounts]
 import ../carbin_garage/orchestrator/[importwc, portto_dlc]
 
@@ -104,13 +105,24 @@ proc dispatchMenu(menu: var uimenu.ContextMenu; choice: int;
       return
     try:
       let prof = loadProfileById(src.profileId)
-      let dst = importToWorking(zipPath, prof, app.workingRoot)
+      # Default the working/ folder name to the prefixed pretty form so
+      # users can tell at a glance which game an imported car came from
+      # (`[fh1] Alfa Romeo 8C 2008` instead of bare `ALF_8C_08`).
+      let folderName = defaultWorkingFolderName(menu.rowName, prof.id)
+      let dst = importToWorking(zipPath, prof, app.workingRoot, folderName)
       stderr.writeLine &"imported: {zipPath} -> {dst}"
       reloadSources(app)
     except CatchableError as e:
       stderr.writeLine &"import failed for {zipPath}: {e.msg}"
   elif label == "Open parts tab":
     openPartsTab(app, menu.rowName)
+  elif label.startsWith("Set as donor for "):
+    # rowName is the donor carname; sourceIdx points at the dropup tile
+    # (Source). Pull the profileId off that source so we don't have to
+    # parse it back out of the menu label.
+    if menu.sourceIdx < 0 or menu.sourceIdx >= app.sources.len: return
+    let src = app.sources[menu.sourceIdx]
+    setDonor(app, src.profileId, menu.rowName)
   elif label == "Close tab" and isTabAction:
     closePartsTab(app, menu.sourceIdx)
   elif label == "Unload car" and isTabAction:
@@ -173,50 +185,72 @@ proc dispatchMenu(menu: var uimenu.ContextMenu; choice: int;
     app.grab.active = false
 
 proc dispatchExport(app: var AppState) =
-  ## Plan + execute a port-to-dlc using the palette's current target,
-  ## donor, optional name + dlc-id overrides. Blocks the UI thread —
-  ## same pattern as Import-to-working/. Status feedback via the
-  ## palette toast.
+  ## Multi-target port-to-dlc: iterates every toggled-on game, requires a
+  ## donor bound for each, runs `executePortToDlc` once per target. Blocks
+  ## the UI thread — same pattern as Import-to-working/. Result toast
+  ## summarises succeeded targets; first-failure short-circuits with the
+  ## error message. Auto-synthesizes the dlc-id (`synthDlcId`); user does
+  ## not see or set it.
   if app.activeSlug.len == 0: return
   let workingCar = app.workingRoot / app.activeSlug
-  let gameId   = app.palette.targetGame
-  let donor    = app.palette.donor.text.strip()
-  let newName  = app.palette.newName.text.strip()
-  let dlcIdStr = app.palette.dlcId.text.strip()
+  let newName    = app.palette.newName.text.strip()
   let contentRoot = app.cfg.xeniaContent.strip()
 
-  let mountsAll = loadMounts()
-  let mi = findMount(mountsAll, gameId)
-  if mi < 0:
-    setPaletteStatus(app, "no mount registered for " & gameId, ok = false)
+  if contentRoot.len == 0:
+    setPaletteStatus(app, "set xenia content path in Settings", ok = false)
     return
-  let prof =
-    try: loadProfileById(gameId)
+
+  var targets: seq[string] = @[]
+  for gid in allProfileIds(app):
+    if targetOn(app, gid): targets.add gid
+  if targets.len == 0:
+    setPaletteStatus(app, "toggle at least one target game", ok = false)
+    return
+
+  # Pre-flight: every toggled target needs a bound donor.
+  for gid in targets:
+    if donorBound(app, gid).len == 0:
+      setPaletteStatus(app,
+        "donor not set for " & gid.toUpperAscii() &
+        " (right-click a car in its popup → Set as donor)",
+        ok = false)
+      return
+
+  let mountsAll = effectiveMounts(contentRoot)
+  var done: seq[string] = @[]
+  for gid in targets:
+    let mi = findMount(mountsAll, gid)
+    if mi < 0:
+      setPaletteStatus(app,
+        "no mount registered for " & gid.toUpperAscii(), ok = false)
+      return
+    let prof =
+      try: loadProfileById(gid)
+      except CatchableError as e:
+        setPaletteStatus(app,
+          gid.toUpperAscii() & ": profile load failed: " & e.msg,
+          ok = false)
+        return
+    let donor = donorBound(app, gid)
+    try:
+      let plan = planPortToDlc(workingCar, mountsAll[mi], prof,
+                                contentRoot, donor, newName,
+                                "0000000000000000", 0, 0, 0)
+      executePortToDlc(plan, replace = true, skipMergeSlt = false)
+      done.add gid.toUpperAscii()
+    except DlcPortError as e:
+      setPaletteStatus(app,
+        gid.toUpperAscii() & ": export failed: " & e.msg, ok = false)
+      return
     except CatchableError as e:
-      setPaletteStatus(app, "profile load failed: " & e.msg, ok = false)
+      setPaletteStatus(app,
+        gid.toUpperAscii() & ": export error: " & e.msg, ok = false)
       return
 
-  var dlcIdOverride = 0
-  if dlcIdStr.len > 0:
-    try: dlcIdOverride = parseInt(dlcIdStr)
-    except ValueError:
-      setPaletteStatus(app, "dlc-id must be an integer", ok = false)
-      return
-
-  try:
-    let plan = planPortToDlc(workingCar, mountsAll[mi], prof,
-                              contentRoot, donor, newName,
-                              "0000000000000000", dlcIdOverride, 0, 0)
-    executePortToDlc(plan, replace = true, skipMergeSlt = false)
-    let final = if newName.len > 0: newName else: app.activeSlug
-    setPaletteStatus(app,
-      "Exported " & final & " -> " & gameId.toUpperAscii() &
-      " (dlcId " & $plan.dlcId & ")",
-      ok = true)
-  except DlcPortError as e:
-    setPaletteStatus(app, "export failed: " & e.msg, ok = false)
-  except CatchableError as e:
-    setPaletteStatus(app, "export error: " & e.msg, ok = false)
+  let final = if newName.len > 0: newName else: app.activeSlug
+  setPaletteStatus(app,
+    "Exported " & final & " -> " & done.join(", "),
+    ok = true)
 
 const
   SDLK_ESCAPE = 0x0000001B'u32
@@ -261,8 +295,7 @@ proc buildFrame(ctx: var UiContext; cache: var TextCache;
   # the advanced row expands; before the dropup tiles so the dropup tile
   # row still wins for hits at the very bottom.
   if app.activeSlug.len > 0:
-    let palR = paletteRect(ctx.winW, ctx.winH, dropupH,
-                           app.palette.expanded)
+    let palR = paletteRect(ctx.winW, ctx.winH, dropupH)
     let palRes = drawPalette(ctx, cache, app, palR)
     if palRes.exportPressed:
       dispatchExport(app)

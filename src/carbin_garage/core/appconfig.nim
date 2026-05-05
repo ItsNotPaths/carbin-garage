@@ -1,13 +1,18 @@
 ## Per-machine GUI config: ~/.config/carbin-garage/config.json
-## Today: just the xenia content directory used by port-to-dlc. Sibling
-## to mounts.json — kept separate so the mounts schema doesn't grow a
-## dangling top-level key.
+## Sibling to mounts.json — kept separate so the mounts schema doesn't
+## grow a dangling top-level key.
+##
+## Fields:
+##   xeniaContent       — xenia content/ root used by export + auto-mount
+##   experimentalDamage — opt-in toggle for the WIP cross-game damage
+##                        porting path (no consumer yet; UI stub only)
 
 import std/[json, os]
 
 type
   AppConfig* = object
     xeniaContent*: string
+    experimentalDamage*: bool
 
 proc configFile*(): string =
   let xdg = getEnv("XDG_CONFIG_HOME")
@@ -22,9 +27,12 @@ proc loadAppConfig*(): AppConfig =
     except CatchableError: return
   if j.kind != JObject: return
   result.xeniaContent = j{"xeniaContent"}.getStr("")
+  result.experimentalDamage = j{"experimentalDamage"}.getBool(false)
 
 proc saveAppConfig*(c: AppConfig) =
   let path = configFile()
   createDir(parentDir(path))
-  let j = %*{"xeniaContent": c.xeniaContent}
+  let j = %*{
+    "xeniaContent":       c.xeniaContent,
+    "experimentalDamage": c.experimentalDamage}
   writeFile(path, j.pretty)

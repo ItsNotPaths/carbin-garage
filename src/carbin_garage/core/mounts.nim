@@ -2,7 +2,7 @@
 ## Maps game-id -> absolute folder (the dir that contains <profile.cars>).
 ## Spec: docs/APPLET_ARCHITECTURE.md §"Phase 2.5 — CLI safety layer".
 
-import std/[json, os, strutils, algorithm]
+import std/[json, os, strutils, algorithm, sets]
 import ./profile
 
 type
@@ -70,3 +70,37 @@ proc upsertMount*(mounts: var seq[Mount], gameId, folder: string) =
   let i = findMount(mounts, gameId)
   if i >= 0: mounts[i].folder = folder
   else:      mounts.add(Mount(gameId: gameId, folder: folder))
+
+proc autoMountFolder*(xeniaContent: string; prof: GameProfile): string =
+  ## Standard xenia install layout:
+  ##   <xeniaContent>/0000000000000000/<TitleID>/00007000/<contentId>/
+  ## Returns "" when xeniaContent is unset, the profile lacks the IDs we
+  ## need, or the cars dir isn't present at the expected place — i.e.
+  ## "no auto-detect, user must override".
+  if xeniaContent.len == 0: return ""
+  if prof.titleId.len == 0 or prof.contentId.len == 0: return ""
+  let folder = xeniaContent / "0000000000000000" /
+               prof.titleId.toUpperAscii() / "00007000" /
+               prof.contentId.toUpperAscii()
+  if dirExists(folder / prof.cars): return folder
+  return ""
+
+proc effectiveMounts*(xeniaContent: string): seq[Mount] =
+  ## Mounts the rest of the app should use. Manual mounts.json entries
+  ## take precedence (the user explicitly configured them); auto-detected
+  ## mounts under xeniaContent fill in the rest. Profiles for which
+  ## neither resolves a folder are dropped.
+  let manual = loadMounts()
+  var seen = initHashSet[string]()
+  for m in manual:
+    if m.folder.len > 0 and dirExists(m.folder):
+      result.add m
+      seen.incl m.gameId
+  for id in availableProfileIds():
+    if id in seen: continue
+    let prof =
+      try: loadProfileById(id)
+      except CatchableError: continue
+    let folder = autoMountFolder(xeniaContent, prof)
+    if folder.len > 0:
+      result.add Mount(gameId: id, folder: folder)

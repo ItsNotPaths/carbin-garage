@@ -16,6 +16,7 @@ import modal
 import menu
 import text_input
 import ../state
+import ../car_names
 
 const
   TileH*       = 0.025'f32   ## fraction of window H — matches top strip
@@ -50,20 +51,26 @@ proc togglePalette(selected: bool): tuple[bg, border: Color] =
     (color(0.16, 0.18, 0.22), color(0.30, 0.32, 0.38))
 
 proc menuItemsFor(src: Source; row: CarRow): seq[MenuItem] =
-  ## Right-click on any car row offers the same three entries; enable
-  ## state depends on the row's source. Game / DLC rows can be imported
-  ## (always-copy) into working/ when a backing zip exists; catalog-only
-  ## rows from `listMediaNames` (no sourcePath) stay disabled until the
-  ## .CAB unpack pipeline lands. Working/ rows can be loaded onto the
-  ## pedestal or have a parts tab opened.
+  ## Right-click on any car row. Game/DLC rows with a backing zip can be
+  ## imported into working/ AND set as the donor for export to that game.
+  ## Catalog-only rows (no sourcePath) stay disabled — their carbin is
+  ## still inside an unpacked .CAB. Working/ rows go to the pedestal or
+  ## a parts tab.
   let isWorking   = src.kind == srcWorking
   let canImport   = (src.kind in {srcGame, srcDlc}) and
                     row.sourcePath.len > 0
-  @[
+  let canDonate   = (src.kind == srcGame) and
+                    row.sourcePath.len > 0 and
+                    src.profileId.len > 0
+  result = @[
     MenuItem(label: "Import to working/",  enabled: canImport),
     MenuItem(label: "Load from working/",  enabled: isWorking),
     MenuItem(label: "Open parts tab",      enabled: isWorking),
   ]
+  if src.kind == srcGame:
+    result.add MenuItem(
+      label: "Set as donor for " & src.profileId.toUpperAscii(),
+      enabled: canDonate)
 
 proc drawRow(ctx: var UiContext; cache: var TextCache;
              app: var AppState; menu: var ContextMenu;
@@ -116,7 +123,7 @@ proc drawRow(ctx: var UiContext; cache: var TextCache;
 
   # car name label
   let labelX = togX + ToggleW + RowPadX
-  ctx.pushLabel(cache, row.name,
+  ctx.pushLabel(cache, prettyDisplayName(row.name),
                 labelX,
                 rowRect.y + (rowRect.h - 14) * 0.5'f32)
 

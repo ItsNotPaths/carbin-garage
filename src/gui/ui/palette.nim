@@ -1,13 +1,19 @@
 ## Floating bottom-middle export palette. Renders only when an active
 ## working/ car is loaded; collapses to nothing otherwise. Layout (per
-## `plans/well-ill-describe-it-quizzical-wilkes.md` § Architecture/Layers/4):
-## centred over the dropup strip, ~50% wide × 5% tall.
+## `plans/well-ill-describe-it-quizzical-wilkes.md` § Architecture/Layers/4
+## with 3c.4 restructure): centred over the dropup strip, ~50% wide ×
+## ~15% tall. Three stacked rows:
 ##
-## Widget owns no I/O — clicking Export sets `paletteExportRequested = true`
-## on AppState and the caller (gui/app.nim) dispatches the actual port.
+##   [ name override .................................. ] [ Export ]
+##   [ donor: AUD_R8GT_11 ] [ donor: <select donor> ] [ ... per game ]
+##   [ FH1 ✓ ]              [ FM4   ]                [ ... per game ]
 ##
-## Status toast: fade-after-N-seconds banner anchored under the palette,
-## written to by `state.setPaletteStatus`.
+## Top row is shared across all toggled targets. Middle row shows the
+## currently bound donor for each profile (or a "select donor" prompt);
+## clicking a filled slot clears it. Donors are bound by right-clicking
+## a car in the matching game's dropup popup → "Set as donor for <GAME>".
+## Bottom row is a multi-select target toggle — greyed columns mean the
+## profile has no registered mount.
 
 import std/[hashes, strutils]
 import context
@@ -15,8 +21,8 @@ import draw
 import text as uitext
 import button
 import text_input
-import modal
 import ../state
+import ../car_names
 
 const
   PanelBg          = (0.10'f32, 0.12'f32, 0.16'f32, 0.95'f32)
@@ -25,10 +31,8 @@ const
   RowGap           = 6.0'f32
   PanelPadX        = 10.0'f32
   PanelPadY        = 8.0'f32
-  ChipW            = 72.0'f32
-  ChevronW         = 28.0'f32
-  ExportBtnW       = 110.0'f32
   ColGap           = 8.0'f32
+  ExportBtnW       = 110.0'f32
   StatusH          = 26.0'f32
   StatusGap        = 6.0'f32
   PanelWFrac       = 0.50'f32          ## % of winW
@@ -36,9 +40,19 @@ const
   PanelMaxW        = 760.0'f32
   BottomGap        = 12.0'f32          ## above the dropup strip
 
-  TargetChipBg     = (0.18'f32, 0.20'f32, 0.24'f32, 1.0'f32)
-  TargetChipHover  = (0.24'f32, 0.27'f32, 0.32'f32, 1.0'f32)
-  TargetChipActive = (0.30'f32, 0.34'f32, 0.42'f32, 1.0'f32)
+  ChipBg           = (0.18'f32, 0.20'f32, 0.24'f32, 1.0'f32)
+  ChipHover        = (0.24'f32, 0.27'f32, 0.32'f32, 1.0'f32)
+  ChipActive       = (0.30'f32, 0.34'f32, 0.42'f32, 1.0'f32)
+  ChipDimBg        = (0.12'f32, 0.13'f32, 0.16'f32, 1.0'f32)
+  ChipDimFg        = (0.40'f32, 0.42'f32, 0.48'f32, 1.0'f32)
+
+  TargetOnBg       = (0.30'f32, 0.55'f32, 0.32'f32, 1.0'f32)
+  TargetOnHover    = (0.36'f32, 0.62'f32, 0.38'f32, 1.0'f32)
+  TargetOnActive   = (0.42'f32, 0.70'f32, 0.44'f32, 1.0'f32)
+
+  DonorBoundBg     = (0.20'f32, 0.32'f32, 0.42'f32, 1.0'f32)
+  DonorBoundHover  = (0.26'f32, 0.40'f32, 0.52'f32, 1.0'f32)
+  DonorBoundActive = (0.32'f32, 0.48'f32, 0.62'f32, 1.0'f32)
 
   ExportEnabled    = (0.30'f32, 0.55'f32, 0.32'f32, 1.0'f32)
   ExportEnabledH   = (0.36'f32, 0.62'f32, 0.38'f32, 1.0'f32)
@@ -50,12 +64,9 @@ const
 
 proc wid(label: string): WidgetId = WidgetId(hash("palette." & label))
 
-proc paletteRect*(winW, winH, dropupH: float32;
-                  expanded: bool): Rect =
-  ## Centred above the dropup strip. Height grows when the advanced row
-  ## is shown — the bottom edge stays anchored to (dropupH + BottomGap).
-  let baseH = PanelPadY * 2 + RowH
-  let panelH = if expanded: baseH + RowH + RowGap else: baseH
+proc paletteRect*(winW, winH, dropupH: float32): Rect =
+  ## Centred above the dropup strip. Height fixed at three rows.
+  let panelH = PanelPadY * 2 + RowH * 3 + RowGap * 2
   var w = winW * PanelWFrac
   if w < PanelMinW: w = PanelMinW
   if w > PanelMaxW: w = PanelMaxW
@@ -69,30 +80,19 @@ proc canExport(app: AppState): tuple[ok: bool; reason: string] =
     return (false, "load a working car")
   if app.cfg.xeniaContent.strip.len == 0:
     return (false, "set xenia content path in Settings")
-  if app.palette.targetGame.len == 0:
-    return (false, "register a game mount")
-  if app.palette.donor.text.strip.len == 0:
-    return (false, "donor required (existing car in target game)")
+  if not anyTargetOn(app):
+    return (false, "toggle at least one target game")
+  for gid in allProfileIds(app):
+    if not targetOn(app, gid): continue
+    if donorBound(app, gid).len == 0:
+      return (false,
+        "donor not set for " & gid.toUpperAscii() &
+        " (right-click a car in its popup)")
   (true, "")
 
 type
   PaletteResult* = object
     exportPressed*: bool
-
-proc drawChevron(ctx: var UiContext; r: Rect; expanded: bool) =
-  ## Tiny up/down arrow rasterised as a small triangle of solid quads.
-  ## SDL3 GPU draw list has no triangle primitive — we approximate with
-  ## three short horizontal bars that taper toward the apex.
-  let cx = r.x + r.w * 0.5'f32
-  let cy = r.y + r.h * 0.5'f32
-  let col = color(0.78, 0.82, 0.88, 1.0)
-  let bars = 3
-  for i in 0 ..< bars:
-    let halfW = float32(bars - i) * 2.0'f32
-    let yy =
-      if expanded: cy + 4 - float32(i) * 2.0'f32   # ▼
-      else: cy - 4 + float32(i) * 2.0'f32           # ▲
-    ctx.pushSolid(rect(cx - halfW, yy, halfW * 2, 2.0'f32), col)
 
 proc drawPalette*(ctx: var UiContext; cache: var TextCache;
                   app: var AppState; pane: Rect): PaletteResult =
@@ -106,52 +106,24 @@ proc drawPalette*(ctx: var UiContext; cache: var TextCache;
   let (pr, pg, pb, pa) = PanelBg
   ctx.pushSolid(pane, color(pr, pg, pb, pa))
 
-  # Top row layout:
-  #   [target chip] [donor input ........] [chevron] [Export button]
-  let topY = pane.y + PanelPadY
-  let leftX = pane.x + PanelPadX
+  let leftX  = pane.x + PanelPadX
   let rightX = pane.x + pane.w - PanelPadX
+  let row1Y  = pane.y + PanelPadY
+  let row2Y  = row1Y + RowH + RowGap
+  let row3Y  = row2Y + RowH + RowGap
 
-  let chipR = rect(leftX, topY, ChipW, RowH)
-  let exportR = rect(rightX - ExportBtnW, topY, ExportBtnW, RowH)
-  let chevR = rect(exportR.x - ColGap - ChevronW, topY, ChevronW, RowH)
-  let donorX = chipR.x + chipR.w + ColGap
-  let donorW = chevR.x - ColGap - donorX
-  let donorR = rect(donorX, topY, max(60.0'f32, donorW), RowH)
+  # ---- Top row: name override + Export ----
+  let exportR = rect(rightX - ExportBtnW, row1Y, ExportBtnW, RowH)
+  let nameR   = rect(leftX, row1Y,
+                     exportR.x - ColGap - leftX, RowH)
+  discard textInput(ctx, cache, wid("name"), nameR, app.palette.newName)
+  if app.palette.newName.text.len == 0:
+    ctx.pushLabel(cache,
+                  "name override (default: " &
+                    prettyDisplayName(app.activeSlug) & ")",
+                  nameR.x + 8,
+                  nameR.y + (nameR.h - 14) * 0.5'f32 - 5)
 
-  # Target-game cycler chip — "FH1 ▸" style, click cycles next mount.
-  let chipLabel =
-    if app.palette.targetGame.len == 0: "—"
-    else: app.palette.targetGame.toUpperAscii()
-  let chipStyle = ButtonStyle(
-    bg:       color(TargetChipBg[0], TargetChipBg[1], TargetChipBg[2],
-                     TargetChipBg[3]),
-    bgHover:  color(TargetChipHover[0], TargetChipHover[1],
-                     TargetChipHover[2], TargetChipHover[3]),
-    bgActive: color(TargetChipActive[0], TargetChipActive[1],
-                     TargetChipActive[2], TargetChipActive[3]),
-    fg:       color(0.92, 0.94, 0.98))
-  if button(ctx, cache, wid("target"), chipR, chipLabel, chipStyle):
-    cyclePaletteTarget(app)
-
-  # Donor input — placeholder hint when empty.
-  discard textInput(ctx, cache, wid("donor"), donorR, app.palette.donor)
-  if app.palette.donor.text.len == 0:
-    ctx.pushLabel(cache, "donor (target-game slug, e.g. AUD_R8GT_11)",
-                  donorR.x + 8,
-                  donorR.y + (donorR.h - 14) * 0.5'f32 - 5)
-
-  # Chevron toggles advanced row.
-  ctx.pushSolid(chevR, color(TargetChipBg[0], TargetChipBg[1],
-                              TargetChipBg[2], TargetChipBg[3]))
-  let chevId = wid("chevron")
-  if chevR.contains(ctx.mouseX, ctx.mouseY) and not ctx.inputBlocked:
-    ctx.hotId = chevId
-    if ctx.mouseClicked[0]:
-      app.palette.expanded = not app.palette.expanded
-  drawChevron(ctx, chevR, app.palette.expanded)
-
-  # Export button — green when ready, grey + disabled otherwise.
   let canExp = canExport(app)
   let exportStyle =
     if canExp.ok:
@@ -178,27 +150,102 @@ proc drawPalette*(ctx: var UiContext; cache: var TextCache;
     else:
       setPaletteStatus(app, canExp.reason, ok = false)
 
-  # Advanced row (animated): name + dlc-id inputs.
-  modal.tickFraction(app.palette.expandFrac, app.palette.expanded, ctx.dt)
-  if app.palette.expandFrac > 0:
-    let row2Y = pane.y + PanelPadY + RowH + RowGap
-    let halfW = (pane.w - PanelPadX * 2 - ColGap) * 0.5'f32
-    let nameR = rect(leftX, row2Y, halfW, RowH)
-    let dlcR  = rect(leftX + halfW + ColGap, row2Y, halfW, RowH)
-    discard textInput(ctx, cache, wid("name"), nameR, app.palette.newName)
-    if app.palette.newName.text.len == 0:
-      ctx.pushLabel(cache,
-                    "name override (default: " & app.activeSlug & ")",
-                    nameR.x + 8,
-                    nameR.y + (nameR.h - 14) * 0.5'f32 - 5)
-    discard textInput(ctx, cache, wid("dlc"), dlcR, app.palette.dlcId)
-    if app.palette.dlcId.text.len == 0:
-      ctx.pushLabel(cache, "dlc-id (default: hash of name)",
-                    dlcR.x + 8,
-                    dlcR.y + (dlcR.h - 14) * 0.5'f32 - 5)
+  # ---- Per-profile columns: donor slot (row 2) + target toggle (row 3) ----
+  let profiles = allProfileIds(app)
+  if profiles.len == 0:
+    ctx.pushLabel(cache, "no game profiles installed",
+                  leftX, row2Y + (RowH - 14) * 0.5'f32 - 5)
+    return
 
-  # Status banner floats above the palette so it doesn't crash into the
-  # dropup strip below. Auto-fades via tickPaletteStatus in app.nim.
+  let totalColsW = pane.w - PanelPadX * 2
+  let colGapTotal = ColGap * float32(max(0, profiles.len - 1))
+  let colW = (totalColsW - colGapTotal) / float32(profiles.len)
+
+  for i, gid in profiles:
+    let colX = leftX + float32(i) * (colW + ColGap)
+    let donorR  = rect(colX, row2Y, colW, RowH)
+    let toggleR = rect(colX, row3Y, colW, RowH)
+    let mounted = profileMounted(app, gid)
+    let donor   = donorBound(app, gid)
+
+    # ----- Donor slot (middle row) -----
+    if not mounted:
+      let dimStyle = ButtonStyle(
+        bg:       color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        bgHover:  color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        bgActive: color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        fg:       color(ChipDimFg[0], ChipDimFg[1], ChipDimFg[2],
+                         ChipDimFg[3]))
+      discard button(ctx, cache, wid("donor." & gid),
+                     donorR, "(no mount)", dimStyle)
+    elif donor.len > 0:
+      let boundStyle = ButtonStyle(
+        bg:       color(DonorBoundBg[0], DonorBoundBg[1],
+                         DonorBoundBg[2], DonorBoundBg[3]),
+        bgHover:  color(DonorBoundHover[0], DonorBoundHover[1],
+                         DonorBoundHover[2], DonorBoundHover[3]),
+        bgActive: color(DonorBoundActive[0], DonorBoundActive[1],
+                         DonorBoundActive[2], DonorBoundActive[3]),
+        fg:       color(0.92, 0.96, 1.0))
+      if button(ctx, cache, wid("donor." & gid),
+                donorR, prettyDisplayName(donor), boundStyle):
+        clearDonor(app, gid)
+    else:
+      let promptStyle = ButtonStyle(
+        bg:       color(ChipBg[0], ChipBg[1], ChipBg[2], ChipBg[3]),
+        bgHover:  color(ChipHover[0], ChipHover[1], ChipHover[2],
+                         ChipHover[3]),
+        bgActive: color(ChipActive[0], ChipActive[1], ChipActive[2],
+                         ChipActive[3]),
+        fg:       color(0.70, 0.74, 0.80))
+      # Non-clickable behaviourally — but rendered as a button for
+      # visual consistency with the bound state. We don't act on the
+      # click; the user binds via right-click in the dropup.
+      discard button(ctx, cache, wid("donor." & gid),
+                     donorR, "select donor", promptStyle)
+
+    # ----- Target toggle (bottom row) -----
+    let label = gid.toUpperAscii() &
+                (if mounted and targetOn(app, gid): "  ✓" else: "")
+    if not mounted:
+      let dimStyle = ButtonStyle(
+        bg:       color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        bgHover:  color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        bgActive: color(ChipDimBg[0], ChipDimBg[1], ChipDimBg[2],
+                         ChipDimBg[3]),
+        fg:       color(ChipDimFg[0], ChipDimFg[1], ChipDimFg[2],
+                         ChipDimFg[3]))
+      discard button(ctx, cache, wid("target." & gid),
+                     toggleR, gid.toUpperAscii(), dimStyle)
+    else:
+      let on = targetOn(app, gid)
+      let style =
+        if on:
+          ButtonStyle(
+            bg:       color(TargetOnBg[0], TargetOnBg[1],
+                             TargetOnBg[2], TargetOnBg[3]),
+            bgHover:  color(TargetOnHover[0], TargetOnHover[1],
+                             TargetOnHover[2], TargetOnHover[3]),
+            bgActive: color(TargetOnActive[0], TargetOnActive[1],
+                             TargetOnActive[2], TargetOnActive[3]),
+            fg:       color(0.96, 0.98, 0.96))
+        else:
+          ButtonStyle(
+            bg:       color(ChipBg[0], ChipBg[1], ChipBg[2], ChipBg[3]),
+            bgHover:  color(ChipHover[0], ChipHover[1], ChipHover[2],
+                             ChipHover[3]),
+            bgActive: color(ChipActive[0], ChipActive[1], ChipActive[2],
+                             ChipActive[3]),
+            fg:       color(0.92, 0.94, 0.98))
+      if button(ctx, cache, wid("target." & gid), toggleR, label, style):
+        toggleTarget(app, gid)
+
+  # ---- Status banner ----
   if app.palette.statusMsg.len > 0:
     let (sr, sg, sb, sa) =
       if app.palette.statusOk: StatusOkBg else: StatusErrBg

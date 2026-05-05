@@ -10,6 +10,7 @@ import std/[strutils, math]
 import context
 import draw
 import text as uitext
+import ../../render/platform/sdl3
 
 const
   # SDL3 keycodes used by this widget. Values straight from SDL_keycode.h.
@@ -22,6 +23,13 @@ const
   SDLK_RIGHT     = 0x4000004F'u32
   SDLK_HOME      = 0x4000004A'u32
   SDLK_END       = 0x4000004D'u32
+  SDLK_V         = 0x00000076'u32
+
+  KMOD_LCTRL = 0x0040'u16
+  KMOD_RCTRL = 0x0080'u16
+  KMOD_LGUI  = 0x0400'u16   ## Cmd on macOS
+  KMOD_RGUI  = 0x0800'u16
+  PasteMods  = KMOD_LCTRL or KMOD_RCTRL or KMOD_LGUI or KMOD_RGUI
 
   PadX        = 8.0'f32
   CaretBlinkS = 0.50'f32
@@ -59,6 +67,24 @@ proc handleInput(s: var TextInputState; ctx: var UiContext) =
     s.cursor += ctx.textInput.len
   s.pendingEnter = false
   for k in ctx.keys:
+    # Ctrl+V (Cmd+V on macOS) — paste-only; no copy/cut/select. Pulls
+    # SDL_GetClipboardText, strips trailing newlines (multi-line clipboard
+    # contents would corrupt our single-line widgets), and inserts at the
+    # caret like a SDL_EVENT_TEXT_INPUT batch.
+    if k.key == SDLK_V and (k.`mod` and PasteMods) != 0:
+      if SDL_HasClipboardText():
+        let raw = SDL_GetClipboardText()
+        if raw != nil:
+          var clip = $raw
+          SDL_free(cast[pointer](raw))
+          # Squash any newlines/CRs to spaces so a multi-line paste lands
+          # as a single-line value rather than truncating mid-string.
+          for i in 0 ..< clip.len:
+            if clip[i] in {'\n', '\r'}: clip[i] = ' '
+          if clip.len > 0:
+            s.text.insert(clip, s.cursor)
+            s.cursor += clip.len
+      continue
     case k.key
     of SDLK_BACKSPACE:
       if s.cursor > 0:

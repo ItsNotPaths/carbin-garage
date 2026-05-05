@@ -12,6 +12,7 @@ import tabs
 import menu
 import text_input
 import ../state
+import ../car_names
 
 const
   PaneBg          = (0.10'f32, 0.12'f32, 0.16'f32, 0.85'f32)
@@ -130,7 +131,8 @@ proc drawRPane*(ctx: var UiContext; cache: var TextCache;
   # Tab strip
   var tabItems: seq[TabItem] = @[]
   for t in app.partsTabs:
-    tabItems.add TabItem(label: t.slug, pinned: t.pinned, accent: false)
+    tabItems.add TabItem(label: prettyDisplayName(t.slug),
+                         pinned: t.pinned, accent: false)
   let tabsRes = drawTabStrip(ctx, cache, stripR, tabItems, app.activeTab)
   if tabsRes.active >= 0 and tabsRes.active != app.activeTab:
     app.activeTab = tabsRes.active

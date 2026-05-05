@@ -9,6 +9,7 @@ import ../carbin_garage/core/[profile, mounts, cardb, gltf_runtime,
 import ../carbin_garage/orchestrator/scan
 import ui/text_input
 import ui/scroll
+import car_names
 
 type
   ExtractState* = enum esUnextracted, esExtracted
@@ -69,16 +70,13 @@ type
     search*:  TextInputState     ## filter; matched against stat field + column
 
   ExportPaletteState* = object
-    slug*:        string         ## activeSlug this palette state was synced for
-    targetGame*:  string         ## profile id (e.g. "fh1"); blank = first registered
-    donor*:       TextInputState ## donor slug in the target game's cars/ dir
-    newName*:     TextInputState ## final MediaName; blank = use sourceSlug
-    dlcId*:       TextInputState ## decimal int; blank = synth from slug
-    expanded*:    bool           ## advanced row (name + dlcId) toggled open
-    expandFrac*:  float32        ## 0..1 animated
-    statusMsg*:   string         ## last export result (success or error msg)
-    statusOk*:    bool           ## colour cue for statusMsg
-    statusS*:     float32        ## remaining display seconds; 0 = hide
+    slug*:        string                  ## activeSlug this palette state was synced for
+    newName*:     TextInputState          ## shared MediaName override across all toggled targets
+    targetsOn*:   Table[string, bool]     ## profile id → toggled-on
+    donors*:      Table[string, string]   ## profile id → donor carname (empty = unbound)
+    statusMsg*:   string                  ## last export result (success or error msg)
+    statusOk*:    bool                    ## colour cue for statusMsg
+    statusS*:     float32                 ## remaining display seconds; 0 = hide
 
   AppState* = object
     workingRoot*: string
@@ -119,11 +117,15 @@ proc loadGameSource(m: Mount; workingRoot: string): Source =
       return  # mount references an unknown profile — leave cars empty
 
   # 1. Loose .zips in cars/ — these are the immediately-extractable rows.
+  # Working/ folders are now created with a `[gameid] PrettyName` default
+  # (see gui/car_names.nim:defaultWorkingFolderName), so the extract-state
+  # check has to look at that derived path, not the raw carbin slug.
   var byName = initTable[string, CarRow]()
   for slot in scanLibrary(m.folder, prof):
+    let workingFolder = defaultWorkingFolderName(slot.name, m.gameId)
     byName[slot.name] = CarRow(
       name: slot.name, sourcePath: slot.path, sizeBytes: slot.sizeBytes,
-      extractState: computeExtractState(workingRoot, slot.name))
+      extractState: computeExtractState(workingRoot, workingFolder))
 
   # 2. Every MediaName in gamedb.slt — adds the base-game catalog rows
   # whose carbin lives inside a packed .CAB. They show up greyed out (no
@@ -132,9 +134,10 @@ proc loadGameSource(m: Mount; workingRoot: string): Source =
   let dbPath = m.folder / prof.gamedbPath
   for mediaName in listMediaNames(dbPath):
     if not byName.hasKey(mediaName):
+      let workingFolder = defaultWorkingFolderName(mediaName, m.gameId)
       byName[mediaName] = CarRow(
         name: mediaName, sourcePath: "", sizeBytes: 0,
-        extractState: computeExtractState(workingRoot, mediaName))
+        extractState: computeExtractState(workingRoot, workingFolder))
 
   var rows: seq[CarRow] = @[]
   for k, v in byName: rows.add(v)
@@ -156,9 +159,11 @@ proc loadWorkingSource(workingRoot: string): Source =
   result.cars = rows
 
 proc reloadSources*(s: var AppState) =
-  ## Rebuild s.sources from disk. Called at startup and after mounts edits.
+  ## Rebuild s.sources from disk. Called at startup and after Settings
+  ## commits. Combines manual mounts.json overrides with the auto-detected
+  ## standard-install layout under cfg.xeniaContent.
   s.sources.setLen(0)
-  for m in loadMounts():
+  for m in effectiveMounts(s.cfg.xeniaContent):
     s.sources.add(loadGameSource(m, s.workingRoot))
   s.sources.add(loadWorkingSource(s.workingRoot))
 
@@ -386,12 +391,25 @@ proc toggleSelected*(s: var AppState; sourceIdx: int; name: string) =
         break
 
 # ---- Export palette helpers ----
+#
+# The palette has three rows. Top: name override + Export button (shared
+# across all toggled targets). Middle: per-game donor slot (label = bound
+# donor carname or "select donor"). Bottom: per-game toggle button. Donor
+# binding happens by right-clicking a car in a srcGame dropup popup; the
+# palette itself is read-only on the donor cell beyond clicking it to
+# clear. Profiles without a registered mount render their column greyed
+# out and non-clickable in both rows.
 
-proc availableTargetGames*(s: AppState): seq[string] =
-  ## Profile ids of every registered game mount, in source order.
+proc allProfileIds*(s: AppState): seq[string] =
+  ## Profile ids known to the app, in source order. The palette renders
+  ## one column per id whether a mount exists or not — unmounted columns
+  ## are greyed out and disabled, which makes "go register a mount"
+  ## discoverable from the palette itself.
   for src in s.sources:
     if src.kind == srcGame and src.profileId.len > 0:
       result.add src.profileId
+  if result.len == 0:
+    result = availableProfileIds()
 
 proc gameSourceFor*(s: AppState; profileId: string): int =
   for i, src in s.sources:
@@ -399,55 +417,48 @@ proc gameSourceFor*(s: AppState; profileId: string): int =
       return i
   -1
 
-proc donorCandidate(s: AppState; targetGame, slug: string): string =
-  ## Pre-fill heuristic: if the slug already exists as a car in the target
-  ## game's source listing we use that as the donor (intuitive default for
-  ## same-slug "overwrite" exports). Otherwise blank — user picks.
-  let idx = gameSourceFor(s, targetGame)
-  if idx < 0: return ""
-  for r in s.sources[idx].cars:
-    if r.name == slug and r.sourcePath.len > 0:
-      return slug
-  ""
+proc profileMounted*(s: AppState; profileId: string): bool =
+  s.gameSourceFor(profileId) >= 0
+
+proc donorBound*(s: AppState; profileId: string): string =
+  if s.palette.donors.hasKey(profileId): s.palette.donors[profileId]
+  else: ""
+
+proc setDonor*(s: var AppState; profileId, carName: string) =
+  ## Bind a donor carname for a target. Auto-toggles the target ON so
+  ## the user doesn't have to click twice — picking a donor is the
+  ## stronger signal of intent.
+  if profileId.len == 0 or carName.len == 0: return
+  s.palette.donors[profileId] = carName
+  s.palette.targetsOn[profileId] = true
+
+proc clearDonor*(s: var AppState; profileId: string) =
+  if s.palette.donors.hasKey(profileId):
+    s.palette.donors.del(profileId)
+
+proc toggleTarget*(s: var AppState; profileId: string) =
+  let cur = s.palette.targetsOn.getOrDefault(profileId, false)
+  s.palette.targetsOn[profileId] = not cur
+
+proc targetOn*(s: AppState; profileId: string): bool =
+  s.palette.targetsOn.getOrDefault(profileId, false)
+
+proc anyTargetOn*(s: AppState): bool =
+  for _, v in s.palette.targetsOn:
+    if v: return true
+  false
 
 proc syncPaletteForActiveCar*(s: var AppState) =
-  ## Rebuild palette inputs when the active car changes. Picks a default
-  ## target (first registered game; preferring originGame when registered)
-  ## and seeds the donor from a same-slug match in the target.
+  ## Rebuild palette state when the active car changes. We keep
+  ## donor/target bindings *empty* by default — the user explicitly
+  ## binds donors via right-click, and toggling targets is one click on
+  ## the bottom row. Pre-filling either was clever-but-wrong: picked
+  ## targets/donors that the user didn't actually want, and harder to
+  ## un-bind than to bind in the first place.
   if s.palette.slug == s.activeSlug: return
   s.palette = ExportPaletteState(slug: s.activeSlug)
-  if s.activeSlug.len == 0: return
-
-  # Pick target: originGame from carslot.json if its mount is registered,
-  # else first registered game.
-  let games = availableTargetGames(s)
-  if games.len == 0: return
-  var pick = games[0]
-  let manifestPath = s.workingRoot / s.activeSlug / "carslot.json"
-  if fileExists(manifestPath):
-    try:
-      let m = readCarSlot(s.workingRoot, s.activeSlug)
-      if m.originGame.len > 0 and m.originGame in games:
-        pick = m.originGame
-    except CatchableError: discard
-  s.palette.targetGame = pick
-  let d = donorCandidate(s, pick, s.activeSlug)
-  s.palette.donor.text = d
-  s.palette.donor.cursor = d.len
-
-proc cyclePaletteTarget*(s: var AppState) =
-  ## Step the target-game cycler to the next registered game; rolls over.
-  let games = availableTargetGames(s)
-  if games.len == 0: return
-  var idx = -1
-  for i, g in games:
-    if g == s.palette.targetGame: idx = i; break
-  let next = if idx < 0: 0 else: (idx + 1) mod games.len
-  if games[next] == s.palette.targetGame: return
-  s.palette.targetGame = games[next]
-  let d = donorCandidate(s, games[next], s.palette.slug)
-  s.palette.donor.text = d
-  s.palette.donor.cursor = d.len
+  s.palette.targetsOn = initTable[string, bool]()
+  s.palette.donors = initTable[string, string]()
 
 proc setPaletteStatus*(s: var AppState; msg: string; ok: bool) =
   s.palette.statusMsg = msg
