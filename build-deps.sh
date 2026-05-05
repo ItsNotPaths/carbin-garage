@@ -60,6 +60,9 @@ CMAKE_BASE_FLAGS=(
     "-DCMAKE_INSTALL_PREFIX=$PREFIX"
     "-DBUILD_SHARED_LIBS=OFF"
     "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+    # SDL3 test binaries pull in CRC32 intrinsics that mingw-w64's libgcc
+    # doesn't expose; nothing in this project consumes them anyway.
+    "-DSDL_TESTS=OFF"
 )
 
 if [ "$TARGET" = "windows" ]; then
