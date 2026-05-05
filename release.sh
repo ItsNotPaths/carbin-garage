@@ -8,7 +8,7 @@ RELEASE_DIR="$(cd "$PROJECT_DIR/.." && pwd)/${PROJECT_NAME}-release"
 usage() {
     cat <<EOF
 usage: $(basename "$0") --local [--target linux|windows] [--skip-deps] [--clear-working]
-       $(basename "$0") --public --version vX.Y.Z [--notes "text"]
+       $(basename "$0") --public --version X.Y[.Z] [--notes "text"] [--prerelease]
 
   --local                       build locally into <project>-release/<target>/.
                                 Overwrites the binary, LICENSE, README, and
@@ -22,8 +22,10 @@ usage: $(basename "$0") --local [--target linux|windows] [--skip-deps] [--clear-
                                 staging. Use when a code change makes existing
                                 working/ trees stale and you want a clean slate.
   --public                      trigger release.yml workflow via gh CLI
-  --version <tag>               required when --public is used
+  --version <tag>               required when --public is used. Accepts 1.2,
+                                1.2.3, v1.2 etc.; normalized to vX.Y[.Z].
   --notes <text>                optional release notes
+  --prerelease                  mark the GitHub release as a pre-release
 EOF
 }
 
@@ -34,6 +36,7 @@ VERSION=""
 NOTES=""
 SKIP_DEPS=0
 CLEAR_WORKING=0
+PRERELEASE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
         --notes)          NOTES="${2:-}"; shift 2 ;;
         --skip-deps)      SKIP_DEPS=1; shift ;;
         --clear-working)  CLEAR_WORKING=1; shift ;;
+        --prerelease)     PRERELEASE=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *) echo "unknown flag: $1" >&2; usage; exit 1 ;;
     esac
@@ -136,12 +140,60 @@ if [ $DO_PUBLIC -eq 1 ]; then
     if [ -z "$REPO" ]; then
         echo "error: not in a github repo (or gh not authenticated)" >&2; exit 1
     fi
+
+    # Normalize tag: "1.2" / "1.2.3" / "v1.2" → "v1.2" / "v1.2.3".
+    case "$VERSION" in
+        v*) ;;
+        *)  VERSION="v$VERSION" ;;
+    esac
+    if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+        echo "error: --version must look like X.Y or X.Y.Z (got '$VERSION')" >&2
+        exit 1
+    fi
+
+    cd "$PROJECT_DIR"
+
+    # Working tree must be clean — anything uncommitted won't make it to GHA.
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: working tree dirty; commit or stash before --public" >&2
+        git status --short >&2
+        exit 1
+    fi
+
+    # workflow_dispatch runs against the remote default branch. Make sure the
+    # tip of that branch matches local HEAD, otherwise GHA builds stale code.
+    REMOTE_DEFAULT=$(git ls-remote --symref origin HEAD 2>/dev/null \
+        | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
+    if [ -z "$REMOTE_DEFAULT" ]; then
+        echo "error: could not detect origin's default branch" >&2; exit 1
+    fi
+    git fetch --quiet origin "$REMOTE_DEFAULT"
+    LOCAL_SHA=$(git rev-parse HEAD)
+    REMOTE_SHA=$(git rev-parse "origin/$REMOTE_DEFAULT")
+    if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+        cat >&2 <<EOF
+error: HEAD ($LOCAL_SHA) does not match origin/$REMOTE_DEFAULT ($REMOTE_SHA).
+       GitHub Actions builds the tip of the default branch, so push first:
+           git push origin HEAD:$REMOTE_DEFAULT
+EOF
+        exit 1
+    fi
+
+    # Refuse to clobber an existing tag — gh release create would fail later
+    # with a less-obvious error.
+    if gh release view "$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+        echo "error: release $VERSION already exists on $REPO" >&2; exit 1
+    fi
+
     WORKFLOW="release.yml"
-    echo "==> Triggering $WORKFLOW on $REPO ($VERSION)"
+    PRERELEASE_ARG="false"; [ $PRERELEASE -eq 1 ] && PRERELEASE_ARG="true"
+    echo "==> Triggering $WORKFLOW on $REPO ($VERSION, ref=$REMOTE_DEFAULT, prerelease=$PRERELEASE_ARG)"
     OLD_ID=$(gh run list --workflow="$WORKFLOW" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || echo "")
     gh workflow run "$WORKFLOW" \
+        --ref "$REMOTE_DEFAULT" \
         --field version="$VERSION" \
-        --field notes="$NOTES"
+        --field notes="$NOTES" \
+        --field prerelease="$PRERELEASE_ARG"
     echo "==> Waiting for run to register..."
     NEW_ID=""
     for i in $(seq 1 30); do
@@ -156,4 +208,5 @@ if [ $DO_PUBLIC -eq 1 ]; then
     fi
     echo "==> Watching run $NEW_ID"
     gh run watch "$NEW_ID" --exit-status
+    echo "==> Release: https://github.com/$REPO/releases/tag/$VERSION"
 fi
