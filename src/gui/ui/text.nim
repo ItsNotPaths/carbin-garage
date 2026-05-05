@@ -36,6 +36,11 @@ proc getOrBuild(c: var TextCache; s: string): rendertext.TextTexture =
   c.entries[s] = result
 
 proc measureText*(c: var TextCache; s: string): tuple[w, h: float32] =
+  ## TTF_RenderText_Blended fails on an empty string ("Text has zero
+  ## width"), so short-circuit before the rasterizer is touched. Layout
+  ## code measures speculatively (caret position, marquee period, etc.)
+  ## and the empty case is normal.
+  if s.len == 0: return (0'f32, 0'f32)
   let t = c.getOrBuild(s)
   (float32(t.width), float32(t.height))
 
@@ -47,6 +52,16 @@ proc pushLabel*(ctx: var UiContext; c: var TextCache; s: string;
   let t = c.getOrBuild(s)
   ctx.pushText(rect(x, y, float32(t.width), float32(t.height)),
                cast[pointer](t.tex), cast[pointer](c.sampler))
+
+proc pushLabelClipped*(ctx: var UiContext; c: var TextCache; s: string;
+                       x, y: float32; clip: Rect) =
+  ## Same as `pushLabel` but the resulting quad is scissor-clipped to
+  ## `clip`. The caller can position `(x, y)` outside `clip` for marquee
+  ## scrolling — only the portion that falls inside `clip` will rasterize.
+  if s.len == 0: return
+  let t = c.getOrBuild(s)
+  ctx.pushTextClipped(rect(x, y, float32(t.width), float32(t.height)),
+                      cast[pointer](t.tex), cast[pointer](c.sampler), clip)
 
 proc pushLabelCentered*(ctx: var UiContext; c: var TextCache; s: string;
                         r: Rect) =

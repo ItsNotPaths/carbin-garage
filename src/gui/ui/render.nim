@@ -110,8 +110,12 @@ proc submitDrawList*(cmdBuf: ptr SDL_GPUCommandBuffer;
   ## Walk ctx.draw, switch the bound pipeline as needed, push per-quad
   ## uniforms, draw 6 verts per command. Texture sampler is bound per
   ## text command since each glyph atlas / line texture is its own surface.
+  ## When a command carries a `clip` rect, we set a scissor for that one
+  ## draw and restore the full-window scissor afterward.
   var bound: DrawCmdKind = high(DrawCmdKind)  # invalid → forces first bind
   var first = true
+  var fullScissor = SDL_Rect(x: 0, y: 0,
+                             w: cint(ctx.winW), h: cint(ctx.winH))
 
   for cmd in ctx.draw:
     if first or cmd.kind != bound:
@@ -121,6 +125,12 @@ proc submitDrawList*(cmdBuf: ptr SDL_GPUCommandBuffer;
       of dckText:   SDL_BindGPUGraphicsPipeline(rp, pipes.text)
       bound = cmd.kind
       first = false
+
+    if cmd.clipped:
+      var sc = SDL_Rect(
+        x: cint(cmd.clip.x), y: cint(cmd.clip.y),
+        w: cint(cmd.clip.w), h: cint(cmd.clip.h))
+      SDL_SetGPUScissor(rp, addr sc)
 
     var rectU = rectToNdc(cmd.rect, ctx.winW, ctx.winH)
     SDL_PushGPUVertexUniformData(cmdBuf, 0,
@@ -139,3 +149,6 @@ proc submitDrawList*(cmdBuf: ptr SDL_GPUCommandBuffer;
       SDL_BindGPUFragmentSamplers(rp, 0, addr binding, 1)
 
     SDL_DrawGPUPrimitives(rp, 6, 1, 0, 0)
+
+    if cmd.clipped:
+      SDL_SetGPUScissor(rp, addr fullScissor)

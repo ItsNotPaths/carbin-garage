@@ -7,14 +7,19 @@ import draw
 
 const
   AnimSecs* = 0.15'f32
+  EaseK     = 0.20'f32   ## per-frame fraction of the remaining gap to close.
 
 proc tickFraction*(frac: var float32; opening: bool; dt: float32) =
-  ## Advance `frac` toward 1.0 when `opening` is true, else toward 0.0.
-  let step = dt / AnimSecs
-  if opening:
-    frac = min(1.0'f32, frac + step)
-  else:
-    frac = max(0.0'f32, frac - step)
+  ## Animate `frac` toward 1.0 when `opening` is true, else toward 0.0.
+  ## Exponential ease — each frame closes `EaseK` of the remaining gap to
+  ## the target, which feels smoother than linear and is cheap. Snap
+  ## within an imperceptible epsilon so callers can rely on hitting the
+  ## endpoint exactly (otherwise the value asymptotes forever).
+  let target = if opening: 1.0'f32 else: 0.0'f32
+  frac += (target - frac) * EaseK
+  if abs(frac - target) < 0.003'f32: frac = target
+  # `dt` retained for API compat + future framerate-aware tweaks.
+  discard dt
 
 proc modalDim*(ctx: var UiContext; frac: float32; alpha: float32 = 0.55'f32) =
   ## Push a single full-window dim quad whose alpha scales with `frac`.

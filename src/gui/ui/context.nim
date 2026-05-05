@@ -16,12 +16,19 @@ type
 
   DrawCmd* = object
     rect*: Rect
+    clipped*: bool         ## when true, render with `clip` as a scissor box
+    clip*: Rect            ## scissor rect in window pixels (only valid if clipped)
     case kind*: DrawCmdKind
     of dckSolid, dckCircle:
       color*: Color
     of dckText:
       tex*: pointer       ## ptr SDL_GPUTexture (avoids importing sdl3 here)
       sampler*: pointer   ## ptr SDL_GPUSampler
+
+  KeyPress* = object
+    key*:    uint32             ## SDL_Keycode
+    `mod`*:  uint16             ## SDL_Keymod (Ctrl/Shift/Alt mask)
+    repeat*: bool
 
   UiContext* = object
     winW*, winH*: float32       ## current backbuffer size in pixels
@@ -30,6 +37,9 @@ type
     mouseX*, mouseY*: float32
     mouseDown*, mouseClicked*, mouseReleased*: array[3, bool]
     wheelY*: float32
+
+    textInput*: string          ## concatenated UTF-8 chars typed this frame
+    keys*: seq[KeyPress]        ## SDL_EVENT_KEY_DOWN events this frame
 
     hotId*, activeId*, focusedId*: WidgetId
 

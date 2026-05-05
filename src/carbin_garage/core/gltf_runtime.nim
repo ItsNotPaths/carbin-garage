@@ -36,6 +36,16 @@ type
     submeshes*: seq[CarSubmesh]
     bbMin*, bbMax*: array[3, float32]
 
+  GltfPartMeta* = object
+    ## Lightweight per-mesh metadata for the R pane parts list. Populated
+    ## from the glTF JSON only — no buffer slurp.
+    name*:     string        # mesh.name (e.g. "hooda", "wheel-fl")
+    meshIdx*:  int           # index into j["meshes"]
+    nodeIdx*:  int           # first node referencing this mesh, or -1
+    lodKind*:  string        # extras.carbin.lodKind ("main"/"lod0"/"cockpit"/"corner")
+    primCount*: int          # number of primitives in the mesh
+    section*:  string        # extras.carbin.section if present, else mesh.name
+
 const
   GLTF_UNSIGNED_BYTE  = 5121
   GLTF_UNSIGNED_SHORT = 5123
@@ -272,3 +282,33 @@ proc loadMainCarMesh*(gltfPath: string;
       metallic:    bucket.metallic,
       roughness:   bucket.roughness,
       imageUri:    bucket.imageUri)
+
+proc listCarParts*(gltfPath: string): seq[GltfPartMeta] =
+  ## Enumerate every mesh in the default scene with its name + lodKind +
+  ## primitive count, in scene-node order. Cheap — only parses car.gltf;
+  ## never reads car.bin. The R pane parts list consumes this directly.
+  let j = parseFile(gltfPath)
+  let nMeshes = j["meshes"].len
+
+  # Map meshIdx -> first nodeIdx that references it (parts may also be
+  # un-referenced glTF leftovers; we still expose them, with nodeIdx=-1).
+  var firstNode = newSeq[int](nMeshes)
+  for i in 0 ..< nMeshes: firstNode[i] = -1
+  for ni in 0 ..< j["nodes"].len:
+    let n = j["nodes"][ni]
+    if not n.hasKey("mesh"): continue
+    let mi = n["mesh"].getInt
+    if mi >= 0 and mi < nMeshes and firstNode[mi] == -1:
+      firstNode[mi] = ni
+
+  for mi in 0 ..< nMeshes:
+    let m = j["meshes"][mi]
+    var meta: GltfPartMeta
+    meta.meshIdx = mi
+    meta.nodeIdx = firstNode[mi]
+    meta.name = m{"name"}.getStr("mesh_" & $mi)
+    meta.lodKind = m{"extras", "carbin", "lodKind"}.getStr("")
+    meta.section = m{"extras", "carbin", "section"}.getStr(meta.name)
+    meta.primCount =
+      if m.hasKey("primitives"): m["primitives"].len else: 0
+    result.add meta

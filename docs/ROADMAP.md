@@ -1,6 +1,34 @@
 # Roadmap
 
-Status snapshot of where carbin-garage is and what's next. Updated 2026-05-01 EOD.
+Status snapshot of where carbin-garage is and what's next. Updated 2026-05-04.
+
+**>>> GUI PHASE 3c.2 LANDED (2026-05-04): authoring tool surface complete <<<**
+
+Right-click a working/ row → **Open parts tab** / **Load from working/**.
+Right-click a game-source row → **Import to working/** (always-copy; the
+`--cli import` verb's GUI counterpart). Active car renders on the
+pedestal; L pane shows profile-driven Data_Car stats with edit + reset +
+Save (writes to `carslot.json` `stats{}`); R pane lists parts in a
+tabbed view. Right-click a part → **Grab part**; right-click a part on
+the pinned tab → **Replace with grabbed** — donor geometry overwrites
+host bytes, host slot tag preserved (`hooda` keeps name `hooda`),
+`.undo/<ts>/` snapshot taken, `edits[]` audit appended, scene reloads.
+Search bars on every list (game popups, R pane, L pane). DLC-only
+simplification: `esDirty` removed, never patch host gamedb. Code
+concentrated in `src/gui/` + `src/carbin_garage/core/{part_swap,
+workspace, profile, gltf_runtime}.nim` + `profiles/*.json`.
+
+Open GUI work, ranked:
+1. Bottom-middle palette + Export buttons (export-target selector +
+   Export). Wires to `port-to-dlc` / `port-to`.
+2. Stats consumer at export time — apply `carslot.stats{}` overrides
+   into the generated DLC's gamedb during `port-to-dlc`.
+3. Worker-thread async for Import-to-working/ (currently blocks
+   ~1–5 s on the UI thread).
+
+Full notes in memory `project_gui_phase_3c2_landed.md`.
+
+---
 
 **>>> DLC PIPELINE LANDED (2026-05-01 EOD): FM4→FH1 cross-game port works in-game <<<**
 

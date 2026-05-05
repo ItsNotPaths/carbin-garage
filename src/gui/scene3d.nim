@@ -41,7 +41,7 @@ const
   PedestalContactOuter    = PedestalRadius * 0.95'f32
   TopNormalThreshold      = 0.5'f32
 
-  CarBodyLift = 0.06'f32
+  CarBodyLift = 0.18'f32
   WheelInsetX = 0.12'f32
 
 # ───── stb_image FFI (impl is compiled once via core/xds.nim) ──────────────
@@ -382,6 +382,13 @@ proc release*(dev: ptr SDL_GPUDevice; scene: var Scene3D) =
     SDL_ReleaseGPUGraphicsPipeline(dev, scene.pipelineOpaque); scene.pipelineOpaque = nil
   if scene.pipelineTransparent != nil:
     SDL_ReleaseGPUGraphicsPipeline(dev, scene.pipelineTransparent); scene.pipelineTransparent = nil
+
+proc unloadCar*(scene: var Scene3D; dev: ptr SDL_GPUDevice) =
+  ## Drop GPU resources for the current car so the pedestal renders empty.
+  if scene.car.vbuf != nil: releaseMesh(dev, scene.car)
+  releaseCarTextures(dev, scene)
+  scene.carParts.setLen(0)
+  scene.carLoaded = false
 
 proc loadCar*(scene: var Scene3D; dev: ptr SDL_GPUDevice; gltfPath: string): bool {.discardable.} =
   ## Replace any currently-loaded car. Returns true on success; false if

@@ -542,7 +542,13 @@ type
     x*, y*, w*, h*: cfloat
     min_depth*, max_depth*: cfloat
 
+  SDL_Rect* {.importc: "SDL_Rect", header: SDL_Header, bycopy.} = object
+    x*, y*, w*, h*: cint
+
 proc SDL_SetGPUViewport*(rp: ptr SDL_GPURenderPass; viewport: ptr SDL_GPUViewport)
+  {.importc, header: SDL_GPUHeader.}
+
+proc SDL_SetGPUScissor*(rp: ptr SDL_GPURenderPass; scissor: ptr SDL_Rect)
   {.importc, header: SDL_GPUHeader.}
 
 proc SDL_GetTicks*(): uint64 {.importc, header: SDL_Header.}

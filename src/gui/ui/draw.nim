@@ -16,3 +16,12 @@ proc pushText*(ctx: var UiContext; r: Rect;
   ## produced by src/render/text.nim's buildTextTexture + a linear-clamp
   ## sampler shared by all text draws.
   ctx.draw.add DrawCmd(kind: dckText, rect: r, tex: tex, sampler: sampler)
+
+proc pushTextClipped*(ctx: var UiContext; r: Rect;
+                      tex: pointer; sampler: pointer;
+                      clip: Rect) =
+  ## Same as `pushText` but the quad is scissor-clipped to `clip` for the
+  ## one draw — useful for marquee scrolling where the text quad extends
+  ## beyond its column.
+  ctx.draw.add DrawCmd(kind: dckText, rect: r, tex: tex, sampler: sampler,
+                       clipped: true, clip: clip)

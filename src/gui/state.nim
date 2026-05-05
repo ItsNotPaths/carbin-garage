@@ -3,12 +3,15 @@
 ## mutate the working tree go through gui/verbs.nim — this module is a
 ## passive view of mounts + per-source car lists + selection.
 
-import std/[os, sets, algorithm, strutils, tables]
-import ../carbin_garage/core/[profile, mounts, cardb]
+import std/[os, sets, algorithm, strutils, tables, json]
+import ../carbin_garage/core/[profile, mounts, cardb, gltf_runtime,
+                              workspace, appconfig]
 import ../carbin_garage/orchestrator/scan
+import ui/text_input
+import ui/scroll
 
 type
-  ExtractState* = enum esUnextracted, esExtracted, esDirty
+  ExtractState* = enum esUnextracted, esExtracted
 
   SourceKind* = enum srcGame, srcDlc, srcWorking
 
@@ -28,6 +31,7 @@ type
     expanded*: bool
     expandFrac*: float32   ## 0..1 animated
     scrollY*: float32      ## current scroll offset within the expanded panel
+    search*: TextInputState ## per-source search filter; matched against car name
 
   PartRow* = object
     name*: string          ## mesh name from car.gltf (e.g. "hooda", "wheel-fl")
@@ -40,12 +44,52 @@ type
     slug*: string          ## working car this tab represents
     parts*: seq[PartRow]
     pinned*: bool          ## the active car's tab is pinned leftmost
+    scrollY*: float32      ## per-tab scroll offset for the parts list
+    search*: TextInputState ## per-tab search filter; matched against part name
+
+  GrabSlot* = object
+    active*: bool
+    donorSlug*: string     ## working/ slug the part lives in
+    partName*: string      ## mesh name (e.g. "hooda")
+    lodKind*:  string
+    section*:  string
+
+  LPaneField* = object
+    stat*:        EditableStat
+    original*:    string         ## value as parsed from cardb.json (display)
+    overridden*:  bool            ## true iff carslot.stats holds a value
+    input*:       TextInputState
+
+  LPaneState* = object
+    slug*:    string             ## the activeSlug this state was built for
+    profile*: string             ## originGame
+    fields*:  seq[LPaneField]
+    scroll*:  ScrollState
+    dirty*:   bool               ## any unsaved edits since the last save?
+    search*:  TextInputState     ## filter; matched against stat field + column
+
+  ExportPaletteState* = object
+    slug*:        string         ## activeSlug this palette state was synced for
+    targetGame*:  string         ## profile id (e.g. "fh1"); blank = first registered
+    donor*:       TextInputState ## donor slug in the target game's cars/ dir
+    newName*:     TextInputState ## final MediaName; blank = use sourceSlug
+    dlcId*:       TextInputState ## decimal int; blank = synth from slug
+    expanded*:    bool           ## advanced row (name + dlcId) toggled open
+    expandFrac*:  float32        ## 0..1 animated
+    statusMsg*:   string         ## last export result (success or error msg)
+    statusOk*:    bool           ## colour cue for statusMsg
+    statusS*:     float32        ## remaining display seconds; 0 = hide
 
   AppState* = object
     workingRoot*: string
+    cfg*: AppConfig
     sources*: seq[Source]
     activeSlug*: string
     partsTabs*: seq[PartsTab]
+    activeTab*: int             ## index into partsTabs (0 = pinned slot when populated)
+    grab*: GrabSlot
+    lpane*: LPaneState
+    palette*: ExportPaletteState
     selection*: HashSet[tuple[sourceIdx: int, name: string]]
     settingsOpen*: bool
     settingsFrac*: float32
@@ -61,9 +105,8 @@ proc defaultWorkingRoot*(): string =
   beside
 
 proc computeExtractState(workingRoot, slug: string): ExtractState =
-  ## Phase 3a: dirty bit isn't tracked yet — we only distinguish
-  ## extracted vs unextracted. Phase 3d adds dirty-tracking via a manifest
-  ## field + in-memory write-bit.
+  ## Binary by design: under the DLC-only model we never edit a game-source
+  ## archive in place, so a working/ slot is either present or absent.
   if dirExists(workingRoot / slug): esExtracted
   else:                              esUnextracted
 
@@ -122,6 +165,7 @@ proc reloadSources*(s: var AppState) =
 proc initAppState*(workingRoot = ""): AppState =
   result.workingRoot = if workingRoot.len > 0: workingRoot
                        else: defaultWorkingRoot()
+  result.cfg = loadAppConfig()
   result.selection = initHashSet[tuple[sourceIdx: int, name: string]]()
   reloadSources(result)
 
@@ -136,6 +180,200 @@ proc selectedRows*(s: AppState): seq[tuple[sourceIdx: int, row: CarRow]] =
         result.add((sel.sourceIdx, r))
         break
 
+proc partsTabIndex*(s: AppState; slug: string): int =
+  ## -1 if no tab exists for this slug.
+  for i, t in s.partsTabs:
+    if t.slug == slug: return i
+  result = -1
+
+proc loadPartsForTab(s: var AppState; tabIdx: int) =
+  ## Populate `partsTabs[tabIdx].parts` from the working car's car.gltf.
+  ## Silent no-op if the gltf is missing.
+  if tabIdx < 0 or tabIdx >= s.partsTabs.len: return
+  let slug = s.partsTabs[tabIdx].slug
+  let gltfPath = s.workingRoot / slug / "car.gltf"
+  if not fileExists(gltfPath): return
+  s.partsTabs[tabIdx].parts.setLen(0)
+  for meta in listCarParts(gltfPath):
+    s.partsTabs[tabIdx].parts.add(PartRow(
+      name:    meta.name,
+      section: meta.section,
+      lodKind: meta.lodKind,
+      visible: true,
+      modified: false))
+
+proc ensurePinnedTab*(s: var AppState) =
+  ## When activeSlug is set, guarantee partsTabs[0] is the pinned tab for
+  ## that slug. When activeSlug is empty, drop the pinned tab if any.
+  if s.activeSlug.len == 0:
+    if s.partsTabs.len > 0 and s.partsTabs[0].pinned:
+      s.partsTabs.delete(0)
+      if s.activeTab > 0: dec s.activeTab
+      else: s.activeTab = max(0, s.partsTabs.len - 1)
+    return
+  # Pinned tab present and matches?
+  if s.partsTabs.len > 0 and s.partsTabs[0].pinned and
+     s.partsTabs[0].slug == s.activeSlug:
+    return
+  # Pinned tab present but stale slug — replace.
+  if s.partsTabs.len > 0 and s.partsTabs[0].pinned:
+    s.partsTabs[0].slug = s.activeSlug
+    s.partsTabs[0].parts.setLen(0)
+    s.partsTabs[0].scrollY = 0
+    loadPartsForTab(s, 0)
+    return
+  # No pinned tab — insert at front. If a non-pinned tab for this slug
+  # already exists, promote it instead of duplicating.
+  let existing = partsTabIndex(s, s.activeSlug)
+  if existing >= 0:
+    var t = s.partsTabs[existing]
+    s.partsTabs.delete(existing)
+    t.pinned = true
+    s.partsTabs.insert(t, 0)
+    s.activeTab = 0
+    return
+  var tab = PartsTab(slug: s.activeSlug, pinned: true)
+  s.partsTabs.insert(tab, 0)
+  loadPartsForTab(s, 0)
+  s.activeTab = 0
+
+proc openPartsTab*(s: var AppState; slug: string) =
+  ## No-op if a tab for `slug` already exists; switches to it instead.
+  let existing = partsTabIndex(s, slug)
+  if existing >= 0:
+    s.activeTab = existing
+    return
+  s.partsTabs.add(PartsTab(slug: slug, pinned: false))
+  loadPartsForTab(s, s.partsTabs.len - 1)
+  s.activeTab = s.partsTabs.len - 1
+
+proc dataCarRow(cardb: JsonNode): JsonNode =
+  ## Return the Data_Car single-row dict from cardb.json, or nil if absent.
+  ## Cardb persists a list-of-dicts under tables.<name>.rows[]; we treat
+  ## row[0] as the canonical row for the slug.
+  if cardb == nil or cardb.kind != JObject: return nil
+  if not cardb.hasKey("tables"): return nil
+  let t = cardb["tables"]
+  if not t.hasKey("Data_Car"): return nil
+  let dc = t["Data_Car"]
+  if dc.kind != JObject or not dc.hasKey("rows"): return nil
+  let rows = dc["rows"]
+  if rows.kind != JArray or rows.len == 0: return nil
+  rows[0]
+
+proc fmtJsonValue(v: JsonNode): string =
+  if v == nil: return ""
+  case v.kind
+  of JString: v.getStr
+  of JInt:    $v.getInt
+  of JFloat:  $v.getFloat
+  of JBool:   (if v.getBool: "1" else: "0")
+  of JNull:   ""
+  else:       $v
+
+proc loadLPane*(s: var AppState) =
+  ## Rebuild s.lpane for the current activeSlug. Empty slug → empty state.
+  s.lpane = LPaneState()
+  if s.activeSlug.len == 0: return
+  let slug = s.activeSlug
+  let manifestPath = s.workingRoot / slug / "carslot.json"
+  if not fileExists(manifestPath): return
+  let manifest = readCarSlot(s.workingRoot, slug)
+  let originGame = manifest.originGame
+  if originGame.len == 0: return
+  var prof: GameProfile
+  try: prof = loadProfileById(originGame)
+  except CatchableError: return
+  if prof.userEditableStats.len == 0: return
+
+  # cardb.json — may be absent if the importer skipped it; we still render
+  # the form, just with empty originals.
+  var dataRow: JsonNode
+  let cardbPath = s.workingRoot / slug / "cardb.json"
+  if fileExists(cardbPath):
+    try:
+      dataRow = dataCarRow(parseJson(readFile(cardbPath)))
+    except CatchableError: discard
+
+  s.lpane.slug = slug
+  s.lpane.profile = originGame
+  for stat in prof.userEditableStats:
+    var f = LPaneField(stat: stat)
+    if dataRow != nil and dataRow.hasKey(stat.column):
+      f.original = fmtJsonValue(dataRow[stat.column])
+    var initial = f.original
+    if manifest.stats != nil and manifest.stats.hasKey(stat.column):
+      f.overridden = true
+      initial = fmtJsonValue(manifest.stats[stat.column])
+    f.input.text = initial
+    f.input.cursor = initial.len
+    s.lpane.fields.add f
+
+proc syncLPaneIfStale*(s: var AppState) =
+  ## Cheap idempotent reload — call each frame in the L pane drawer.
+  if s.lpane.slug != s.activeSlug:
+    loadLPane(s)
+
+proc resetLPaneField*(s: var AppState; idx: int) =
+  if idx < 0 or idx >= s.lpane.fields.len: return
+  s.lpane.fields[idx].input.text = s.lpane.fields[idx].original
+  s.lpane.fields[idx].input.cursor = s.lpane.fields[idx].original.len
+  s.lpane.fields[idx].overridden = false
+  s.lpane.dirty = true
+
+proc saveLPane*(s: var AppState) =
+  ## Persist current fields[] to carslot.json. Skips fields whose value
+  ## matches the original (those become "no override" instead of clutter).
+  if s.lpane.slug.len == 0: return
+  var manifest = readCarSlot(s.workingRoot, s.lpane.slug)
+  if manifest.stats == nil or manifest.stats.kind != JObject:
+    manifest.stats = newJObject()
+  var changes: seq[string] = @[]
+  for i in 0 ..< s.lpane.fields.len:
+    var f = addr s.lpane.fields[i]
+    let v = f[].input.text.strip()
+    if v == f[].original or v.len == 0:
+      if manifest.stats.hasKey(f[].stat.column):
+        manifest.stats.delete(f[].stat.column)
+        f[].overridden = false
+        changes.add f[].stat.column & "=<reset>"
+      continue
+    var newNode: JsonNode
+    case f[].stat.kind
+    of eskInt:
+      try: newNode = %parseInt(v)
+      except ValueError: continue
+    of eskBool:
+      let lc = v.toLowerAscii
+      if lc in ["1","true","yes","on"]: newNode = %1
+      elif lc in ["0","false","no","off"]: newNode = %0
+      else: continue
+    else:
+      try: newNode = %parseFloat(v)
+      except ValueError: continue
+    let existed = manifest.stats.hasKey(f[].stat.column)
+    let prev = if existed: $manifest.stats[f[].stat.column] else: ""
+    if not existed or prev != $newNode:
+      changes.add f[].stat.column & "=" & v
+    manifest.stats[f[].stat.column] = newNode
+    f[].overridden = true
+  if changes.len > 0:
+    appendEdit(manifest, kind = "stats_edit",
+               note = changes.join(", "))
+  writeCarSlot(s.workingRoot, s.lpane.slug, manifest)
+  s.lpane.dirty = false
+
+proc closePartsTab*(s: var AppState; tabIdx: int) =
+  ## Refuses to close a pinned tab — caller should route Unload-car to a
+  ## scene-side helper instead.
+  if tabIdx < 0 or tabIdx >= s.partsTabs.len: return
+  if s.partsTabs[tabIdx].pinned: return
+  s.partsTabs.delete(tabIdx)
+  if s.activeTab >= s.partsTabs.len:
+    s.activeTab = max(0, s.partsTabs.len - 1)
+  elif s.activeTab > tabIdx:
+    dec s.activeTab
+
 proc toggleSelected*(s: var AppState; sourceIdx: int; name: string) =
   let key = (sourceIdx, name)
   if key in s.selection: s.selection.excl(key)
@@ -146,3 +384,79 @@ proc toggleSelected*(s: var AppState; sourceIdx: int; name: string) =
       if src[].cars[i].name == name:
         src[].cars[i].selected = key in s.selection
         break
+
+# ---- Export palette helpers ----
+
+proc availableTargetGames*(s: AppState): seq[string] =
+  ## Profile ids of every registered game mount, in source order.
+  for src in s.sources:
+    if src.kind == srcGame and src.profileId.len > 0:
+      result.add src.profileId
+
+proc gameSourceFor*(s: AppState; profileId: string): int =
+  for i, src in s.sources:
+    if src.kind == srcGame and src.profileId == profileId:
+      return i
+  -1
+
+proc donorCandidate(s: AppState; targetGame, slug: string): string =
+  ## Pre-fill heuristic: if the slug already exists as a car in the target
+  ## game's source listing we use that as the donor (intuitive default for
+  ## same-slug "overwrite" exports). Otherwise blank — user picks.
+  let idx = gameSourceFor(s, targetGame)
+  if idx < 0: return ""
+  for r in s.sources[idx].cars:
+    if r.name == slug and r.sourcePath.len > 0:
+      return slug
+  ""
+
+proc syncPaletteForActiveCar*(s: var AppState) =
+  ## Rebuild palette inputs when the active car changes. Picks a default
+  ## target (first registered game; preferring originGame when registered)
+  ## and seeds the donor from a same-slug match in the target.
+  if s.palette.slug == s.activeSlug: return
+  s.palette = ExportPaletteState(slug: s.activeSlug)
+  if s.activeSlug.len == 0: return
+
+  # Pick target: originGame from carslot.json if its mount is registered,
+  # else first registered game.
+  let games = availableTargetGames(s)
+  if games.len == 0: return
+  var pick = games[0]
+  let manifestPath = s.workingRoot / s.activeSlug / "carslot.json"
+  if fileExists(manifestPath):
+    try:
+      let m = readCarSlot(s.workingRoot, s.activeSlug)
+      if m.originGame.len > 0 and m.originGame in games:
+        pick = m.originGame
+    except CatchableError: discard
+  s.palette.targetGame = pick
+  let d = donorCandidate(s, pick, s.activeSlug)
+  s.palette.donor.text = d
+  s.palette.donor.cursor = d.len
+
+proc cyclePaletteTarget*(s: var AppState) =
+  ## Step the target-game cycler to the next registered game; rolls over.
+  let games = availableTargetGames(s)
+  if games.len == 0: return
+  var idx = -1
+  for i, g in games:
+    if g == s.palette.targetGame: idx = i; break
+  let next = if idx < 0: 0 else: (idx + 1) mod games.len
+  if games[next] == s.palette.targetGame: return
+  s.palette.targetGame = games[next]
+  let d = donorCandidate(s, games[next], s.palette.slug)
+  s.palette.donor.text = d
+  s.palette.donor.cursor = d.len
+
+proc setPaletteStatus*(s: var AppState; msg: string; ok: bool) =
+  s.palette.statusMsg = msg
+  s.palette.statusOk = ok
+  s.palette.statusS = 6.0'f32   ## seconds the toast hangs around
+
+proc tickPaletteStatus*(s: var AppState; dt: float32) =
+  if s.palette.statusS > 0:
+    s.palette.statusS -= dt
+    if s.palette.statusS < 0:
+      s.palette.statusS = 0
+      s.palette.statusMsg = ""

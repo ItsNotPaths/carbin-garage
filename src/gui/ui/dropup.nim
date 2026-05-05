@@ -3,16 +3,18 @@
 ## position, listing that source's cars. Mutually exclusive — opening one
 ## closes the others.
 ##
-## Phase 3a renders the list with no scrolling and no row actions beyond
-## the multi-select toggle. Right-click context menu (extract / open parts
-## tab) and scroll land in 3b/3c.
+## Phase 3c added a right-click context menu (`Export to working/`,
+## `Load from working/`) — see `gui/ui/menu.nim`. Multi-select toggle
+## and virtualised wheel-scroll have been here since 3a.
 
-import std/hashes
+import std/[hashes, strutils]
 import context
 import draw
 import text as uitext
 import button
 import modal
+import menu
+import text_input
 import ../state
 
 const
@@ -22,6 +24,15 @@ const
   LightR       = 5.0'f32     ## extracted-state circle radius
   ToggleW      = 16.0'f32    ## select-toggle square side
   RowPadX      = 10.0'f32
+  SearchH*     = 24.0'f32    ## height of the search field row at the panel bottom
+  SearchPad    = 4.0'f32
+
+proc searchWid(srcIdx: int): WidgetId =
+  WidgetId(hash("dropup.search." & $srcIdx))
+
+proc matchesSearch*(query, name: string): bool =
+  if query.len == 0: return true
+  name.toLowerAscii.contains(query.toLowerAscii.strip())
 
 proc tileWid(idx: int): WidgetId = WidgetId(hash("dropup.tile." & $idx))
 proc rowWid(srcIdx: int; name: string): WidgetId =
@@ -31,7 +42,6 @@ proc lightColor(state: ExtractState): Color =
   case state
   of esUnextracted: color(0.45, 0.45, 0.50)
   of esExtracted:   color(0.30, 0.78, 0.42)
-  of esDirty:       color(0.95, 0.70, 0.20)
 
 proc togglePalette(selected: bool): tuple[bg, border: Color] =
   if selected:
@@ -39,8 +49,24 @@ proc togglePalette(selected: bool): tuple[bg, border: Color] =
   else:
     (color(0.16, 0.18, 0.22), color(0.30, 0.32, 0.38))
 
+proc menuItemsFor(src: Source; row: CarRow): seq[MenuItem] =
+  ## Right-click on any car row offers the same three entries; enable
+  ## state depends on the row's source. Game / DLC rows can be imported
+  ## (always-copy) into working/ when a backing zip exists; catalog-only
+  ## rows from `listMediaNames` (no sourcePath) stay disabled until the
+  ## .CAB unpack pipeline lands. Working/ rows can be loaded onto the
+  ## pedestal or have a parts tab opened.
+  let isWorking   = src.kind == srcWorking
+  let canImport   = (src.kind in {srcGame, srcDlc}) and
+                    row.sourcePath.len > 0
+  @[
+    MenuItem(label: "Import to working/",  enabled: canImport),
+    MenuItem(label: "Load from working/",  enabled: isWorking),
+    MenuItem(label: "Open parts tab",      enabled: isWorking),
+  ]
+
 proc drawRow(ctx: var UiContext; cache: var TextCache;
-             app: var AppState;
+             app: var AppState; menu: var ContextMenu;
              srcIdx: int; rowIdx: int;
              rowRect: Rect) =
   let row = app.sources[srcIdx].cars[rowIdx]
@@ -48,6 +74,18 @@ proc drawRow(ctx: var UiContext; cache: var TextCache;
   # hover highlight
   if rowRect.contains(ctx.mouseX, ctx.mouseY):
     ctx.pushSolid(rowRect, color(0.22, 0.24, 0.30, 0.6))
+
+  # Right-click anywhere in the row opens the context menu at the cursor.
+  # We intentionally let the toggle-square below also see the click — but
+  # it only acts on LMB, so there's no conflict.
+  if (not ctx.inputBlocked) and ctx.mouseClicked[2] and
+     rowRect.contains(ctx.mouseX, ctx.mouseY):
+    menu.open       = true
+    menu.anchorX    = ctx.mouseX
+    menu.anchorY    = ctx.mouseY
+    menu.sourceIdx  = srcIdx
+    menu.rowName    = row.name
+    menu.items      = menuItemsFor(app.sources[srcIdx], row)
 
   # extracted-state light (filled circle)
   let lightCx = rowRect.x + RowPadX + LightR
@@ -82,8 +120,72 @@ proc drawRow(ctx: var UiContext; cache: var TextCache;
                 labelX,
                 rowRect.y + (rowRect.h - 14) * 0.5'f32)
 
+proc expandedPanelRect(ctx: UiContext; app: AppState; i: int): Rect =
+  ## Geometry must match `drawDropupRow`'s inline computation.
+  let stripH = ctx.winH * TileH
+  let stripY = ctx.winH - stripH
+  let tileW  = ctx.winW / float32(app.sources.len)
+  let panelMax = ctx.winH * PanelMaxFrac
+  let panelH = panelMax * app.sources[i].expandFrac
+  let panelW = max(tileW, 360.0'f32)
+  var panelX = float32(i) * tileW + (tileW - panelW) * 0.5'f32
+  if panelX < 0: panelX = 0
+  if panelX + panelW > ctx.winW: panelX = ctx.winW - panelW
+  let panelY = stripY - panelH
+  rect(panelX, panelY, panelW, panelH)
+
+proc dropupClaimsInput*(ctx: var UiContext; app: var AppState): bool =
+  ## Pre-pass run before any pane renders. If a source's expanded panel
+  ## is on screen and the mouse is over it, drain the wheel into that
+  ## source and return true so the caller raises `inputBlocked` for the
+  ## panes underneath. Closes the panel on outside-click, too.
+  result = false
+  if app.sources.len == 0: return
+  let stripH = ctx.winH * TileH
+  let stripY = ctx.winH - stripH
+  let tileW  = ctx.winW / float32(app.sources.len)
+
+  var anyVisible = -1
+  var hovering = false
+  for i in 0 ..< app.sources.len:
+    if app.sources[i].expandFrac <= 0: continue
+    anyVisible = i
+    let panel = expandedPanelRect(ctx, app, i)
+    if panel.contains(ctx.mouseX, ctx.mouseY):
+      hovering = true
+      # Drain wheel into this source's scrollY immediately, before the
+      # panes get a shot at it. List area excludes the search bar at the
+      # bottom of the panel.
+      if ctx.wheelY != 0:
+        let q = app.sources[i].search.text.strip()
+        var visible = 0
+        for k in 0 ..< app.sources[i].cars.len:
+          if matchesSearch(q, app.sources[i].cars[k].name): inc visible
+        let totalH = float32(visible) * RowH
+        let listH = panel.h - SearchH
+        let maxScroll = max(0.0'f32, totalH - listH)
+        var sy = app.sources[i].scrollY
+        sy -= ctx.wheelY * RowH * 3.0'f32
+        if sy < 0: sy = 0
+        if sy > maxScroll: sy = maxScroll
+        app.sources[i].scrollY = sy
+        ctx.wheelY = 0
+      result = true
+      break
+
+  # Outside-click close: any non-tile, non-panel click on a fully-open
+  # panel collapses it. Tile clicks are already handled by the toggle in
+  # drawDropupRow; we exclude the strip rect so a tile click here doesn't
+  # double-fire.
+  if anyVisible >= 0 and not hovering and
+     (ctx.mouseClicked[0] or ctx.mouseClicked[2]):
+    let stripRect = rect(0, stripY, ctx.winW, stripH)
+    if not stripRect.contains(ctx.mouseX, ctx.mouseY):
+      for i in 0 ..< app.sources.len:
+        app.sources[i].expanded = false
+
 proc drawDropupRow*(ctx: var UiContext; cache: var TextCache;
-                    app: var AppState) =
+                    app: var AppState; menu: var ContextMenu) =
   if app.sources.len == 0: return
 
   let stripH = ctx.winH * TileH
@@ -129,41 +231,54 @@ proc drawDropupRow*(ctx: var UiContext; cache: var TextCache;
     ctx.pushSolid(rect(panelX, panelY, panelW, panelH),
                   color(0.10, 0.12, 0.16, 0.96))
 
-    let panelRect = rect(panelX, panelY, panelW, panelH)
-    let total = src[].cars.len
+    # Build filtered car-index list — query persists per source.
+    let q = src[].search.text.strip()
+    var filtered: seq[int] = @[]
+    for k in 0 ..< src[].cars.len:
+      if matchesSearch(q, src[].cars[k].name):
+        filtered.add k
+
+    # Reserve the bottom strip for the search field; the list area sits
+    # above it. The list panel still covers the full panelH.
+    let listH = panelH - SearchH
+    let total = filtered.len
     let totalH = float32(total) * RowH
-    let maxScroll = max(0.0'f32, totalH - panelH)
-
-    # consume wheel when hovering this panel (and input isn't blocked)
-    if (not ctx.inputBlocked) and
-       panelRect.contains(ctx.mouseX, ctx.mouseY) and ctx.wheelY != 0:
-      src[].scrollY -= ctx.wheelY * RowH * 3.0'f32
-      ctx.wheelY = 0
-
+    let maxScroll = max(0.0'f32, totalH - listH)
     if src[].scrollY < 0:           src[].scrollY = 0
     if src[].scrollY > maxScroll:   src[].scrollY = maxScroll
 
-    # virtualised row range
+    # virtualised row range over the filtered list
     let firstRow = int(src[].scrollY / RowH)
     let lastRow = min(total - 1,
-                      firstRow + int(panelH / RowH) + 1)
-    # Reserve a small gap above the strip so a partial bottom row never
-    # bleeds onto the dropup-tile button row.
-    let usableH = panelH - 4.0'f32
+                      firstRow + int(listH / RowH) + 1)
+    # Reserve a small gap above the search field so a partial bottom row
+    # never bleeds onto it.
+    let usableH = listH - 4.0'f32
     for j in firstRow .. lastRow:
       let yOff = float32(j) * RowH - src[].scrollY
       if yOff < 0 or yOff + RowH > usableH: continue
       let rRect = rect(panelX, panelY + yOff, panelW, RowH)
-      drawRow(ctx, cache, app, i, j, rRect)
+      drawRow(ctx, cache, app, menu, i, filtered[j], rRect)
 
-    # scrollbar (right edge, only when content overflows)
+    # scrollbar (right edge, only when content overflows the list area)
     if maxScroll > 0:
       let trackW = 4.0'f32
       let trackR = rect(panelX + panelW - trackW - 2, panelY + 2,
-                        trackW, panelH - 4)
+                        trackW, listH - 4)
       ctx.pushSolid(trackR, color(0.20, 0.22, 0.26, 0.6))
-      let thumbH = max(20.0'f32, panelH * panelH / totalH)
+      let thumbH = max(20.0'f32, listH * listH / totalH)
       let thumbY = trackR.y +
                    (trackR.h - thumbH) * (src[].scrollY / maxScroll)
       ctx.pushSolid(rect(trackR.x, thumbY, trackR.w, thumbH),
                     color(0.55, 0.58, 0.65, 0.85))
+
+    # Search field at the bottom of the panel.
+    let searchR = rect(panelX + SearchPad,
+                       panelY + listH + SearchPad,
+                       panelW - SearchPad * 2,
+                       SearchH - SearchPad * 2)
+    discard textInput(ctx, cache, searchWid(i), searchR, src[].search)
+    if src[].search.text.len == 0:
+      ctx.pushLabel(cache, "search…",
+                    searchR.x + 8,
+                    searchR.y + (searchR.h - 14) * 0.5'f32 - 5)

@@ -18,6 +18,23 @@ type
     dbDatabaseXmplr = "DatabaseXmplr"  # FM3 (TBD)
     dbUnsupported = "Unsupported"      # stub profile
 
+  EditableStatKind* = enum
+    eskFloat = "float"
+    eskInt   = "int"
+    eskBool  = "bool"
+    eskEnum  = "enum"
+
+  EditableStat* = object
+    field*: string                 ## display name; matches column when synthetic absent
+    table*: string                 ## gamedb table (typically "Data_Car")
+    column*: string                ## gamedb column
+    kind*: EditableStatKind
+    minVal*: float                 ## lower bound for clamp; 0 if unused
+    maxVal*: float                 ## upper bound for clamp; 0 if unused
+    step*: float                   ## numeric step on Enter; 0 = free
+    unit*: string                  ## display unit suffix ("kg", "rpm", "")
+    enumValues*: seq[string]       ## populated when kind == eskEnum
+
   GameProfile* = object
     id*: string
     displayName*: string
@@ -38,6 +55,7 @@ type
     rmbBinVersion*: int
     canUnbundle*: bool
     canBundle*: bool
+    userEditableStats*: seq[EditableStat]
 
 proc parseEnum[T: enum](s: string): T =
   for v in T.low .. T.high:
@@ -69,6 +87,21 @@ proc loadProfile*(path: string): GameProfile =
   )
   for x in j["extraXdsBuckets"]:
     result.extraXdsBuckets.add(x.getStr)
+  if j.hasKey("userEditableStats"):
+    for x in j["userEditableStats"]:
+      var es = EditableStat(
+        field:  x{"field"}.getStr,
+        table:  x{"table"}.getStr("Data_Car"),
+        column: x{"column"}.getStr,
+        kind:   parseEnum[EditableStatKind](x{"kind"}.getStr("float")),
+        minVal: x{"min"}.getFloat(0.0),
+        maxVal: x{"max"}.getFloat(0.0),
+        step:   x{"step"}.getFloat(0.0),
+        unit:   x{"unit"}.getStr(""))
+      if x.hasKey("enumValues"):
+        for v in x["enumValues"]:
+          es.enumValues.add v.getStr
+      result.userEditableStats.add es
 
 proc profilesDir*(): string =
   ## Conventional location: profiles/ next to the running binary.
