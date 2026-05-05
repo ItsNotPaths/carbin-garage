@@ -54,7 +54,7 @@ jobs:
           for attempt in 1 2 3 4 5; do
             apt-get update && \
             apt-get install -y --no-install-recommends \
-              build-essential cmake ninja-build curl git pkg-config ca-certificates xz-utils \
+              build-essential cmake ninja-build curl git pkg-config ca-certificates xz-utils file \
               libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
               libxi-dev libxfixes-dev libxcursor-dev libxss-dev libxtst-dev \
               libwayland-dev libxkbcommon-dev wayland-protocols \
