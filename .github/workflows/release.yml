@@ -20,6 +20,9 @@ on:
 env:
   PROJECT_NAME: carbin-garage
   NIM_VERSION: '2.2.8'
+  # Opt actions/* runtimes onto Node.js 24 ahead of GitHub's 2026-06-02 cutoff
+  # (the @v4 actions still ship a node20 entrypoint by default).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -217,6 +220,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # `gh release create` shells out to git for tag context, so the job
+      # needs a checkout even though it doesn't read source files.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: linux-zip
