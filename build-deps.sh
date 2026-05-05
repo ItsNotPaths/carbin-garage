@@ -98,7 +98,21 @@ build_one() {
     cmake --install "$bdir"
 }
 
-build_one sdl3       "$VENDOR/sdl3"       -DSDL_STATIC=ON -DSDL_SHARED=OFF
+# SDL3 backend opt-outs:
+#   - libdecor + pipewire dev headers aren't available on Ubuntu 20.04 (jammy+
+#     only). Wayland still works without libdecor (no client-side decorations
+#     on GNOME); audio falls back to ALSA/Pulse without PipeWire.
+#   - mingw-w64 7.x on focal lacks dxgidebug.h, which SDL3's d3d11/d3d12
+#     renderers include. d3d9 (HAVE_D3D9_H) still builds; OpenGL/Vulkan paths
+#     cover Windows fine.
+SDL3_OPTOUT_FLAGS=()
+if [ "$TARGET" = "linux" ]; then
+    SDL3_OPTOUT_FLAGS+=("-DSDL_WAYLAND_LIBDECOR=OFF" "-DSDL_PIPEWIRE=OFF")
+elif [ "$TARGET" = "windows" ]; then
+    SDL3_OPTOUT_FLAGS+=("-DSDL_RENDER_D3D11=OFF" "-DSDL_RENDER_D3D12=OFF")
+fi
+
+build_one sdl3       "$VENDOR/sdl3"       -DSDL_STATIC=ON -DSDL_SHARED=OFF "${SDL3_OPTOUT_FLAGS[@]}"
 # SDL3_image skipped: nothing in Nim code calls IMG_Load yet (we use stb_image
 # from csrc/ for our own decoders). Re-enable once a real consumer needs it —
 # its 3.4.2 CMake hits an upstream bug querying SDL_FULL_VERSION on the
