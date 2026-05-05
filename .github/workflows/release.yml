@@ -173,6 +173,11 @@ jobs:
           ./build-deps.sh --target windows
 
       - name: Cross-compile carbin-garage
+        # SDL3's static lib pulls in Win32 system DLLs: winmm (timer),
+        # ole32 (COM), gdi32 (DC/bitmap), setupapi (device enum), imm32 (IME),
+        # version (file-version queries), oleaut32/uuid (COM helpers),
+        # cfgmgr32 (PnP), ws2_32 (sockets). System libs go AFTER the static
+        # archives so the linker can resolve their imports.
         shell: bash
         run: |
           PASSL_ARGS=("--passL:-Wl,--start-group")
@@ -180,6 +185,10 @@ jobs:
               PASSL_ARGS+=("--passL:$lib")
           done
           PASSL_ARGS+=("--passL:-Wl,--end-group")
+          for sysl in winmm ole32 oleaut32 uuid gdi32 user32 shell32 \
+                      advapi32 setupapi imm32 version cfgmgr32 ws2_32; do
+              PASSL_ARGS+=("--passL:-l$sysl")
+          done
           nimble -y build -d:release --os:windows --cpu:amd64 -d:mingw \
             --gcc.exe:x86_64-w64-mingw32-gcc \
             --gcc.linkerexe:x86_64-w64-mingw32-gcc \
