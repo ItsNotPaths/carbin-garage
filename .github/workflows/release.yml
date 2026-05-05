@@ -120,13 +120,16 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────
   # Windows build via mingw-w64 cross-compile from Linux.
-  # Single CI image, deterministic. SDL3_image / SDL3_ttf use VENDORED=ON,
-  # so the .exe is fully self-contained.
+  # SDL3_image / SDL3_ttf use VENDORED=ON, so the .exe is fully self-contained.
+  # ubuntu:22.04 (jammy), NOT focal — focal's mingw-w64 7.x lacks dxgidebug.h
+  # (SDL_GPU's d3d12 path) and newer audioclient.h fields (WASAPI). Jammy
+  # ships mingw-w64 v10 which has both. The build host's glibc doesn't matter
+  # for a Windows .exe output.
   # ──────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:20.04
+      image: ubuntu:22.04
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:

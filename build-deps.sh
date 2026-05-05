@@ -98,21 +98,14 @@ build_one() {
     cmake --install "$bdir"
 }
 
-# SDL3 backend opt-outs:
-#   - libdecor + pipewire dev headers aren't available on Ubuntu 20.04 (jammy+
-#     only). Wayland still works without libdecor (no client-side decorations
-#     on GNOME); audio falls back to ALSA/Pulse without PipeWire.
-#   - mingw-w64 7.x on focal lacks dxgidebug.h, which SDL3's d3d11/d3d12
-#     renderers include. d3d9 (HAVE_D3D9_H) still builds; OpenGL/Vulkan paths
-#     cover Windows fine.
+# Linux SDL3 backend opt-outs: libdecor + pipewire dev headers aren't available
+# on Ubuntu 20.04 (jammy+ only). Wayland still works without libdecor (no
+# client-side decorations on GNOME); audio falls back to ALSA/Pulse without
+# PipeWire. Windows cross-build runs on jammy (release.yml) so its mingw-w64
+# v10 has all the Windows SDK headers SDL3's d3d11/d3d12/WASAPI need.
 SDL3_OPTOUT_FLAGS=()
 if [ "$TARGET" = "linux" ]; then
     SDL3_OPTOUT_FLAGS+=("-DSDL_WAYLAND_LIBDECOR=OFF" "-DSDL_PIPEWIRE=OFF")
-elif [ "$TARGET" = "windows" ]; then
-    # mingw-w64 7.x on focal also lacks newer audioclient.h fields
-    # (AudioClientProperties.Options, AUDCLNT_STREAMOPTIONS_RAW) used by
-    # SDL3's WASAPI backend. DirectSound covers Windows audio output.
-    SDL3_OPTOUT_FLAGS+=("-DSDL_RENDER_D3D11=OFF" "-DSDL_RENDER_D3D12=OFF" "-DSDL_WASAPI=OFF")
 fi
 
 build_one sdl3       "$VENDOR/sdl3"       -DSDL_STATIC=ON -DSDL_SHARED=OFF "${SDL3_OPTOUT_FLAGS[@]}"
