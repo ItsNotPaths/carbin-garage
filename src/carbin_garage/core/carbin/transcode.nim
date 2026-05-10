@@ -54,17 +54,9 @@ import std/[options, sets, tables]
 import ./model
 import ./parser
 import ./builders
-import ./damage_remap
 import ../profile
 
 const TranscodeTrace {.booldefine.} = false
-const SliceDDamageRemap {.booldefine.} = false
-  ## Experimental: NN-remap donor's per-vertex damage table (a*b) onto
-  ## source's vertex order. Empirically does NOT fix cross-game spike
-  ## artifacts on collision in FH1 — its deformation engine doesn't
-  ## read this table. Off by default. The eventual UI toggle for
-  ## "experimental damage export" will flip this; until then users
-  ## should rely on FH1's in-game "no visual damage" setting.
 const SliceDExtra4Zero {.booldefine.} = true
   ## Zero `extra4` bytes 1..3 in each cross-version vertex. Empirically
   ## fixes cross-game paint splotchiness — those bytes carry FM4 tangent
@@ -77,6 +69,21 @@ type
   TranscodeMode* = enum
     tmDonorVerbatim   ## Legacy v0: return donor bytes verbatim.
     tmHybridSplice    ## Splice source vertex/index data onto donor scaffold.
+
+  TranscodeOptions* = object
+    ## Runtime knobs the GUI / CLI surface to the user. Compile-time
+    ## constants stay reserved for behaviours that *can't* be safely
+    ## per-export (paint fix, parser tracing).
+    exportHitboxes*: bool
+      ## Gate for physicsdef.bin collision shapes. Default `true`
+      ## ships donor's `shapesAndChildren` verbatim. `false` replaces
+      ## shapesAndChildren with a single `numShapes=0` u32 — the car
+      ## becomes uncollidable (drives through walls, off the map,
+      ## potentially through the ground). Confirmed 2026-05-10 on R8
+      ## cross-car port. Useful as a stunt / clipping mode; also
+      ## proves shapesAndChildren drives BOTH ground collision and
+      ## damage (which is why we can't reuse it as the
+      ## no-deformation hook on its own).
 
   TranscodeReport* = object
     mode*: TranscodeMode
@@ -91,14 +98,14 @@ type
     gapsPreserved*: int  ## Slice C: donor byte ranges between parsed
                           ## sections (LOD0-only sections in main carbin)
                           ## emitted verbatim so partCount stays consistent.
-    damageRemapped*: int ## Slice D: spliced sections whose a*b damage
-                          ## table was remapped by spatial-NN over donor's
-                          ## vertex order (cvFour→cvFive only).
     lod0Spliced*: int    ## LOD0-only sections (lod0/cockpit carbins,
                           ## caliper/rotor) whose LOD0 pool was rebuilt
                           ## from source. Visible in autoshow / close
                           ## camera; prior behavior was donor verbatim.
     note*: string
+
+proc defaultTranscodeOptions*(): TranscodeOptions =
+  TranscodeOptions(exportHitboxes: true)
 
 proc expectedDonorVersion(targetProfile: GameProfile): CarbinVersion =
   ## Validate by family, not exact TypeId — FM4 ships TypeIds 1/2/3 in
@@ -190,10 +197,10 @@ proc fm4Lod0PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
 
 proc spliceCarbin(sourceData, donorData: openArray[byte],
                   srcInfo, donInfo: CarbinInfo,
-                  srcVer, donVer: CarbinVersion):
+                  srcVer, donVer: CarbinVersion,
+                  options: TranscodeOptions):
                   tuple[bytes: seq[byte]; spliced: int; fallback: int;
-                        gapsPreserved: int; damageRemapped: int;
-                        lod0Spliced: int] =
+                        gapsPreserved: int; lod0Spliced: int] =
   ## Donor's part list is authoritative. For each donor section, look up
   ## a source section by name; splice if possible, otherwise donor verbatim.
   ## Assemble the final file by concatenating donor's pre-section bytes,
@@ -222,7 +229,6 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   var spliced = 0
   var fallback = 0
   var gapsPreserved = 0
-  var damageRemapped = 0
   var lod0Spliced = 0
 
   let renames = initTable[string, string]()
@@ -277,31 +283,6 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
             b
           forcedBlob = some(fm4PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
-        # Slice D: when crossVersion and donor section has a non-empty
-        # a*b damage table, remap it by spatial nearest-neighbor so source
-        # vertex i inherits donor vertex j_best's per-vertex skinning
-        # record (where j_best minimizes ||srcPos[i] - donPos[j]||²). For
-        # same-game splices or empty-table sections, leave donor's table
-        # verbatim — the bytes are correct as-is.
-        var remap = none(seq[byte])
-        if SliceDDamageRemap and crossVersionStride and
-           donSec.aTableEnd > donSec.aTableStart:
-          let srcPool = block:
-            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
-            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
-            b
-          let donPool = block:
-            var b = newSeq[byte](donSec.lodVerticesEnd - donSec.lodVerticesStart)
-            for i in 0 ..< b.len: b[i] = donorData[donSec.lodVerticesStart + i]
-            b
-          let donATable = block:
-            var b = newSeq[byte](donSec.aTableEnd - donSec.aTableStart)
-            for i in 0 ..< b.len: b[i] = donorData[donSec.aTableStart + i]
-            b
-          remap = some(remapDamageTable(
-            srcPool, int(srcSec.lodVerticesSize), int(srcSec.lodVerticesCount),
-            donPool, int(donSec.lodVerticesSize), int(donSec.lodVerticesCount),
-            donATable, recordSize = 4))
         let r = buildSectionConvertedToTargetLodOnTargetTemplate(
           donorData, donSec, sourceData, srcSec,
           donorLod = 1'i32, targetLod = 1'i32,
@@ -309,8 +290,7 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           upconvertIndices = true, padToTargetVpool = false,
           forcedDonorVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
-          remappedDamageTable = remap)
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
 
         # Per-section validation: reparse the rebuilt bytes against the
         # target version. Reject on raise, on byte-count mismatch (parser
@@ -318,8 +298,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
         # vertex/subsection-count drift.
         let chk = tryParseSection(r.bytes, donVer)
         var srcLodSubcount = 0
+        # Match the builder's new lod-selection rule (builders.nim, sel
+        # filter): LOD pool serves all subsections at lod >= 1.
         for ss in srcSec.subsections:
-          if ss.lod == 1'i32: inc srcLodSubcount
+          if ss.lod >= 1'i32: inc srcLodSubcount
         # cvFive sections end with 4..8 bytes of variable trailing pad
         # that the parser only resolves via next-section marker probe.
         # In single-section validation there is no next marker, so the
@@ -338,7 +320,6 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
         if ok:
           thisSecBytes = r.bytes
           thisSpliced = true
-          if remap.isSome: inc damageRemapped
         else:
           when TranscodeTrace:
             stderr.writeLine "    [splice] '" & donSec.name &
@@ -381,8 +362,7 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           upconvertIndices = true, padToTargetVpool = false,
           forcedDonorVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
-          remappedDamageTable = none(seq[byte]))
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
 
         let chk = tryParseSection(r.bytes, donVer)
         var srcLod0Subcount = 0
@@ -440,14 +420,14 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   result.spliced = spliced
   result.fallback = fallback
   result.gapsPreserved = gapsPreserved
-  result.damageRemapped = damageRemapped
   result.lod0Spliced = lod0Spliced
 
 # ---- entry point ----
 
 proc transcodeCarbin*(sourceData, donorData: openArray[byte],
                       targetProfile: GameProfile,
-                      mode: TranscodeMode = tmDonorVerbatim
+                      mode: TranscodeMode = tmDonorVerbatim,
+                      options: TranscodeOptions = defaultTranscodeOptions()
                      ): tuple[bytes: seq[byte]; report: TranscodeReport] =
   ## v2 splice (mode=tmHybridSplice): cvFour→cvFive stride conversion
   ## (32→28) is plumbed via `fm4PoolToFh1`, the cvFive m_NumBoneWeights
@@ -474,7 +454,7 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
     result = (copy, report)
   of tmHybridSplice:
     let r = spliceCarbin(sourceData, donorData, srcInfo, donInfo,
-                          srcVer, donVer)
+                          srcVer, donVer, options)
     let report = TranscodeReport(
       mode: tmHybridSplice,
       sourceVersion: srcVer, sourceTypeId: srcInfo.typeId,
@@ -483,7 +463,6 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
       donorSections: donInfo.sections.len,
       sectionsSpliced: r.spliced, sectionsFallback: r.fallback,
       gapsPreserved: r.gapsPreserved,
-      damageRemapped: r.damageRemapped,
       lod0Spliced: r.lod0Spliced,
       note: "v1: per-section splice with donor-fallback on failure")
     result = (r.bytes, report)

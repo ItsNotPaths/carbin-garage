@@ -11,6 +11,7 @@ import ../core/gltf
 import ../core/xds
 import ../core/texture_map
 import ../core/cardb
+import ../core/physicsdef
 import ../core/carbin/parser
 
 proc isCarbin(name: string): bool =
@@ -206,6 +207,22 @@ proc importToWorking*(zipPath: string, profile: GameProfile,
       echo "  - cardb skipped: ", e.msg
     except CatchableError as e:
       echo "  - cardb error: ", e.msg
+
+  # Parse physicsdefinition.bin → physicsdef.json sidecar. Same pattern
+  # as cardb.json: the raw bytes stay on disk for byte-identical export
+  # if the user never edits anything; the JSON is the editable surface
+  # the L pane reads from + writes back to. Export will eventually
+  # re-emit the bin from this JSON instead of passing the donor bytes
+  # through (decision noted in docs/FH1_PHYSICSDEFINITION_BIN.md).
+  let physBin = root / "physicsdefinition.bin"
+  if fileExists(physBin):
+    try:
+      let bytes = readFileBytes(physBin)
+      let pd = parsePhysicsDef(bytes)
+      writeFile(root / "physicsdef.json", pd.toJson.pretty)
+      echo "  + physicsdef.json"
+    except CatchableError as e:
+      echo "  - physicsdef.json skipped: ", e.msg
 
   # Decode .xds → .png for every texture in working/<slug>/textures/.
   # The .xds bytes stay on disk (round-trip + re-encode reference); the

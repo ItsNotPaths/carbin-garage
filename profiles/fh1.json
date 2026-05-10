@@ -20,7 +20,7 @@
   "canBundle": false,
   "userEditableStats": [
     {"field": "Year",                    "table": "Data_Car", "column": "Year",                    "kind": "int",   "min": 1900,    "max": 2100},
-    {"field": "Curb weight",             "table": "Data_Car", "column": "CurbWeight",              "kind": "float", "min": 0,       "max": 100,     "unit": "x100kg"},
+    {"field": "Phys. mass",              "source": "synthetic", "syntheticKind": "physMassKg",     "kind": "float", "min": 100,     "max": 100000,  "step": 1, "unit": "kg"},
     {"field": "Weight distribution",     "table": "Data_Car", "column": "WeightDistribution",      "kind": "float", "min": 0,       "max": 1,       "step": 0.01},
     {"field": "Number of gears",         "table": "Data_Car", "column": "NumGears",                "kind": "int",   "min": 1,       "max": 12},
     {"field": "Base rarity",             "table": "Data_Car", "column": "BaseRarity",              "kind": "int",   "min": 0,       "max": 1000},
@@ -107,6 +107,21 @@
     {"field": "Drivable",                "table": "Data_Car", "column": "IsDrivable",              "kind": "bool"},
     {"field": "Selectable",              "table": "Data_Car", "column": "IsSelectable",            "kind": "bool"},
     {"field": "Camera collidable",       "table": "Data_Car", "column": "IsCameraCollidable",      "kind": "bool"},
-    {"field": "Box camera collision",    "table": "Data_Car", "column": "UseBoxCameraCollision",   "kind": "bool"}
+    {"field": "Box camera collision",    "table": "Data_Car", "column": "UseBoxCameraCollision",   "kind": "bool"},
+
+    {"field": "Phys. inertia Ixx",       "source": "physicsdef", "path": "forwardInertia.0.0", "kind": "float", "min": 0, "max": 100000, "unit": "kg·m²"},
+    {"field": "Phys. inertia Iyy",       "source": "physicsdef", "path": "forwardInertia.1.1", "kind": "float", "min": 0, "max": 100000, "unit": "kg·m²"},
+    {"field": "Phys. inertia Izz",       "source": "physicsdef", "path": "forwardInertia.2.2", "kind": "float", "min": 0, "max": 100000, "unit": "kg·m²"},
+    {"field": "Phys. AABB half X",       "source": "physicsdef", "path": "aabbHalfExtents.0",  "kind": "float", "min": 0, "max": 50,     "unit": "m"},
+    {"field": "Phys. AABB half Y",       "source": "physicsdef", "path": "aabbHalfExtents.1",  "kind": "float", "min": 0, "max": 50,     "unit": "m"},
+    {"field": "Phys. AABB half Z",       "source": "physicsdef", "path": "aabbHalfExtents.2",  "kind": "float", "min": 0, "max": 50,     "unit": "m"},
+
+    {"field": "Phys. bounding radius",   "source": "physicsdef", "path": "boundingRadius",         "kind": "float", "min": 0,    "max": 50,     "unit": "m"},
+    {"field": "Phys→Gfx offset X",       "source": "physicsdef", "path": "physToGraphicsOffset.0", "kind": "float", "min": -10,  "max": 10,     "unit": "m"},
+    {"field": "Phys→Gfx offset Y",       "source": "physicsdef", "path": "physToGraphicsOffset.1", "kind": "float", "min": -5,   "max": 5,      "unit": "m"},
+    {"field": "Phys→Gfx offset Z",       "source": "physicsdef", "path": "physToGraphicsOffset.2", "kind": "float", "min": -10,  "max": 10,     "unit": "m"},
+    {"field": "Phys. AABB centre X",     "source": "physicsdef", "path": "aabbCentreOffset.0",     "kind": "float", "min": -10,  "max": 10,     "unit": "m"},
+    {"field": "Phys. AABB centre Y",     "source": "physicsdef", "path": "aabbCentreOffset.1",     "kind": "float", "min": -5,   "max": 5,      "unit": "m"},
+    {"field": "Phys. AABB centre Z",     "source": "physicsdef", "path": "aabbCentreOffset.2",     "kind": "float", "min": -10,  "max": 10,     "unit": "m"}
   ]
 }

@@ -41,8 +41,7 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     padToTargetVpool: bool = true,
     forcedDonorVertexBlob: Option[seq[byte]] = none(seq[byte]),
     forcedNewVertexSize: Option[uint32] = none(uint32),
-    upconvertSubsectionsCvFourToCvFive: bool = false,
-    remappedDamageTable: Option[seq[byte]] = none(seq[byte])
+    upconvertSubsectionsCvFourToCvFive: bool = false
    ): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
   ## `forcedDonorVertexBlob` / `forcedNewVertexSize` override the donor's
   ## raw vertex pool + vSize (cross-version splice path uses these to feed
@@ -83,9 +82,29 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
 
   let tgtBytes = sliceBytes(targetData, targetSec.start, targetSec.endPos)
 
+  # Subsection LOD selection. A single carbin section's vertex POOL is
+  # shared across multiple LODs of subsections (each subsection group
+  # has its own index list referencing the same pool). Body sections
+  # carry 5 LOD groups (LOD1-5) sharing the LOD pool; LOD0 sits in the
+  # separate lod0VerticesStart..End pool.
+  #
+  # Selection rule:
+  #   donorLod == 0  →  include only ss.lod == 0   (LOD0 pool consumers)
+  #   donorLod >= 1  →  include all ss.lod >= 1    (LOD pool consumers,
+  #                     i.e. all LODs 1..N for the multi-LOD body case)
+  #
+  # Fix 2026-05-10: previously we filtered `ss.lod == donorLod` strictly,
+  # which dropped LODs 2..N when splicing body sections. The rebuilt
+  # section then carried only LOD1 subsections; xenia fell back to donor
+  # bytes whenever a missing LOD was needed — making the body appear as
+  # the donor car at any non-close camera distance. Diagnosed against
+  # Camaro FM4→FH1 cross-car port (probe/nim_camaro_splice_diag.nim).
   var sel: seq[SubSectionInfo] = @[]
   for ss in donorSec.subsections:
-    if ss.lod == donorLod:
+    let lodMatches =
+      if donorLod == 0: ss.lod == 0
+      else: ss.lod >= 1
+    if lodMatches:
       if allowedSubparts.isNone or ss.name in allowedSubparts.get:
         sel.add(ss)
   if sel.len == 0:
@@ -208,10 +227,10 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
         let preStream = sliceBytes(tgtBytes,
           targetSec.tailStart - targetSec.start,
           targetSec.postPoolStart - targetSec.start)
-        let zeroStream = newSeq[byte](int(newVertexCount) * 4)
+        let stream = newSeq[byte](int(newVertexCount) * 4)
         let trailingPad = sliceBytes(tgtBytes,
           targetSec.postPoolEnd - targetSec.start, tgtBytes.len)
-        concatBytes(preStream, zeroStream, trailingPad)
+        concatBytes(preStream, stream, trailingPad)
       else:
         sliceBytes(tgtBytes,
           targetSec.tailStart - targetSec.start, tgtBytes.len)
@@ -285,21 +304,30 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
   let betweenSubsAndVc = sliceBytes(tgtBytes,
     targetSec.subsectionsEnd - targetSec.start,
     targetSec.vertexCountPos - targetSec.start)
-  # Slice D: when a remapped damage table is provided, splice it in over
-  # donor's tail a*b region and patch the `a` field to match srcVCount.
-  # `a` (donor's = donVCount) and the table size (donVCount * 4) must agree
-  # for FH1's tail walk to land on c/d / post-pool / trailing — so changing
-  # the table to srcVCount * 4 bytes requires patching `a` too. When
-  # remappedDamageTable is None (same-game splice or empty donor table),
-  # fall back to the verbatim suffix copy. The donor's aFieldPos /
-  # aTableStart / aTableEnd were captured by the parser tail walk; if
-  # they're zero (cvFour parser without the new fields, defensive), also
-  # fall back.
-  let canRemap = remappedDamageTable.isSome and
-                 targetSec.aFieldPos > 0 and
+  # Tail rewrite: keep donor's per-vertex 4B/v "a*b" damage table CONTENT
+  # but resize it to match the new (source) LOD vertex count. The runtime
+  # uses `a` as the count of damage records; if it stays at donor's count
+  # while the LOD pool is source-sized, source's trailing vertices read
+  # garbage past the table → consistent spike at the tail of the pool
+  # (showed up as the rear-bumper triangle on cross-car ports).
+  let aFieldOk = targetSec.aFieldPos > 0 and
                  targetSec.aTableEnd > targetSec.aTableStart
+  let donorATableLen = targetSec.aTableEnd - targetSec.aTableStart
+  let donorAField =
+    if aFieldOk:
+      uint32(targetData[targetSec.aFieldPos]) shl 24 or
+      uint32(targetData[targetSec.aFieldPos + 1]) shl 16 or
+      uint32(targetData[targetSec.aFieldPos + 2]) shl 8 or
+      uint32(targetData[targetSec.aFieldPos + 3])
+    else: 0'u32
+  let recordB =
+    if aFieldOk and donorAField > 0'u32:
+      donorATableLen div int(donorAField)
+    else: 0
+  let needsResize = aFieldOk and recordB > 0 and
+                    uint32(newLodCount) != donorAField
   let suffix =
-    if canRemap:
+    if needsResize:
       let beforeAField = sliceBytes(tgtBytes,
         targetSec.vertexCountPos - targetSec.start,
         targetSec.aFieldPos - targetSec.start)
@@ -308,13 +336,20 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
         targetSec.aTableStart - targetSec.start)
       let afterATable = sliceBytes(tgtBytes,
         targetSec.aTableEnd - targetSec.start, tgtBytes.len)
-      let remap = remappedDamageTable.get
-      let newACount = uint32(remap.len div 4)
+      let donorTableBytes = sliceBytes(tgtBytes,
+        targetSec.aTableStart - targetSec.start,
+        targetSec.aTableEnd - targetSec.start)
+      let newTableLen = int(newLodCount) * recordB
+      var newTable = newSeq[byte](newTableLen)
+      let copyLen = min(donorTableBytes.len, newTableLen)
+      for i in 0 ..< copyLen: newTable[i] = donorTableBytes[i]
+      # Trailing entries (if newTable is larger) stay zero-initialized —
+      # those vertices get a "neutral" damage record instead of garbage.
       concatBytes(
         beforeAField,
-        @(bePackU32(newACount)),
+        @(bePackU32(uint32(newLodCount))),
         bAndReserved,
-        remap,
+        newTable,
         afterATable)
     else:
       sliceBytes(tgtBytes,

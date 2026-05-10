@@ -236,7 +236,9 @@ proc dispatchExport(app: var AppState) =
       let plan = planPortToDlc(workingCar, mountsAll[mi], prof,
                                 contentRoot, donor, newName,
                                 "0000000000000000", 0, 0, 0)
-      executePortToDlc(plan, replace = true, skipMergeSlt = false)
+      let opts = TranscodeOptions(exportHitboxes: app.cfg.exportHitboxes)
+      executePortToDlc(plan, replace = true, skipMergeSlt = false,
+                        options = opts)
       done.add gid.toUpperAscii()
     except DlcPortError as e:
       setPaletteStatus(app,

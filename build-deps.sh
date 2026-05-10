@@ -46,9 +46,9 @@ fi
 
 mkdir -p "$OUT/lib" "$OUT/include"
 
-# Skip-if-built sentinels.
+# Skip-if-built sentinels. Mirror the actual build_one calls below — keep
+# in sync if SDL3_image (currently skipped) gets re-enabled.
 if [ -f "$PREFIX/lib/libSDL3.a" ] && \
-   [ -f "$PREFIX/lib/libSDL3_image.a" ] && \
    [ -f "$PREFIX/lib/libSDL3_ttf.a" ]; then
     echo "==> $TARGET deps already built at $OUT (use --clean to rebuild)"
     exit 0
@@ -95,6 +95,19 @@ build_one() {
     local extra=("$@")
 
     local bdir="$OUT/build-$name"
+    # Stale-cache guard: a CMakeCache.txt pointing at a different source
+    # path (e.g. docker's /src/... vs a host rebuild) blows up cmake with
+    # "source does not match the source used to generate cache." Wipe the
+    # build dir in that case — install artifacts under $PREFIX/lib are
+    # untouched, so this only re-does the configure/build, not the install.
+    if [ -f "$bdir/CMakeCache.txt" ]; then
+        local cached_src
+        cached_src=$(awk -F= '/^CMAKE_HOME_DIRECTORY:INTERNAL=/{print $2; exit}' "$bdir/CMakeCache.txt")
+        if [ -n "$cached_src" ] && [ "$cached_src" != "$src" ]; then
+            echo "==> stale cache in $bdir (was $cached_src, now $src) — wiping"
+            rm -rf "$bdir"
+        fi
+    fi
     echo "==> building $name ($TARGET)"
     cmake -S "$src" -B "$bdir" -G "Unix Makefiles" "${CMAKE_BASE_FLAGS[@]}" "${extra[@]}"
     cmake --build "$bdir" --parallel "$NCPU"

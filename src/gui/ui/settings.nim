@@ -9,8 +9,9 @@
 ##     when their install lives somewhere weird. A non-empty override
 ##     becomes a manual mounts.json entry; clearing it falls back to
 ##     auto-detect.
-##   - Experimental section: a damage-modelling-porting toggle (stub —
-##     no consumer in the export pipeline yet; persists to AppConfig).
+##   - Experimental section: single export-deformation toggle. Default
+##     ON ships the working damage path; OFF is the hook for the
+##     "ship a non-deforming car" experiments (consumer iterates).
 ##
 ## Save & Close commits both mounts.json edits and AppConfig (xenia path
 ## + experimental flags), then reloads sources.
@@ -244,14 +245,8 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
   let expHeaderY = gamesBottomY + ExpSectionGap
   ctx.pushLabel(cache, "Experimental",
                 panel.x + RowPadX, expHeaderY)
-  let toggleY = expHeaderY + ExpHeaderH
-  let toggleR = rect(panel.x + RowPadX, toggleY,
-                     panel.w - RowPadX * 2, ExpToggleH)
-  let on = s.sessionConfig.experimentalDamage
-  let toggleLabel =
-    (if on: "[x] " else: "[ ] ") &
-    "damage modelling porting (WIP — cross-game damage transfer)"
-  let toggleStyle =
+
+  proc toggleStyleFor(on: bool): ButtonStyle =
     if on:
       ButtonStyle(
         bg:       color(0.25, 0.18, 0.32),
@@ -264,9 +259,17 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
         bgHover:  color(0.18, 0.20, 0.25),
         bgActive: color(0.22, 0.25, 0.30),
         fg:       color(0.78, 0.82, 0.88))
-  if button(ctx, cache, rowId("exp_damage", ""),
-            toggleR, toggleLabel, toggleStyle):
-    s.sessionConfig.experimentalDamage = not s.sessionConfig.experimentalDamage
+
+  let toggle1Y = expHeaderY + ExpHeaderH
+  let toggle1R = rect(panel.x + RowPadX, toggle1Y,
+                      panel.w - RowPadX * 2, ExpToggleH)
+  let hitboxOn = s.sessionConfig.exportHitboxes
+  let hitboxLabel =
+    (if hitboxOn: "[x] " else: "[ ] ") &
+    "export hitboxes (off = car has no collision, drive off the map)"
+  if button(ctx, cache, rowId("exp_hitbox", ""),
+            toggle1R, hitboxLabel, toggleStyleFor(hitboxOn)):
+    s.sessionConfig.exportHitboxes = not s.sessionConfig.exportHitboxes
 
   # ---- Save & Close strip ----
   let stripH = max(CloseStripMin, ctx.winH * CloseStripFrac)

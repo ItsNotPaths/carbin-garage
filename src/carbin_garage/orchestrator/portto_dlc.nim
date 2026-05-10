@@ -93,12 +93,15 @@
 ## under arbitrary IDs. If Xenia rejects the synthesized id, fall back
 ## to enumerating an unused integer DLC id under `00000002/`.
 
-import std/[hashes, json, os, strutils, tables]
+import std/[hashes, json, os, sets, strutils, tables]
 import ../core/profile
 import ../core/mounts
 import ../core/zip21
 import ../core/texture_port
 import ../core/carbin/transcode
+import ../core/carbin/parser as carbin_parser
+import ../core/physicsdef
+export TranscodeOptions, defaultTranscodeOptions
 import ../core/dlc_merge
 
 type
@@ -439,7 +442,8 @@ proc buildRenames(donorEntries: seq[Entry], donorSlug, newSlug: string):
     if renamed != e.name:
       result[e.name] = renamed
 
-proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
+proc collectGeometryEdits(p: DlcPortPlan;
+                          options: TranscodeOptions): Table[string, seq[byte]] =
   ## Build the edits table for `rewriteZipMixedMethod`. Mirrors
   ## `portto.nim:collectEdits`. Both texture splice and geometry
   ## transcode produce edits keyed on the donor zip's entry names so
@@ -490,9 +494,45 @@ proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
       let donorEntry = donorEntryByBase[extractFilename(ga.zipEntryName).toLowerAscii()]
       var donorBytesEntry = extract(p.donorCarsZip, donorEntry)
       let sourceBytes = readFileBytes(ga.sourcePath)
+
+      # Cockpit + lod0 carbins: if donor has any section name source
+      # doesn't, splicing source vertices into a donor frame leaves
+      # donor-only sections (cagerace, headlightL, headlightR, etc.)
+      # embedded with donor-specific texture/material refs that don't
+      # exist in our DLC overlay. xenia loops indefinitely on the
+      # missing refs and crashes the heap allocator
+      # (BaseHeap::Alloc page count too big). Detect this mismatch
+      # and ship donor verbatim instead — visually wrong (donor's
+      # cockpit interior, donor's lod0 mesh) but the load completes.
+      # Main carbin always splices because the body section's LOD pool
+      # is what carries the visible body geometry; this gate is
+      # specifically for the supporting LOD0/cockpit slots.
+      let baseLc = extractFilename(ga.zipEntryName).toLowerAscii()
+      let isCockpitOrLod0 = baseLc.endsWith("_cockpit.carbin") or
+                            baseLc.endsWith("_lod0.carbin")
+      if isCockpitOrLod0:
+        var srcSecNames = initHashSet[string]()
+        var donorOnlySections: seq[string] = @[]
+        try:
+          let srcInfo = parseFm4Carbin(sourceBytes)
+          for s in srcInfo.sections: srcSecNames.incl s.name
+          let donInfo = parseFm4Carbin(donorBytesEntry)
+          for s in donInfo.sections:
+            if s.name notin srcSecNames: donorOnlySections.add s.name
+        except CatchableError:
+          # Parse failure on either side — safer to ship donor verbatim
+          # than to attempt a splice we can't reason about.
+          donorOnlySections = @["<parse-failed>"]
+        if donorOnlySections.len > 0:
+          stderr.writeLine "    [transcode] " & extractFilename(ga.zipEntryName) &
+            ": donor-only sections " & $donorOnlySections &
+            " — shipping donor verbatim (xenia heap-loop fix)"
+          # Don't add to result map → rewriter passes donor bytes through.
+          continue
+
       let r =
         try: transcodeCarbin(sourceBytes, donorBytesEntry, p.targetProfile,
-                             mode = tmHybridSplice)
+                             mode = tmHybridSplice, options = options)
         except CatchableError as e:
           raise newException(DlcPortError,
             "transcode failed for " & ga.zipEntryName & ": " & e.msg)
@@ -500,12 +540,38 @@ proc collectGeometryEdits(p: DlcPortPlan): Table[string, seq[byte]] =
         ": spliced=" & $r.report.sectionsSpliced &
         " fallback=" & $r.report.sectionsFallback &
         " gaps=" & $r.report.gapsPreserved &
-        " damageRemap=" & $r.report.damageRemapped &
         " lod0Spliced=" & $r.report.lod0Spliced
       if r.report.mode != tmDonorVerbatim:
         result[ga.zipEntryName] = r.bytes
     of dgaDonorOnly, dgaSourceExtra:
       discard
+
+  # No-hitboxes mode (`exportHitboxes = false`): replace donor's
+  # physicsdefinition.bin `shapesAndChildren` with a single
+  # `numCollisionShapes=0` u32. The runtime allocates zero collision
+  # volumes → car drives through walls + off the map. Confirmed
+  # 2026-05-10 on R8 cross-car port. This was originally tried as
+  # theory #1b for the no-deformation experiment; it suppresses
+  # damage but ALSO kills ground collision, so we keep it as its own
+  # toggle.
+  if not options.exportHitboxes:
+    let physicsKey = "physicsdefinition.bin"
+    if physicsKey in donorEntryByBase:
+      let donorEntry = donorEntryByBase[physicsKey]
+      let donorBytes = extract(p.donorCarsZip, donorEntry)
+      try:
+        var pd = parsePhysicsDef(donorBytes)
+        let origShapesLen = pd.shapesAndChildren.len
+        disableCollisionShapes(pd)
+        let patched = emitPhysicsDef(pd)
+        result[donorEntry.name] = patched
+        stderr.writeLine "    [physicsdef] " & physicsKey &
+          ": shapesAndChildren " & $origShapesLen & "B -> " &
+          $pd.shapesAndChildren.len & "B (hitboxes OFF)"
+      except CatchableError as e:
+        stderr.writeLine "    [physicsdef] " & physicsKey &
+          ": disable failed (" & e.msg & "), donor passthrough"
+
 
 proc zipmountEntry(name, mount: string): string =
   ## One <zip Name="..." Mount="..." AltRootPath="..." ShouldCache="0" />
@@ -637,10 +703,10 @@ proc emitWheelsZip(p: DlcPortPlan) =
   extractZipToDir(p.donorWheelsZip, p.wheelsZipPath, renames,
                    initTable[string, seq[byte]]())
 
-proc emitCarsZip(p: DlcPortPlan) =
+proc emitCarsZip(p: DlcPortPlan; options: TranscodeOptions) =
   ## Cars overlay: extract donor's archive (loose files), apply texture
   ## + transcoded-carbin edits over the loose tree.
-  let edits = collectGeometryEdits(p)
+  let edits = collectGeometryEdits(p, options)
   let donorEntries = listEntries(p.donorCarsZip)
   let renames = buildRenames(donorEntries, p.donorSlug, p.newSlug)
   extractZipToDir(p.donorCarsZip, p.carsZipPath, renames, edits)
@@ -702,11 +768,86 @@ proc emitZipmount(p: DlcPortPlan) =
   createDir(p.zipmountPath.parentDir)
   writeFile(p.zipmountPath, emitZipmountXml(p))
 
+proc findDonorAudioConfig(contentRoot, donorSlug, suffix: string;
+                          allowFallback: bool = true): tuple[path: string; isFallback: bool] =
+  ## Search xenia content tree for donor's CMT/ET XML config. These files
+  ## live in expansion DLC overlay dirs at:
+  ##   <contentRoot>/<profile>/<titleId>/00000002/<package>/Media/DLCZips/CarModelTuning_pri_<id>/<DonorSlug>_CMT.xml
+  ## (and a duplicate at .../carmodeltuning/). Stock-game cars keep their
+  ## CMT/ET inside the XEX so we won't find them on disk.
+  ##
+  ## When `allowFallback` is true and donor's exact file isn't on disk,
+  ## we fall back to ANY same-manufacturer CMT/ET (matched by 3-letter
+  ## prefix — e.g. donor "AST_DBR1_58" → any "AST_*"). This gives the
+  ## audio engine a well-formed profile to load instead of crashing on
+  ## a missing config. The audio is degraded (different car's engine
+  ## tone + exhaust positions) but the load completes. Without this
+  ## fallback, stock-car donors (which have CMT/ET baked into the XEX)
+  ## leave the DLC without any audio config and the audio thread
+  ## crashes (XAUDIO2 GetState read at near-null pointer).
+  if not dirExists(contentRoot):
+    return ("", false)
+  let exactTargets = [donorSlug & suffix, (donorSlug & suffix).toLowerAscii()]
+  let mfrPrefix =
+    if donorSlug.len >= 4 and donorSlug[3] == '_':
+      (donorSlug[0..3]).toLowerAscii()  # e.g. "ast_"
+    else: ""
+  var fallbackPath = ""
+  for path in walkDirRec(contentRoot, yieldFilter = {pcFile},
+                          relative = false, checkDir = false):
+    if "_PARKED_DLC" in path: continue
+    let parent = path.parentDir.lastPathPart.toLowerAscii()
+    if not (parent.startsWith("carmodeltuning") or
+            parent.startsWith("enginetuning")):
+      continue
+    let base = path.lastPathPart
+    if base in exactTargets: return (path, false)
+    if allowFallback and fallbackPath.len == 0 and mfrPrefix.len > 0:
+      let baseLc = base.toLowerAscii()
+      if baseLc.startsWith(mfrPrefix) and baseLc.endsWith(suffix.toLowerAscii()):
+        fallbackPath = path
+  return (fallbackPath, fallbackPath.len > 0)
+
+proc emitAudioCmtEt(p: DlcPortPlan) =
+  ## Splice donor's CMT/ET XMLs into our DLC overlay, renamed to the new
+  ## MediaName. Without this the audio engine crashes on autoshow load
+  ## for some cars (Aston DBR1 1958 in particular). With donor's XMLs in
+  ## place, the audio engine finds well-formed config and uses donor's
+  ## sound profile (engine tone, exhaust positions) for our ported car —
+  ## degraded but stable. Real source-audio porting is a separate piece
+  ## of work (would need to extract FM4 source audio, port to FH1's audio
+  ## container format, etc.).
+  ##
+  ## Destination paths match the engine's resolve patterns observed in
+  ## xenia.log — CMT and ET live in DIFFERENT subdirs even though the
+  ## donor pack stores them in sibling dirs:
+  ##   CMT  →  Media/Audio/Cars/CarModelTuning/<slug>_CMT.xml
+  ##   ET   →  Media/Audio/Cars/Engines/EngineTuning/<slug>_ET.xml
+  const Pieces = [
+    ("_CMT.xml", "Media/Audio/Cars/CarModelTuning"),
+    ("_ET.xml",  "Media/Audio/Cars/Engines/EngineTuning"),
+  ]
+  for (suffix, relDir) in Pieces:
+    let (donorCfg, isFallback) =
+      findDonorAudioConfig(p.contentRoot, p.donorSlug, suffix)
+    if donorCfg.len == 0:
+      stderr.writeLine "    [audio] no " & suffix & " donor candidate " &
+        "found under content/, skipping (audio thread may crash)"
+      continue
+    let dstDir = p.mergeOverlayDir / relDir
+    createDir(dstDir)
+    let dst = dstDir / (p.newSlug & suffix)
+    copyFile(donorCfg, dst)
+    let tag = if isFallback: " (FALLBACK — donor exact missing)" else: ""
+    stderr.writeLine "    [audio] " & donorCfg.lastPathPart &
+      " → " & p.newSlug & suffix & tag
+
 proc emitMergeSlt(p: DlcPortPlan) =
   discard emitMergeSltFile(p)
 
 proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
-                       skipMergeSlt: bool = false) =
+                       skipMergeSlt: bool = false,
+                       options: TranscodeOptions = defaultTranscodeOptions()) =
   ## Atomic install: full-delete then full-write. `synthDlcId(finalSlug)`
   ## is a deterministic hash of the lower-cased slug, so re-exporting the
   ## same car-name targets the *same* `packageDir` and the *same*
@@ -743,8 +884,9 @@ proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
   emitXeniaHeader(p)
   emitPuboffer(p)
   emitZipmount(p)
-  emitCarsZip(p)
+  emitCarsZip(p, options)
   emitWheelsZip(p)
+  emitAudioCmtEt(p)
   if not skipMergeSlt:
     emitMergeSlt(p)
 

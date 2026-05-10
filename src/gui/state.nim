@@ -5,7 +5,7 @@
 
 import std/[os, sets, algorithm, strutils, tables, json]
 import ../carbin_garage/core/[profile, mounts, cardb, gltf_runtime,
-                              workspace, appconfig]
+                              workspace, appconfig, physicsdef]
 import ../carbin_garage/orchestrator/scan
 import ui/text_input
 import ui/scroll
@@ -278,6 +278,12 @@ proc fmtJsonValue(v: JsonNode): string =
 
 proc loadLPane*(s: var AppState) =
   ## Rebuild s.lpane for the current activeSlug. Empty slug → empty state.
+  ## Each `EditableStat` is dispatched on `source`:
+  ##   - essCardb     → original = cardb.json's Data_Car row, overrides
+  ##                    layered on top via carslot.stats{}
+  ##   - essPhysicsdef→ original = current value at `path` inside
+  ##                    physicsdef.json (the bin's editable mirror).
+  ##                    There's no override layer; the JSON IS the data.
   s.lpane = LPaneState()
   if s.activeSlug.len == 0: return
   let slug = s.activeSlug
@@ -300,18 +306,62 @@ proc loadLPane*(s: var AppState) =
       dataRow = dataCarRow(parseJson(readFile(cardbPath)))
     except CatchableError: discard
 
+  # physicsdef.json — only loaded if the profile defines any
+  # essPhysicsdef stat. Missing file is fine (stats just show empty).
+  var physJson: JsonNode = nil
+  block:
+    var any = false
+    for stat in prof.userEditableStats:
+      if stat.source == essPhysicsdef: any = true; break
+    if any:
+      let p = s.workingRoot / slug / "physicsdef.json"
+      if fileExists(p):
+        try: physJson = parseJson(readFile(p))
+        except CatchableError: discard
+
   s.lpane.slug = slug
   s.lpane.profile = originGame
   for stat in prof.userEditableStats:
     var f = LPaneField(stat: stat)
-    if dataRow != nil and dataRow.hasKey(stat.column):
-      f.original = fmtJsonValue(dataRow[stat.column])
-    var initial = f.original
-    if manifest.stats != nil and manifest.stats.hasKey(stat.column):
-      f.overridden = true
-      initial = fmtJsonValue(manifest.stats[stat.column])
-    f.input.text = initial
-    f.input.cursor = initial.len
+    case stat.source
+    of essCardb:
+      if dataRow != nil and dataRow.hasKey(stat.column):
+        f.original = fmtJsonValue(dataRow[stat.column])
+      var initial = f.original
+      if manifest.stats != nil and manifest.stats.hasKey(stat.column):
+        f.overridden = true
+        initial = fmtJsonValue(manifest.stats[stat.column])
+      f.input.text = initial
+    of essPhysicsdef:
+      if physJson != nil:
+        let v = resolvePath(physJson, stat.path)
+        if v != nil: f.original = fmtJsonValue(v)
+      f.input.text = f.original
+    of essSynthetic:
+      # Synthetic fields have no direct on-disk representation; their
+      # value is computed from other sources at load and dispatched to
+      # a syntheticKind-specific handler at save.
+      case stat.syntheticKind
+      of "physMassKg":
+        # Effective mass in kg = (override CurbWeight × 100) if set,
+        # else (cardb default CurbWeight × 100). Stored at SQL scale
+        # (x100kg); we display in kg.
+        var x100kg = 0.0
+        var hasOverride = false
+        if manifest.stats != nil and manifest.stats.hasKey("CurbWeight"):
+          x100kg = manifest.stats["CurbWeight"].getFloat
+          hasOverride = true
+        elif dataRow != nil and dataRow.hasKey("CurbWeight"):
+          x100kg = dataRow["CurbWeight"].getFloat
+        if x100kg > 0:
+          f.original = formatFloat(x100kg * 100.0, ffDecimal, 1)
+        else:
+          f.original = ""
+        f.overridden = hasOverride
+      else:
+        f.original = ""
+      f.input.text = f.original
+    f.input.cursor = f.input.text.len
     s.lpane.fields.add f
 
 proc syncLPaneIfStale*(s: var AppState) =
@@ -326,46 +376,175 @@ proc resetLPaneField*(s: var AppState; idx: int) =
   s.lpane.fields[idx].overridden = false
   s.lpane.dirty = true
 
+proc parseStatValue(kind: EditableStatKind; v: string): JsonNode =
+  ## Convert a raw text input to the typed JsonNode the field expects.
+  ## Returns nil on parse failure — the caller should skip the field.
+  case kind
+  of eskInt:
+    try: result = %parseInt(v)
+    except ValueError: result = nil
+  of eskBool:
+    let lc = v.toLowerAscii
+    if lc in ["1","true","yes","on"]: result = %1
+    elif lc in ["0","false","no","off"]: result = %0
+    else: result = nil
+  else:
+    try: result = %parseFloat(v)
+    except ValueError: result = nil
+
 proc saveLPane*(s: var AppState) =
-  ## Persist current fields[] to carslot.json. Skips fields whose value
-  ## matches the original (those become "no override" instead of clutter).
+  ## Persist current fields[] to disk. Two destinations, dispatched
+  ## per-field on `stat.source`:
+  ##   - essCardb     → carslot.json's `stats{}` override layer.
+  ##                    Reset (input == original) deletes the override.
+  ##   - essPhysicsdef→ physicsdef.json's leaf at `stat.path`.
+  ##                    No override layer — the JSON is the data file.
   if s.lpane.slug.len == 0: return
   var manifest = readCarSlot(s.workingRoot, s.lpane.slug)
   if manifest.stats == nil or manifest.stats.kind != JObject:
     manifest.stats = newJObject()
-  var changes: seq[string] = @[]
+
+  let physPath = s.workingRoot / s.lpane.slug / "physicsdef.json"
+  var physJson: JsonNode = nil
+  var physDirty = false
+  if fileExists(physPath):
+    try: physJson = parseJson(readFile(physPath))
+    except CatchableError: discard
+
+  var cardbChanges: seq[string] = @[]
+  var physChanges:  seq[string] = @[]
+
   for i in 0 ..< s.lpane.fields.len:
     var f = addr s.lpane.fields[i]
     let v = f[].input.text.strip()
-    if v == f[].original or v.len == 0:
-      if manifest.stats.hasKey(f[].stat.column):
-        manifest.stats.delete(f[].stat.column)
-        f[].overridden = false
-        changes.add f[].stat.column & "=<reset>"
-      continue
-    var newNode: JsonNode
-    case f[].stat.kind
-    of eskInt:
-      try: newNode = %parseInt(v)
-      except ValueError: continue
-    of eskBool:
-      let lc = v.toLowerAscii
-      if lc in ["1","true","yes","on"]: newNode = %1
-      elif lc in ["0","false","no","off"]: newNode = %0
-      else: continue
-    else:
-      try: newNode = %parseFloat(v)
-      except ValueError: continue
-    let existed = manifest.stats.hasKey(f[].stat.column)
-    let prev = if existed: $manifest.stats[f[].stat.column] else: ""
-    if not existed or prev != $newNode:
-      changes.add f[].stat.column & "=" & v
-    manifest.stats[f[].stat.column] = newNode
-    f[].overridden = true
-  if changes.len > 0:
+
+    case f[].stat.source
+    of essCardb:
+      if v == f[].original or v.len == 0:
+        if manifest.stats.hasKey(f[].stat.column):
+          manifest.stats.delete(f[].stat.column)
+          f[].overridden = false
+          cardbChanges.add f[].stat.column & "=<reset>"
+        continue
+      let newNode = parseStatValue(f[].stat.kind, v)
+      if newNode == nil: continue
+      let existed = manifest.stats.hasKey(f[].stat.column)
+      let prev = if existed: $manifest.stats[f[].stat.column] else: ""
+      if not existed or prev != $newNode:
+        cardbChanges.add f[].stat.column & "=" & v
+      manifest.stats[f[].stat.column] = newNode
+      f[].overridden = true
+
+    of essPhysicsdef:
+      if physJson == nil: continue       # nothing to write into
+      let newNode = parseStatValue(f[].stat.kind, v)
+      if newNode == nil: continue
+      try:
+        # Only mutate + record a change if the leaf actually shifts.
+        # Stringified compare keeps "0.01" vs "0.01" equal even when
+        # JsonNode kinds differ (JFloat vs JInt for round numbers).
+        let cur = resolvePath(physJson, f[].stat.path)
+        let curStr = if cur != nil: $cur else: ""
+        if curStr != $newNode:
+          setPath(physJson, f[].stat.path, newNode)
+          physChanges.add f[].stat.path & "=" & v
+          physDirty = true
+        f[].overridden = (v != f[].original)
+      except ValueError:
+        discard  # bad path in profile; don't lose the rest of save
+
+    of essSynthetic:
+      case f[].stat.syntheticKind
+      of "physMassKg":
+        # Absolute-target semantics: input is the desired mass in kg.
+        # Save scales forwardInertia × (new/old), inverseInertia ×
+        # (old/new), and writes the cardb CurbWeight override to
+        # new/100 (SQL stores x100kg). If new matches the cardb
+        # default exactly, the override is deleted instead.
+        if v.len == 0 or v == f[].original: continue
+        var vNewKg = 0.0
+        try: vNewKg = parseFloat(v)
+        except ValueError: continue
+        if vNewKg <= 0.0: continue
+        var vOldKg = 0.0
+        try: vOldKg = parseFloat(f[].original)
+        except ValueError: continue
+        if vOldKg <= 0.0: continue
+        if abs(vNewKg - vOldKg) < 0.5: continue       # within 0.5 kg = no-op
+
+        let scale = vNewKg / vOldKg
+
+        # Scale tensors. FM4 cars without a bin still get the SQL
+        # update (no physJson means no tensor work to do).
+        if physJson != nil:
+          try:
+            var fwd = mat3FromJson(physJson["forwardInertia"])
+            var inv = mat3FromJson(physJson["inverseInertia"])
+            let sf = scale.float32
+            for k in 0..8:
+              fwd[k] = fwd[k] * sf
+              inv[k] = inv[k] / sf
+            physJson["forwardInertia"] = mat3ToJson(fwd)
+            physJson["inverseInertia"] = mat3ToJson(inv)
+            physChanges.add "physMassKg " &
+              formatFloat(vOldKg, ffDecimal, 1) & "->" &
+              formatFloat(vNewKg, ffDecimal, 1) &
+              " (x" & formatFloat(scale, ffDecimal, 4) & ")"
+            physDirty = true
+          except CatchableError: discard
+
+        # Write the cardb CurbWeight override (x100kg). If it matches
+        # the cardb default within float tolerance, delete instead.
+        let cwNew = vNewKg / 100.0
+        var cwDefault = 0.0
+        let cardbPath = s.workingRoot / s.lpane.slug / "cardb.json"
+        if fileExists(cardbPath):
+          try:
+            let dr = dataCarRow(parseJson(readFile(cardbPath)))
+            if dr != nil and dr.hasKey("CurbWeight"):
+              cwDefault = dr["CurbWeight"].getFloat
+          except CatchableError: discard
+        if cwDefault > 0 and abs(cwNew - cwDefault) < 1e-4:
+          if manifest.stats.hasKey("CurbWeight"):
+            manifest.stats.delete("CurbWeight")
+            cardbChanges.add "CurbWeight=<reset>"
+          f[].overridden = false
+        else:
+          manifest.stats["CurbWeight"] = %cwNew
+          cardbChanges.add "CurbWeight=" & formatFloat(cwNew, ffDecimal, 5)
+          f[].overridden = true
+
+        # Update f.original so subsequent saves in the same session
+        # compute scale from the just-saved baseline.
+        f[].original = v
+      else: discard
+
+  if cardbChanges.len > 0:
     appendEdit(manifest, kind = "stats_edit",
-               note = changes.join(", "))
+               note = cardbChanges.join(", "))
   writeCarSlot(s.workingRoot, s.lpane.slug, manifest)
+
+  if physDirty:
+    writeFile(physPath, physJson.pretty)
+    # Re-emit the bin from the JSON so working/<slug>/physicsdefinition.bin
+    # stays the canonical export-time payload. If the JSON has been
+    # hand-mutated to something the emitter rejects, leave the bin
+    # alone and surface the error in the edit log — better than
+    # producing a corrupt bin silently.
+    try:
+      let pd = fromJson(physJson)
+      let bytes = emitPhysicsDef(pd)
+      var binOut = newString(bytes.len)
+      for j in 0 ..< bytes.len:
+        binOut[j] = char(bytes[j])
+      writeFile(s.workingRoot / s.lpane.slug / "physicsdefinition.bin", binOut)
+      appendEdit(manifest, kind = "physicsdef_edit",
+                 note = physChanges.join(", "))
+    except CatchableError as e:
+      appendEdit(manifest, kind = "physicsdef_emit_failed",
+                 note = e.msg)
+    writeCarSlot(s.workingRoot, s.lpane.slug, manifest)
+
   s.lpane.dirty = false
 
 proc closePartsTab*(s: var AppState; tabIdx: int) =

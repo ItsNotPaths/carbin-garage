@@ -24,16 +24,42 @@ type
     eskBool  = "bool"
     eskEnum  = "enum"
 
+  EditableStatSource* = enum
+    ## Where this stat's authoritative value lives.
+    ## - essCardb: gamedb.slt → cardb.json sidecar (UI-text fields like
+    ##   display CurbWeight, Year, BaseCost)
+    ## - essPhysicsdef: physicsdefinition.bin → physicsdef.json sidecar
+    ##   (the values that actually drive simulation — inertia, AABB,
+    ##   eventually mass)
+    ## - essSynthetic: derived/computed value with no direct on-disk
+    ##   storage. Each save invokes a `syntheticKind`-specific handler
+    ##   (e.g. `physMassScale` multiplies the inertia tensors and
+    ##   resets the input to its identity value).
+    ## When the same conceptual stat exists in both sources, only the
+    ## physicsdef entry is listed in `userEditableStats`; the cardb
+    ## entry is dropped. The bin is the source of truth.
+    essCardb = "cardb"
+    essPhysicsdef = "physicsdef"
+    essSynthetic = "synthetic"
+
   EditableStat* = object
     field*: string                 ## display name; matches column when synthetic absent
     table*: string                 ## gamedb table (typically "Data_Car")
-    column*: string                ## gamedb column
+    column*: string                ## gamedb column (essCardb) — also used as
+                                   ## the persistence key in carslot.stats{}
     kind*: EditableStatKind
     minVal*: float                 ## lower bound for clamp; 0 if unused
     maxVal*: float                 ## upper bound for clamp; 0 if unused
     step*: float                   ## numeric step on Enter; 0 = free
     unit*: string                  ## display unit suffix ("kg", "rpm", "")
     enumValues*: seq[string]       ## populated when kind == eskEnum
+    source*: EditableStatSource    ## defaults to essCardb (existing behavior)
+    path*: string                  ## dotted JSON path into physicsdef.json
+                                   ## (essPhysicsdef only; e.g.
+                                   ## "forwardInertia.0.0", "aabbHalfExtents.0").
+                                   ## Indexed array steps allowed.
+    syntheticKind*: string         ## handler key (essSynthetic only).
+                                   ## Recognised keys: "physMassScale".
 
   GameProfile* = object
     id*: string
@@ -97,10 +123,32 @@ proc loadProfile*(path: string): GameProfile =
         minVal: x{"min"}.getFloat(0.0),
         maxVal: x{"max"}.getFloat(0.0),
         step:   x{"step"}.getFloat(0.0),
-        unit:   x{"unit"}.getStr(""))
+        unit:   x{"unit"}.getStr(""),
+        source:        parseEnum[EditableStatSource](x{"source"}.getStr("cardb")),
+        path:          x{"path"}.getStr(""),
+        syntheticKind: x{"syntheticKind"}.getStr(""))
       if x.hasKey("enumValues"):
         for v in x["enumValues"]:
           es.enumValues.add v.getStr
+      # Sanity: physicsdef stats need a path; cardb stats need a column;
+      # synthetic stats need a syntheticKind. Bad config = silent display
+      # bug, so fail loudly at load time.
+      case es.source
+      of essPhysicsdef:
+        if es.path.len == 0:
+          raise newException(ValueError,
+            "profile " & result.id & ": physicsdef stat \"" & es.field &
+            "\" missing required `path`")
+      of essCardb:
+        if es.column.len == 0:
+          raise newException(ValueError,
+            "profile " & result.id & ": cardb stat \"" & es.field &
+            "\" missing required `column`")
+      of essSynthetic:
+        if es.syntheticKind.len == 0:
+          raise newException(ValueError,
+            "profile " & result.id & ": synthetic stat \"" & es.field &
+            "\" missing required `syntheticKind`")
       result.userEditableStats.add es
 
 proc profilesDir*(): string =

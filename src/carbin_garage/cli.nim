@@ -5,6 +5,7 @@ import ./core/profile
 import ./core/xds
 import ./core/cardb
 import ./core/mounts
+import ./core/physicsdef
 import ./orchestrator/importwc
 import ./orchestrator/scan
 import ./orchestrator/mount as mountop
@@ -122,6 +123,7 @@ usage:
                                             [--name <new-slug>] [--profile-id <hex>]
                                             [--replace] [--skip-merge-slt]
                                             [--dry-run] [--uninstall]
+                                            [--no-hitboxes]
                                             New-car port via DLC packaging.
                                             Emits a complete xenia DLC tree
                                             at <content>/<profile-id>/<title>/00000002/<package>/
@@ -361,6 +363,43 @@ proc cmdDumpCardb(args: seq[string]) =
   else:
     echo body
 
+proc readBytes(p: string): seq[byte] =
+  let s = readFile(p); result = newSeq[byte](s.len)
+  for i, c in s: result[i] = byte(c)
+
+proc cmdDumpPhysicsdef(args: seq[string]) =
+  ## Parse a `physicsdefinition.bin` and print the labelled fields.
+  ## With `--json <out>` writes the editable intermediate format
+  ## instead. With `--from-json <in> --out <bin>` round-trips JSON
+  ## back into a bin (mutated fields are honoured; opaque blobs ride
+  ## along verbatim).
+  let fromJsonPath = parseFlag(args, "--from-json")
+  if fromJsonPath.len > 0:
+    let outPath = parseFlag(args, "--out")
+    if outPath.len == 0:
+      echo "dump-physicsdef --from-json requires --out <bin>"; quit 1
+    let pd = fromJson(parseFile(fromJsonPath))
+    let bytes = emitPhysicsDef(pd)
+    var s = newString(bytes.len)
+    for i, b in bytes: s[i] = char(b)
+    writeFile(outPath, s)
+    echo "wrote -> ", outPath, " (", bytes.len, " B)"
+    return
+
+  if args.len < 1:
+    echo "dump-physicsdef: missing <bin> [--json <out>] | --from-json <in> --out <bin>"
+    quit 1
+  let binPath = args[0]
+  let data = readBytes(binPath)
+  let pd = parsePhysicsDef(data)
+  let jsonOut = parseFlag(args, "--json")
+  if jsonOut.len > 0:
+    writeFile(jsonOut, pd.toJson.pretty)
+    echo "wrote -> ", jsonOut
+  else:
+    echo "=== ", binPath, " ==="
+    echo summarize(pd)
+
 proc humanSize(bytes: BiggestInt): string =
   const units = ["B", "KiB", "MiB", "GiB"]
   var v = bytes.float
@@ -536,6 +575,7 @@ proc cmdPortToDlc(args: seq[string]) =
   let skipMerge = "--skip-merge-slt" in args
   let dryRun = "--dry-run" in args
   let uninstall = "--uninstall" in args
+  let noHitboxes = "--no-hitboxes" in args
   let dlcIdOverride = block:
     let v = parseFlag(args, "--dlc-id")
     if v.len > 0:
@@ -590,7 +630,9 @@ proc cmdPortToDlc(args: seq[string]) =
     echo "  (dry-run — no files touched)"
     return
   try:
-    executePortToDlc(plan, replace = replace, skipMergeSlt = skipMerge)
+    let opts = TranscodeOptions(exportHitboxes: not noHitboxes)
+    executePortToDlc(plan, replace = replace, skipMergeSlt = skipMerge,
+                      options = opts)
   except DlcPortError as e:
     echo "port-to-dlc: ", e.msg; quit 1
   echo "  wrote package at ", plan.packageDir
@@ -654,6 +696,8 @@ proc mainWithArgs*(args: openArray[string]) =
     cmdReencodeTextures(rest)
   of "dump-cardb":
     cmdDumpCardb(rest)
+  of "dump-physicsdef":
+    cmdDumpPhysicsdef(rest)
   of "list":
     cmdList(rest)
   of "mount":
