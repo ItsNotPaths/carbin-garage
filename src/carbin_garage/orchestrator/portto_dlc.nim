@@ -508,27 +508,27 @@ proc collectGeometryEdits(p: DlcPortPlan;
       # is what carries the visible body geometry; this gate is
       # specifically for the supporting LOD0/cockpit slots.
       let baseLc = extractFilename(ga.zipEntryName).toLowerAscii()
-      let isCockpitOrLod0 = baseLc.endsWith("_cockpit.carbin") or
-                            baseLc.endsWith("_lod0.carbin")
-      if isCockpitOrLod0:
-        var srcSecNames = initHashSet[string]()
-        var donorOnlySections: seq[string] = @[]
-        try:
-          let srcInfo = parseFm4Carbin(sourceBytes)
-          for s in srcInfo.sections: srcSecNames.incl s.name
-          let donInfo = parseFm4Carbin(donorBytesEntry)
-          for s in donInfo.sections:
-            if s.name notin srcSecNames: donorOnlySections.add s.name
-        except CatchableError:
-          # Parse failure on either side — safer to ship donor verbatim
-          # than to attempt a splice we can't reason about.
-          donorOnlySections = @["<parse-failed>"]
-        if donorOnlySections.len > 0:
-          stderr.writeLine "    [transcode] " & extractFilename(ga.zipEntryName) &
-            ": donor-only sections " & $donorOnlySections &
-            " — shipping donor verbatim (xenia heap-loop fix)"
-          # Don't add to result map → rewriter passes donor bytes through.
-          continue
+      let isLod0 = baseLc.endsWith("_lod0.carbin")
+      let isCockpit = baseLc.endsWith("_cockpit.carbin")
+      let isCockpitOrLod0 = isLod0 or isCockpit
+      # LOD0/cockpit splice has been broken since 2026-05-05 for ALL
+      # cross-game cases:
+      #   - cross-car: drops xenia into BaseHeap heap-loop
+      #     or MSVC C++ exception (E06D7363) on autoshow load
+      #   - same-car cross-game: hangs xenia indefinitely on autoshow
+      #     (no exception logged, asset re-resolve loop)
+      # The previously-noted "alfa autoshow shows source car" claim was a
+      # false signal — the donor was alfa, so donor-verbatim ALSO showed
+      # the alfa, masking the broken splice. Until the splice is rebuilt
+      # to produce FH1-loadable bytes for cross-game pairs, ship donor
+      # verbatim by default. Splice attempts gated behind
+      # `--lod0-splice-cross-car` for development.
+      let crossCarTryLod0 = options.lod0SpliceCrossCar and isLod0
+      if isCockpitOrLod0 and not crossCarTryLod0:
+        stderr.writeLine "    [transcode] " & extractFilename(ga.zipEntryName) &
+          " — shipping donor verbatim (lod0/cockpit splice currently broken cross-game)"
+        # Don't add to result map → rewriter passes donor bytes through.
+        continue
 
       let r =
         try: transcodeCarbin(sourceBytes, donorBytesEntry, p.targetProfile,

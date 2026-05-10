@@ -5,6 +5,7 @@ import ./core/profile
 import ./core/xds
 import ./core/cardb
 import ./core/mounts
+import ./core/appconfig
 import ./core/physicsdef
 import ./orchestrator/importwc
 import ./orchestrator/scan
@@ -124,6 +125,7 @@ usage:
                                             [--replace] [--skip-merge-slt]
                                             [--dry-run] [--uninstall]
                                             [--no-hitboxes]
+                                            [--lod0-splice-cross-car]
                                             New-car port via DLC packaging.
                                             Emits a complete xenia DLC tree
                                             at <content>/<profile-id>/<title>/00000002/<package>/
@@ -566,7 +568,7 @@ proc cmdPortToDlc(args: seq[string]) =
   let workingCar = args[0]
   let gameId = args[1]
   let donor = parseFlag(args, "--donor")
-  let contentRoot = parseFlag(args, "--content")
+  var contentRoot = parseFlag(args, "--content")
   let newName = parseFlag(args, "--name")
   let profileId = block:
     let v = parseFlag(args, "--profile-id")
@@ -576,6 +578,7 @@ proc cmdPortToDlc(args: seq[string]) =
   let dryRun = "--dry-run" in args
   let uninstall = "--uninstall" in args
   let noHitboxes = "--no-hitboxes" in args
+  let lod0SpliceCrossCar = "--lod0-splice-cross-car" in args
   let dlcIdOverride = block:
     let v = parseFlag(args, "--dlc-id")
     if v.len > 0:
@@ -600,14 +603,18 @@ proc cmdPortToDlc(args: seq[string]) =
   if donor.len == 0:
     echo "port-to-dlc: --donor <donor-slug> is required"; quit 1
   if contentRoot.len == 0:
-    echo "port-to-dlc: --content <xenia-content-dir> is required"
-    echo "  (the directory that holds <profile-id>/<title-id>/...)"
-    quit 1
-  let all = loadMounts()
+    let cfg = loadAppConfig()
+    if cfg.xeniaContent.len > 0:
+      contentRoot = cfg.xeniaContent
+    else:
+      echo "port-to-dlc: --content <xenia-content-dir> is required"
+      echo "  (the directory that holds <profile-id>/<title-id>/...)"
+      quit 1
+  let all = effectiveMounts(contentRoot)
   let i = findMount(all, gameId)
   if i < 0:
-    echo "port-to-dlc: no mount registered for game-id '", gameId, "'"
-    echo "  (run: carbin-garage mount <game-folder>)"
+    echo "port-to-dlc: no mount registered or auto-detected for game-id '", gameId, "'"
+    echo "  (run: carbin-garage mount <game-folder>, or set xeniaContent in config.json)"
     quit 1
   let prof = loadProfileById(gameId)
   let plan =
@@ -630,7 +637,8 @@ proc cmdPortToDlc(args: seq[string]) =
     echo "  (dry-run — no files touched)"
     return
   try:
-    let opts = TranscodeOptions(exportHitboxes: not noHitboxes)
+    let opts = TranscodeOptions(exportHitboxes: not noHitboxes,
+                                lod0SpliceCrossCar: lod0SpliceCrossCar)
     executePortToDlc(plan, replace = replace, skipMergeSlt = skipMerge,
                       options = opts)
   except DlcPortError as e:

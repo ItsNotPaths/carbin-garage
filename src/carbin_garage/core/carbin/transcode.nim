@@ -84,6 +84,16 @@ type
       ## proves shapesAndChildren drives BOTH ground collision and
       ## damage (which is why we can't reuse it as the
       ## no-deformation hook on its own).
+    lod0SpliceCrossCar*: bool
+      ## When `true`, attempt the LOD0/cockpit splice even for cross-car
+      ## ports where donor has sections source doesn't (cagerace,
+      ## headlightL, etc.). Default `false` ships donor verbatim in that
+      ## case to dodge the historical xenia BaseHeap::Alloc loop. The
+      ## bypass was added 2026-05-10 alongside damage porting and may
+      ## now be stale — main-carbin splice handles donor-only sections
+      ## fine cross-car, so the LOD0 carbin probably does too. Flag
+      ## exists so we can test that without regressing today's working
+      ## damage-port pipeline.
 
   TranscodeReport* = object
     mode*: TranscodeMode
@@ -105,7 +115,7 @@ type
     note*: string
 
 proc defaultTranscodeOptions*(): TranscodeOptions =
-  TranscodeOptions(exportHitboxes: true)
+  TranscodeOptions(exportHitboxes: true, lod0SpliceCrossCar: false)
 
 proc expectedDonorVersion(targetProfile: GameProfile): CarbinVersion =
   ## Validate by family, not exact TypeId — FM4 ships TypeIds 1/2/3 in
@@ -283,6 +293,14 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
             b
           forcedBlob = some(fm4PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
+        # Carry source's 9 part-bound floats (offset.xyz + targetMin.xyz +
+        # targetMax.xyz) into the rebuilt section. Without this, donor's
+        # bounds drive the spos→world decode (`CalculateBoundTargetValue`)
+        # and source vertices render at donor-car scale.
+        let srcXform = block:
+          var b = newSeq[byte](36)
+          for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
+          some(b)
         let r = buildSectionConvertedToTargetLodOnTargetTemplate(
           donorData, donSec, sourceData, srcSec,
           donorLod = 1'i32, targetLod = 1'i32,
@@ -290,7 +308,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           upconvertIndices = true, padToTargetVpool = false,
           forcedDonorVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
+          srcTransform9 = srcXform)
 
         # Per-section validation: reparse the rebuilt bytes against the
         # target version. Reject on raise, on byte-count mismatch (parser
@@ -355,6 +374,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
             b
           forcedBlob = some(fm4Lod0PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
+        let srcXform = block:
+          var b = newSeq[byte](36)
+          for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
+          some(b)
         let r = buildSectionConvertedToTargetLodOnTargetTemplate(
           donorData, donSec, sourceData, srcSec,
           donorLod = 0'i32, targetLod = 0'i32,
@@ -362,7 +385,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
           upconvertIndices = true, padToTargetVpool = false,
           forcedDonorVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride)
+          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
+          srcTransform9 = srcXform)
 
         let chk = tryParseSection(r.bytes, donVer)
         var srcLod0Subcount = 0

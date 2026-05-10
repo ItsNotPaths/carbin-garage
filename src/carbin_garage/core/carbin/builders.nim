@@ -41,7 +41,8 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     padToTargetVpool: bool = true,
     forcedDonorVertexBlob: Option[seq[byte]] = none(seq[byte]),
     forcedNewVertexSize: Option[uint32] = none(uint32),
-    upconvertSubsectionsCvFourToCvFive: bool = false
+    upconvertSubsectionsCvFourToCvFive: bool = false,
+    srcTransform9: Option[seq[byte]] = none(seq[byte])
    ): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
   ## `forcedDonorVertexBlob` / `forcedNewVertexSize` override the donor's
   ## raw vertex pool + vSize (cross-version splice path uses these to feed
@@ -63,6 +64,18 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
   ## subsection bytes spliced into an FH1 section template parse cleanly
   ## as cvFive. All subsequent index conversion / restart-marker fixing
   ## runs against the upconverted bytes + shifted SubSectionInfo.
+  ##
+  ## `srcTransform9` (when Some, must be 36 bytes): replaces the 9 floats
+  ## at `targetSec.transformPos` (offset.xyz + targetMin.xyz + targetMax.xyz,
+  ## BE float32). The carbin per-vertex `spos` is `_XMSHORTN4` decoded as
+  ## `pos = CalculateBoundTargetValue(spos, lod0Min, lod0Max, targetMin,
+  ## targetMax)`. Splicing source's vertex pool onto donor's section
+  ## template without overwriting these bounds renders the source mesh
+  ## stretched/shrunk to the donor car's bbox (e.g. FM4 beetle body
+  ## ports onto FH1 raptor scaffold and renders raptor-sized). On-disk
+  ## layout for the 9 floats is identical in FM4 and FH1 — copy bytes
+  ## verbatim. Same offset+min+max also feeds the part's collision /
+  ## damage AABB so the runtime bbox stays consistent with the geometry.
 
   var donorVCount: int
   var donorVSize: int
@@ -206,7 +219,17 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
       newVertexSize = uint32(donorVSize)
       poolBlob = donorVerticesBlob
 
-    let prefix = sliceBytes(tgtBytes, 0, targetSec.subpartCountPos - targetSec.start)
+    var prefix = sliceBytes(tgtBytes, 0, targetSec.subpartCountPos - targetSec.start)
+    if srcTransform9.isSome:
+      let blob = srcTransform9.get
+      if blob.len != 36:
+        raise newException(ValueError,
+          "srcTransform9 must be 36 bytes (got " & $blob.len & ")")
+      let dst = targetSec.transformPos - targetSec.start
+      if dst < 0 or dst + 36 > prefix.len:
+        raise newException(ValueError,
+          "transform region falls outside section prefix")
+      for i in 0 ..< 36: prefix[dst + i] = blob[i]
     let betweenSubsAndVc = sliceBytes(tgtBytes,
       targetSec.subsectionsEnd - targetSec.start,
       targetSec.vertexCountPos - targetSec.start)
@@ -218,16 +241,29 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
       targetSec.lod0VerticesStart - targetSec.start)
     # Tail rewrite: when the section carries a per-vertex post-pool 4B
     # stream (cvFive lod0/cockpit body sections — postPoolEnd >
-    # postPoolStart) AND we changed lod0VCount (forced path), replace the
-    # donor stream with `newVertexCount * 4` zero bytes so the tail length
-    # matches. Otherwise emit the donor tail verbatim.
+    # postPoolStart) AND we changed lod0VCount (forced path), produce a
+    # `newVertexCount * 4` byte stream. Source carries the same data in
+    # its `cTable` (FM4 stores c=lod0Vc d=4 → lod0Vc*4 byte table; FH1
+    # stores c=1 d=4 + separate post-pool stream of lod0Vc*4 bytes —
+    # same per-vertex 4B data, different layout). When source's cTable
+    # byte count matches newVertexCount*4, copy it verbatim. Empirically
+    # confirmed 2026-05-10 PM via probe/nim_alfa_lod0_field_diff.nim:
+    # alfa 8C FM4 cTable byte counts equal alfa 8C FH1 post-pool byte
+    # counts for every body-bearing LOD0 section. Falls back to zero-fill
+    # when the byte count doesn't match (rare; would lose shading).
     let hasPostPool = targetSec.postPoolEnd > targetSec.postPoolStart
     let tail =
       if hasPostPool and forcedDonorVertexBlob.isSome:
         let preStream = sliceBytes(tgtBytes,
           targetSec.tailStart - targetSec.start,
           targetSec.postPoolStart - targetSec.start)
-        let stream = newSeq[byte](int(newVertexCount) * 4)
+        let neededStreamLen = int(newVertexCount) * 4
+        let srcCTableLen = donorSec.cTableEnd - donorSec.cTableStart
+        let stream =
+          if srcCTableLen == neededStreamLen:
+            sliceBytes(donorData, donorSec.cTableStart, donorSec.cTableEnd)
+          else:
+            newSeq[byte](neededStreamLen)
         let trailingPad = sliceBytes(tgtBytes,
           targetSec.postPoolEnd - targetSec.start, tgtBytes.len)
         concatBytes(preStream, stream, trailingPad)
@@ -291,7 +327,17 @@ proc buildSectionConvertedToTargetLodOnTargetTemplate*(
     newLodSize = uint32(donorVSize)
     lodBlob = donorVerticesBlob
 
-  let prefixBeforeLod = sliceBytes(tgtBytes, 0, targetSec.lodVertexCountPos - targetSec.start)
+  var prefixBeforeLod = sliceBytes(tgtBytes, 0, targetSec.lodVertexCountPos - targetSec.start)
+  if srcTransform9.isSome:
+    let blob = srcTransform9.get
+    if blob.len != 36:
+      raise newException(ValueError,
+        "srcTransform9 must be 36 bytes (got " & $blob.len & ")")
+    let dst = targetSec.transformPos - targetSec.start
+    if dst < 0 or dst + 36 > prefixBeforeLod.len:
+      raise newException(ValueError,
+        "transform region falls outside section prefixBeforeLod")
+    for i in 0 ..< 36: prefixBeforeLod[dst + i] = blob[i]
   # cvFive sections carry m_NumBoneWeights [+ perSectionId] between the
   # vSize field and the actual LOD pool start. Splat those donor bytes
   # back in unchanged. Empty for cvFour (lodVertexSizePos+4 == lodVerticesStart).
