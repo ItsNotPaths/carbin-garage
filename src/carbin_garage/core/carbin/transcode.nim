@@ -203,6 +203,32 @@ proc fm4Lod0PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
   ## extra4-bytes-1..3 zero (paint fix) applies under SliceDExtra4Zero.
   fm4PoolToFh1(fm4Pool)
 
+proc fh1PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
+  ## Inverse of `fm4PoolToFh1`: extend each 28-byte FH1 vertex to FM4's 32
+  ## bytes by appending 4 zero bytes. FH1 `pos[8] uv0[4] uv1[4] quat[8]
+  ## extra4[4]` maps verbatim to FM4 bytes [0..28); the FH1 extra4 lands in
+  ## FM4's extra8[0..4) and extra8[4..8) become zeros (FH1 doesn't carry the
+  ## last 4 bytes of FM4's re-baked tangent encoding). The dominant tangent
+  ## space lives in the quaternion at [16..24), so the zero tail costs only
+  ## minor shading fidelity — symmetric with what fm4PoolToFh1 already drops.
+  if fh1Pool.len mod Fh1VertexStride != 0:
+    raise newException(TranscodeError,
+      "fh1PoolToFm4: input length " & $fh1Pool.len &
+      " not a multiple of 28 bytes")
+  let n = fh1Pool.len div Fh1VertexStride
+  result = newSeq[byte](n * Fm4VertexStride)
+  for i in 0 ..< n:
+    let src = i * Fh1VertexStride
+    let dst = i * Fm4VertexStride
+    for j in 0 ..< Fh1VertexStride:
+      result[dst + j] = fh1Pool[src + j]
+    # bytes [dst+28 .. dst+32) stay zero (newSeq default)
+
+proc fh1Lod0PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
+  ## LOD0 pool stride conversion, fh1→fm4 (28→32). Mirror of
+  ## `fm4Lod0PoolToFh1` for the reverse direction.
+  fh1PoolToFm4(fh1Pool)
+
 # ---- the splice driver ----
 
 proc spliceCarbin(sourceData, donorData: openArray[byte],
@@ -244,7 +270,11 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   let renames = initTable[string, string]()
   let allowed = none(HashSet[string])
 
-  let crossVersionStride = (srcVer == cvFour and donVer == cvFive)
+  # Cross-version stride conversion runs in either direction:
+  #   crossUp   : working FM4 (cvFour, 32B) → donor FH1 (cvFive, 28B)
+  #   crossDown : working FH1 (cvFive, 28B) → donor FM4 (cvFour, 32B)
+  let crossUp = (srcVer == cvFour and donVer == cvFive)
+  let crossDown = (srcVer == cvFive and donVer == cvFour)
 
   for kIdx, donSec in donInfo.sections:
     # Slice C: preserve donor bytes between consecutive parsed sections.
@@ -286,30 +316,39 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
       try:
         var forcedBlob = none(seq[byte])
         var forcedSize = none(uint32)
-        if crossVersionStride and srcSec.lodVerticesSize == 32'u32:
+        if crossUp and srcSec.lodVerticesSize == 32'u32:
           let srcPool = block:
             var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
             for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
             b
           forcedBlob = some(fm4PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
-        # Carry source's 9 part-bound floats (offset.xyz + targetMin.xyz +
-        # targetMax.xyz) into the rebuilt section. Without this, donor's
-        # bounds drive the spos→world decode (`CalculateBoundTargetValue`)
-        # and source vertices render at donor-car scale.
+        elif crossDown and srcSec.lodVerticesSize == 28'u32:
+          let srcPool = block:
+            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
+            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
+            b
+          forcedBlob = some(fh1PoolToFm4(srcPool))
+          forcedSize = some(uint32(Fm4VertexStride))
+        # Carry the working car's 9 part-bound floats (offset.xyz +
+        # targetMin.xyz + targetMax.xyz) into the rebuilt section. Without
+        # this, the donor's bounds drive the spos→world decode
+        # (`CalculateBoundTargetValue`) and working vertices render at
+        # donor-car scale.
         let srcXform = block:
           var b = newSeq[byte](36)
           for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
           some(b)
-        let r = buildSectionConvertedToTargetLodOnTargetTemplate(
+        let r = buildSectionConvertedToDonorLodOnDonorTemplate(
           donorData, donSec, sourceData, srcSec,
-          donorLod = 1'i32, targetLod = 1'i32,
+          workingLod = 1'i32, donorLod = 1'i32,
           renameMap = renames, allowedSubparts = allowed,
-          upconvertIndices = true, padToTargetVpool = false,
-          forcedDonorVertexBlob = forcedBlob,
+          upconvertIndices = true, padToDonorVpool = false,
+          forcedWorkingVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
-          srcTransform9 = srcXform)
+          upconvertSubsectionsCvFourToCvFive = crossUp,
+          downconvertSubsectionsCvFiveToCvFour = crossDown,
+          workingTransform9 = srcXform)
 
         # Per-section validation: reparse the rebuilt bytes against the
         # target version. Reject on raise, on byte-count mismatch (parser
@@ -331,7 +370,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
                  chk.consumed >= r.bytes.len - 8 and
                  chk.consumed <= r.bytes.len
         if ok and chk.info.lodVerticesCount != srcSec.lodVerticesCount: ok = false
-        if ok and crossVersionStride and chk.info.lodVerticesSize != 28'u32: ok = false
+        if ok and crossUp and chk.info.lodVerticesSize != 28'u32: ok = false
+        if ok and crossDown and chk.info.lodVerticesSize != 32'u32: ok = false
         if ok and chk.info.subsections.len != srcLodSubcount: ok = false
         # LOD0 pool unchanged — must still match donor's counts.
         if ok and chk.info.lod0VerticesCount != donSec.lod0VerticesCount: ok = false
@@ -360,33 +400,42 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
       # LOD0-only section (lod0/cockpit body sections — visible in
       # autoshow / close camera). Today's behavior with the LOD-only
       # splice gate above was donor verbatim → autoshow showed donor's
-      # body. Splice source's LOD0 pool onto donor's section template;
-      # for cvFour→cvFive, re-stride 32→28 the same way the LOD path
-      # does. The builder regenerates the post-pool 4B/v stream with
-      # zero bytes of length srcLod0VCount*4 so the tail length matches.
+      # body. Splice the working car's LOD0 pool onto the donor's section
+      # template; re-stride 32→28 (crossUp) or 28→32 (crossDown) the same
+      # way the LOD path does. The builder regenerates the post-pool 4B/v
+      # stream with zero bytes of length workingLod0VCount*4 so the tail
+      # length matches.
       try:
         var forcedBlob = none(seq[byte])
         var forcedSize = none(uint32)
-        if crossVersionStride and srcSec.lod0VerticesSize == 32'u32:
+        if crossUp and srcSec.lod0VerticesSize == 32'u32:
           let srcPool = block:
             var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
             for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
             b
           forcedBlob = some(fm4Lod0PoolToFh1(srcPool))
           forcedSize = some(uint32(Fh1VertexStride))
+        elif crossDown and srcSec.lod0VerticesSize == 28'u32:
+          let srcPool = block:
+            var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
+            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
+            b
+          forcedBlob = some(fh1Lod0PoolToFm4(srcPool))
+          forcedSize = some(uint32(Fm4VertexStride))
         let srcXform = block:
           var b = newSeq[byte](36)
           for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
           some(b)
-        let r = buildSectionConvertedToTargetLodOnTargetTemplate(
+        let r = buildSectionConvertedToDonorLodOnDonorTemplate(
           donorData, donSec, sourceData, srcSec,
-          donorLod = 0'i32, targetLod = 0'i32,
+          workingLod = 0'i32, donorLod = 0'i32,
           renameMap = renames, allowedSubparts = allowed,
-          upconvertIndices = true, padToTargetVpool = false,
-          forcedDonorVertexBlob = forcedBlob,
+          upconvertIndices = true, padToDonorVpool = false,
+          forcedWorkingVertexBlob = forcedBlob,
           forcedNewVertexSize = forcedSize,
-          upconvertSubsectionsCvFourToCvFive = crossVersionStride,
-          srcTransform9 = srcXform)
+          upconvertSubsectionsCvFourToCvFive = crossUp,
+          downconvertSubsectionsCvFiveToCvFour = crossDown,
+          workingTransform9 = srcXform)
 
         let chk = tryParseSection(r.bytes, donVer)
         var srcLod0Subcount = 0
@@ -396,7 +445,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
                  chk.consumed >= r.bytes.len - 8 and
                  chk.consumed <= r.bytes.len
         if ok and chk.info.lod0VerticesCount != srcSec.lod0VerticesCount: ok = false
-        if ok and crossVersionStride and chk.info.lod0VerticesSize != 28'u32: ok = false
+        if ok and crossUp and chk.info.lod0VerticesSize != 28'u32: ok = false
+        if ok and crossDown and chk.info.lod0VerticesSize != 32'u32: ok = false
         if ok and chk.info.subsections.len != srcLod0Subcount: ok = false
         # LOD pool unchanged — must still match donor's counts (= 0 here).
         if ok and chk.info.lodVerticesCount != donSec.lodVerticesCount: ok = false

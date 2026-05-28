@@ -95,6 +95,35 @@ proc upconvertSubsectionCvFourToCvFive*(ssBytes: openArray[byte],
   ssNew.endPos = ss.endPos + 4
   result = (rebuilt, ssNew)
 
+proc downconvertSubsectionCvFiveToCvFour*(ssBytes: openArray[byte],
+                                          ss: SubSectionInfo):
+                                          tuple[bytes: seq[byte];
+                                                ss: SubSectionInfo] =
+  ## Inverse of `upconvertSubsectionCvFourToCvFive` (FH1 cvFive → FM4 cvFour).
+  ## A cvFive subsection carries [u32=4][u32=0] (8 bytes) immediately before
+  ## idxCount — i.e. [4] at (idxCountPos-8) and [0] at (idxCountPos-4). cvFour
+  ## collapses this to a single [u32=3] (4 bytes). Drops the 8-byte pair,
+  ## writes [u32=3], and shifts SubSectionInfo offsets from idxCountPos
+  ## onward by -4. Used for fh1→fm4 working-subsection downconvert.
+  let relIdxCountPos = ss.idxCountPos - ss.start
+  if relIdxCountPos < 8 or relIdxCountPos > ssBytes.len:
+    raise newException(ValueError,
+      "downconvertSubsectionCvFiveToCvFour: bad idxCountPos " &
+      $relIdxCountPos & " (ssBytes.len=" & $ssBytes.len & ")")
+  let prefixEnd = relIdxCountPos - 8
+  var rebuilt = newSeqOfCap[byte](ssBytes.len - 4)
+  for i in 0 ..< prefixEnd: rebuilt.add(ssBytes[i])
+  for b in bePackU32(3'u32): rebuilt.add(b)
+  for i in relIdxCountPos ..< ssBytes.len: rebuilt.add(ssBytes[i])
+  var ssNew = ss
+  ssNew.idxCountPos = ss.idxCountPos - 4
+  ssNew.idxSizePos = ss.idxSizePos - 4
+  ssNew.idxDataStart = ss.idxDataStart - 4
+  ssNew.idxDataEnd = ss.idxDataEnd - 4
+  ssNew.afterIdxPos = ss.afterIdxPos - 4
+  ssNew.endPos = ss.endPos - 4
+  result = (rebuilt, ssNew)
+
 proc upconvertSubsectionIndices_2_to_4*(ssBytes: openArray[byte],
                                         ss: SubSectionInfo): tuple[bytes: seq[byte]; changed: bool] =
   if ss.idxSize != 2: return (@ssBytes, false)
