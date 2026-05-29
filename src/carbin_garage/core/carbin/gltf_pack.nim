@@ -30,6 +30,7 @@
 
 import std/[json, os, math, tables]
 import ../be
+import ../obj
 import ./vertex
 import ./vertex_quat
 
@@ -44,7 +45,18 @@ type
 
 const
   GLTF_FLOAT = 5126
+  GLTF_UNSIGNED_INT = 5125
   POS_EPS = 1e-9'f32
+
+proc readBytes(path: string): seq[byte] =
+  let s = readFile(path)
+  result = newSeq[byte](s.len)
+  for i, c in s: result[i] = byte(c)
+
+proc writeAllBytes2(path: string, data: openArray[byte]) =
+  var f = open(path, fmWrite)
+  defer: f.close()
+  if data.len > 0: discard f.writeBytes(data, 0, data.len)
 
 proc loadGltfDoc*(gltfPath: string): GltfDoc =
   ## Parse car.gltf and read the sibling car.bin (uri from buffers[0]).
@@ -204,3 +216,182 @@ proc encodePoolPositions*(positions: seq[float32], basePool: openArray[byte],
   for a in 0 .. 2: putF(12 + a*4, tMin[a])      # targetMin (local bounds)
   for a in 0 .. 2: putF(24 + a*4, tMax[a])      # targetMax (local bounds)
   result.transform9 = xf
+
+# ---- full-mesh reader (Phase 2: new-part synthesis source) ----
+
+proc accFloatsVec2(d: GltfDoc, accIdx: int): seq[float32] =
+  let acc = d.j["accessors"][accIdx]
+  if acc{"componentType"}.getInt != GLTF_FLOAT or acc{"type"}.getStr != "VEC2":
+    raise newException(GltfPackError, "accessor " & $accIdx & " is not FLOAT VEC2")
+  let bv = d.j["bufferViews"][acc["bufferView"].getInt]
+  let off = bv{"byteOffset"}.getInt(0) + acc{"byteOffset"}.getInt(0)
+  let count = acc["count"].getInt
+  result = newSeq[float32](count * 2)
+  if count > 0: copyMem(addr result[0], unsafeAddr d.bin[off], count * 8)
+
+proc accIndices(d: GltfDoc, accIdx: int): seq[uint32] =
+  let acc = d.j["accessors"][accIdx]
+  let bv = d.j["bufferViews"][acc["bufferView"].getInt]
+  let off = bv{"byteOffset"}.getInt(0) + acc{"byteOffset"}.getInt(0)
+  let count = acc["count"].getInt
+  let ct = acc{"componentType"}.getInt
+  result = newSeq[uint32](count)
+  for i in 0 ..< count:
+    case ct
+    of 5121: result[i] = uint32(uint8(d.bin[off + i]))           # u8
+    of 5123:                                                      # u16 LE
+      result[i] = uint32(uint8(d.bin[off + i*2])) or
+                 (uint32(uint8(d.bin[off + i*2 + 1])) shl 8)
+    of 5125:                                                      # u32 LE
+      result[i] = uint32(uint8(d.bin[off + i*4])) or
+                 (uint32(uint8(d.bin[off + i*4 + 1])) shl 8) or
+                 (uint32(uint8(d.bin[off + i*4 + 2])) shl 16) or
+                 (uint32(uint8(d.bin[off + i*4 + 3])) shl 24)
+    else: raise newException(GltfPackError, "bad index componentType " & $ct)
+
+proc meshGeometry*(d: GltfDoc, meshName: string):
+                  tuple[pos, uv, normal: seq[float32]; indices: seq[uint32];
+                        found: bool] =
+  ## Full geometry of a mesh's LOD (lod>=1) primitive — positions, UVs,
+  ## normals, and triangle indices — for synthesizing a brand-new section.
+  result.found = false
+  if meshName notin d.meshByName: return
+  let m = d.j["meshes"][d.meshByName[meshName]]
+  let prims = m{"primitives"}
+  if prims == nil or prims.kind != JArray: return
+  for p in prims.getElems:
+    let lod = p{"extras", "carbin", "lod"}.getInt(1)
+    if lod == 0: continue
+    let attrs = p{"attributes"}
+    if attrs == nil: continue
+    let posAcc = attrs{"POSITION"}
+    if posAcc == nil: continue
+    result.pos = accFloatsVec3(d, posAcc.getInt)
+    if attrs{"NORMAL"} != nil: result.normal = accFloatsVec3(d, attrs["NORMAL"].getInt)
+    if attrs{"TEXCOORD_0"} != nil: result.uv = accFloatsVec2(d, attrs["TEXCOORD_0"].getInt)
+    if p{"indices"} != nil: result.indices = accIndices(d, p["indices"].getInt)
+    result.found = true
+    return
+
+proc mainMeshNames*(d: GltfDoc): seq[string] =
+  ## Names of meshes tagged lodKind=="main" (or untagged) — the candidates
+  ## for the main carbin. Used to detect new parts (names not in the donor).
+  result = @[]
+  if not d.j.hasKey("meshes"): return
+  for m in d.j["meshes"].getElems:
+    let nm = m{"name"}.getStr("")
+    if nm.len == 0: continue
+    let lk = m{"extras", "carbin", "lodKind"}.getStr("main")
+    if lk == "main": result.add nm
+
+# ---- OBJ -> glTF mesh injector (authoring: add a new part) ----
+
+proc addMeshToGltf*(gltfPath, objPath, name: string,
+                    place: array[3, float32], scale: float32) =
+  ## Inject an OBJ as a mesh `name` into car.gltf + car.bin (world =
+  ## obj*scale + place), tagged lodKind=main with a lod=1 TriList primitive.
+  ## NOTE: this only puts the geometry in the glTF — to get it in-game you
+  ## must REPLACE an existing donor slot with it via part_edits.json
+  ## `addName` ({"<name>":"body"}); a mesh with no donor slot is skipped at
+  ## export (appending a new part crashes in-game — docs/FH1_PART_EDITING.md
+  ## §3). Idempotent on name: a pre-existing mesh of the same name is
+  ## replaced (its old accessors are orphaned in the .bin but harmless).
+  var j = parseFile(gltfPath)
+  let uri = j["buffers"][0]{"uri"}.getStr("")
+  let binPath = parentDir(gltfPath) / uri
+  var buf = readBytes(binPath)
+  let mesh = loadObj(objPath)
+  let vcount = mesh.positions.len div 3
+
+  proc align4() =
+    while buf.len mod 4 != 0: buf.add 0'u8
+  proc wLE(v: float32) =
+    let u = cast[uint32](v)
+    buf.add byte(u and 0xff); buf.add byte((u shr 8) and 0xff)
+    buf.add byte((u shr 16) and 0xff); buf.add byte((u shr 24) and 0xff)
+
+  # Append data first, then register the bufferView with the recorded
+  # offset/length, to keep alignment simple.
+  proc bvFromHere(startOff, byteLen: int): int =
+    j["bufferViews"].add(%*{"buffer": 0, "byteOffset": startOff, "byteLength": byteLen})
+    return j["bufferViews"].len - 1
+
+  if not j.hasKey("bufferViews"): j["bufferViews"] = newJArray()
+  if not j.hasKey("accessors"): j["accessors"] = newJArray()
+  if not j.hasKey("meshes"): j["meshes"] = newJArray()
+  if not j.hasKey("nodes"): j["nodes"] = newJArray()
+
+  # POSITION (world), with min/max.
+  var wmin = [1e30'f32, 1e30'f32, 1e30'f32]
+  var wmax = [-1e30'f32, -1e30'f32, -1e30'f32]
+  align4()
+  let posStart = buf.len
+  for i in 0 ..< vcount:
+    for a in 0 .. 2:
+      let w = mesh.positions[i*3 + a] * scale + place[a]
+      wmin[a] = min(wmin[a], w); wmax[a] = max(wmax[a], w)
+      wLE(w)
+  let posBV = bvFromHere(posStart, vcount * 12)
+  j["accessors"].add(%*{"bufferView": posBV, "componentType": GLTF_FLOAT,
+    "count": vcount, "type": "VEC3",
+    "min": [wmin[0], wmin[1], wmin[2]], "max": [wmax[0], wmax[1], wmax[2]]})
+  let posAcc = j["accessors"].len - 1
+
+  # NORMAL
+  align4(); let nStart = buf.len
+  for i in 0 ..< vcount:
+    for a in 0 .. 2: wLE(if mesh.normals.len >= i*3+3: mesh.normals[i*3+a] else: (if a==1: 1.0'f32 else: 0.0'f32))
+  let nBV = bvFromHere(nStart, vcount * 12)
+  j["accessors"].add(%*{"bufferView": nBV, "componentType": GLTF_FLOAT,
+    "count": vcount, "type": "VEC3"})
+  let nAcc = j["accessors"].len - 1
+
+  # TEXCOORD_0
+  align4(); let tStart = buf.len
+  for i in 0 ..< vcount:
+    wLE(if mesh.uvs.len > i*2: mesh.uvs[i*2] else: 0.0'f32)
+    wLE(if mesh.uvs.len > i*2+1: mesh.uvs[i*2+1] else: 0.0'f32)
+  let tBV = bvFromHere(tStart, vcount * 8)
+  j["accessors"].add(%*{"bufferView": tBV, "componentType": GLTF_FLOAT,
+    "count": vcount, "type": "VEC2"})
+  let tAcc = j["accessors"].len - 1
+
+  # indices (u32 for simplicity)
+  align4(); let iStart = buf.len
+  for ix in mesh.indices:
+    buf.add byte(ix and 0xff); buf.add byte((ix shr 8) and 0xff)
+    buf.add byte((ix shr 16) and 0xff); buf.add byte((ix shr 24) and 0xff)
+  let iBV = bvFromHere(iStart, mesh.indices.len * 4)
+  j["accessors"].add(%*{"bufferView": iBV, "componentType": GLTF_UNSIGNED_INT,
+    "count": mesh.indices.len, "type": "SCALAR"})
+  let iAcc = j["accessors"].len - 1
+
+  let prim = %*{
+    "attributes": {"POSITION": posAcc, "NORMAL": nAcc, "TEXCOORD_0": tAcc},
+    "indices": iAcc, "mode": 4,
+    "extras": {"carbin": {"lod": 1, "indexType": 4, "idxSize": 4, "subName": name,
+      "uvXScale": 1.0, "uvYScale": 1.0, "uvXOffset": 0.0, "uvYOffset": 0.0,
+      "uv1XScale": 1.0, "uv1YScale": 1.0, "uv1XOffset": 0.0, "uv1YOffset": 0.0}}}
+  let meshJson = %*{"name": name, "primitives": [prim],
+    "extras": {"carbin": {"lodKind": "main",
+      "bbox": {"offset": [0.0, 0.0, 0.0],
+        "targetMin": [wmin[0], wmin[1], wmin[2]],
+        "targetMax": [wmax[0], wmax[1], wmax[2]]}}}}
+
+  # Replace an existing mesh of the same name, else append + add a node.
+  var replaced = false
+  for i in 0 ..< j["meshes"].len:
+    if j["meshes"][i]{"name"}.getStr("") == name:
+      j["meshes"].elems[i] = meshJson; replaced = true; break
+  if not replaced:
+    j["meshes"].add(meshJson)
+    let meshIdx = j["meshes"].len - 1
+    j["nodes"].add(%*{"mesh": meshIdx, "name": name})
+    let nodeIdx = j["nodes"].len - 1
+    if j.hasKey("scenes") and j["scenes"].len > 0:
+      if not j["scenes"][0].hasKey("nodes"): j["scenes"][0]["nodes"] = newJArray()
+      j["scenes"][0]["nodes"].add(%nodeIdx)
+
+  j["buffers"][0]["byteLength"] = %buf.len
+  writeFile(gltfPath, $j)
+  writeAllBytes2(binPath, buf)

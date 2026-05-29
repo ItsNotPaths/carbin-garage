@@ -1,7 +1,8 @@
 ## CLI subcommand router. Phase-1 commands target FM4 only.
 
-import std/[json, os, strutils, times]
+import std/[json, os, sets, strutils, times]
 import ./core/profile
+import ./core/carbin/gltf_pack
 import ./core/xds
 import ./core/cardb
 import ./core/mounts
@@ -684,6 +685,59 @@ proc cmdExportTo(args: seq[string]) =
   else:
     echo "  wrote ", plan.targetZip
 
+proc cmdAddPart(args: seq[string]) =
+  ## add-part <working-car> <obj> --name <n> [--place x,y,z] [--scale s]
+  ## Inject an OBJ as a new mesh into the working car's car.gltf (world =
+  ## obj*scale + place). The next port-to-dlc synthesizes it as a new
+  ## carbin section automatically (mesh name not in the donor's part list).
+  if args.len < 2:
+    echo "add-part: need <working-car> <obj.file>"; quit 1
+  let workingCar = args[0]
+  let objPath = args[1]
+  let name = parseFlag(args, "--name")
+  if name.len == 0: echo "add-part: --name <part-name> required"; quit 1
+  var place = [0.0'f32, 0.0'f32, 0.0'f32]
+  let pf = parseFlag(args, "--place")
+  if pf.len > 0:
+    let parts = pf.split(',')
+    if parts.len == 3:
+      for i in 0 .. 2:
+        try: place[i] = parseFloat(parts[i].strip()).float32
+        except CatchableError: discard
+  var scale = 1.0'f32
+  let sf = parseFlag(args, "--scale")
+  if sf.len > 0:
+    try: scale = parseFloat(sf).float32
+    except CatchableError: discard
+  let gltf = workingCar / "car.gltf"
+  if not fileExists(gltf): echo "add-part: no car.gltf in ", workingCar; quit 1
+  if not fileExists(objPath): echo "add-part: no such OBJ: ", objPath; quit 1
+  addMeshToGltf(gltf, objPath, name, place, scale)
+  echo "add-part: injected '", name, "' into ", gltf,
+       "  (place=", place, " scale=", scale, ")"
+
+proc cmdDropPart(args: seq[string]) =
+  ## drop-part <working-car> <name>[,<name>...]
+  ## Record section names to remove from the exported car in
+  ## working/<slug>/part_edits.json {"drop":[...]}. Merges with any existing.
+  if args.len < 2:
+    echo "drop-part: need <working-car> <name[,name...]>"; quit 1
+  let workingCar = args[0]
+  let sidecar = workingCar / "part_edits.json"
+  var j = %*{"drop": newJArray()}
+  if fileExists(sidecar):
+    try: j = parseJson(readFile(sidecar))
+    except CatchableError: discard
+  if not j.hasKey("drop") or j["drop"].kind != JArray: j["drop"] = newJArray()
+  var have = initHashSet[string]()
+  for n in j["drop"].getElems: have.incl n.getStr
+  for n in args[1].split(','):
+    let nm = n.strip()
+    if nm.len > 0 and nm notin have:
+      j["drop"].add(%nm); have.incl nm
+  writeFile(sidecar, j.pretty)
+  echo "drop-part: ", sidecar, " drop=", j["drop"]
+
 proc mainWithArgs*(args: openArray[string]) =
   if args.len == 0:
     usage(); quit(0)
@@ -728,6 +782,10 @@ proc mainWithArgs*(args: openArray[string]) =
     cmdPatchXex(rest)
   of "export-carbin":
     cmdExportCarbin(rest)
+  of "add-part":
+    cmdAddPart(rest)
+  of "drop-part":
+    cmdDropPart(rest)
   else:
     echo "TODO: command '" & cmd & "' not yet implemented"
     quit(1)

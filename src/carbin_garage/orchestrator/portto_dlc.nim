@@ -100,6 +100,8 @@ import ../core/zip21
 import ../core/texture_port
 import ../core/carbin/transcode
 import ../core/carbin/gltf_pack
+import ../core/carbin/section_edit
+import ../core/carbin/model as carbin_model
 import ../core/carbin/parser as carbin_parser
 import ../core/physicsdef
 export TranscodeOptions, defaultTranscodeOptions
@@ -565,6 +567,207 @@ proc collectGeometryEdits(p: DlcPortPlan;
         result[ga.zipEntryName] = r.bytes
     of dgaDonorOnly, dgaSourceExtra:
       discard
+
+  # ---- Part add / remove (Phase 2) ----
+  # Operates on the MAIN body carbin only. ADD: any glTF mesh tagged
+  # lodKind=main whose name is not a donor section → synthesize a new
+  # carbin section (clone a body section as scaffold) and append. REMOVE:
+  # section names listed in working/<slug>/part_edits.json {"drop":[...]}.
+  block partEdits:
+    var dropSet = initHashSet[string]()
+    var dupAppend: seq[tuple[src, name: string]] = @[]   # debug: clone+rename+append
+    var addName = initTable[string, string]()  # gltf mesh name -> carbin section name
+    var mutateOps: seq[tuple[section, op: string]] = @[]  # bisect: mutate a real section in place
+    var boxScale = 1.0'f32   # enlarge the donor target bbox a synthesized part fits into
+    var partOffset = [0.0'f32, 0.0'f32, 0.0'f32]   # shift a synthesized part in world
+    var subName = ""   # template subsection to clone (its material binding) — "" = ss0
+    let sidecar = p.workingCar / "part_edits.json"
+    if fileExists(sidecar):
+      try:
+        let pj = parseJson(readFile(sidecar))
+        if pj.hasKey("drop"):
+          for n in pj["drop"].getElems: dropSet.incl n.getStr
+        if pj.hasKey("dupAppend"):
+          for e in pj["dupAppend"].getElems:
+            dupAppend.add (src: e{"src"}.getStr, name: e{"name"}.getStr)
+        if pj.hasKey("addName"):
+          for k, v in pj["addName"].pairs: addName[k] = v.getStr
+        if pj.hasKey("mutate"):
+          for e in pj["mutate"].getElems:
+            mutateOps.add (section: e{"section"}.getStr, op: e{"op"}.getStr)
+        if pj.hasKey("boxScale"): boxScale = pj["boxScale"].getFloat.float32
+        if pj.hasKey("offset") and pj["offset"].len >= 3:
+          for a in 0 .. 2: partOffset[a] = pj["offset"][a].getFloat.float32
+        if pj.hasKey("subName"): subName = pj["subName"].getStr
+      except CatchableError as e:
+        stderr.writeLine "    [parts] part_edits.json parse failed: " & e.msg
+
+    # Locate the main body carbin entry (not stripped/lod0/cockpit/caliper/rotor).
+    var mainEntry = ""
+    for e in donorIdx.entries:
+      if not isCarbinName(e.name): continue
+      let bl = extractFilename(e.name).toLowerAscii()
+      if bl.startsWith("stripped_"): continue
+      if bl.endsWith("_lod0.carbin") or bl.endsWith("_cockpit.carbin"): continue
+      if bl.contains("caliper") or bl.contains("rotor"): continue
+      mainEntry = e.name; break
+    if mainEntry.len == 0: break partEdits
+
+    var gDoc2 = none(GltfDoc)
+    let gltfPath2 = p.workingCar / "car.gltf"
+    if fileExists(gltfPath2):
+      try: gDoc2 = some(loadGltfDoc(gltfPath2))
+      except CatchableError: discard
+
+    # Nothing to do?
+    if dropSet.len == 0 and gDoc2.isNone: break partEdits
+
+    var mainBytes =
+      if mainEntry in result: result[mainEntry]
+      else: extract(p.donorCarsZip, donorEntryByBase[extractFilename(mainEntry).toLowerAscii()])
+    var info: carbin_model.CarbinInfo
+    try: info = carbin_parser.parseFm4Carbin(mainBytes)
+    except CatchableError as e:
+      stderr.writeLine "    [parts] main carbin parse failed; skipping: " & e.msg
+      break partEdits
+
+    var donorNames = initHashSet[string]()
+    for s in info.sections: donorNames.incl s.name
+
+    # Template: a CLEAN body section (permCount==0 && cnt2==0) with geometry
+    # + subsections — glass sections carry permutation/index blocks that
+    # reference their own geometry and ERANGE when cloned onto a new mesh.
+    # Prefer the largest clean section for a robust scaffold.
+    var tplIdx = -1
+    var tplBest = -1
+    for i, s in info.sections:
+      if s.lodVerticesCount == 0'u32 or s.subsections.len == 0: continue
+      let hc = sectionHeaderCounts(mainBytes, s)
+      if hc.perm != 0'u32 or hc.cnt2 != 0'u32: continue
+      if tplBest < 0 or int(s.lodVerticesCount) > tplBest:
+        tplBest = int(s.lodVerticesCount); tplIdx = i
+    if tplIdx < 0:   # no clean section — fall back to any (best effort)
+      for i, s in info.sections:
+        if s.lodVerticesCount > 0'u32 and s.subsections.len > 0: tplIdx = i; break
+
+    var added: seq[seq[byte]] = @[]
+    var replaceTbl = initTable[string, seq[byte]]()  # in-place section swaps
+
+    # Debug isolation: append verbatim byte-copies of existing sections,
+    # renamed, each with a fresh unique perSectionId. Known-good bytes →
+    # tells us whether appending a part at all is the wall, independent of
+    # synthesis (and whether perSectionId must be unique).
+    var nextPsid = 1'u32
+    block:
+      let used = readPerSectionIds(mainBytes, info)
+      for v in used:
+        if v != high(uint32) and v + 1 > nextPsid: nextPsid = v + 1
+    for da in dupAppend:
+      var srcIdx = -1
+      for i, s in info.sections:
+        if s.name == da.src: srcIdx = i; break
+      if srcIdx < 0:
+        stderr.writeLine "    [parts] dupAppend src '" & da.src & "' not found"
+        continue
+      added.add cloneSectionRenamed(mainBytes, info.sections[srcIdx], da.name,
+                                    int(nextPsid))
+      stderr.writeLine "    [parts] +dup '" & da.src & "' as '" & da.name &
+        "' (perSectionId=" & $nextPsid & ")"
+      inc nextPsid
+
+    if gDoc2.isSome and tplIdx >= 0:
+      for meshName in gDoc2.get.mainMeshNames:
+        if meshName in donorNames: continue          # existing part → Phase 1
+        let mg = gDoc2.get.meshGeometry(meshName)
+        if not mg.found or mg.indices.len < 3: continue
+        # Section name: the game looks up each section in a fixed part-name
+        # registry, so a new part must use a known name. `addName` maps the
+        # glTF mesh → carbin section. `addName` maps the mesh to the donor
+        # section name it should REPLACE (e.g. {"penger":"body"}). The new
+        # part MUST target an existing donor slot: APPENDING a section the
+        # donor lacks crashes in-game unconditionally — the per-car geometry
+        # budget is allocated by the engine from the donor and can't be grown
+        # via our files (see docs/FH1_PART_EDITING.md §3). So a mesh whose
+        # target name isn't a donor section is skipped with a warning rather
+        # than silently shipping a carbin that crashes on load.
+        let secName = addName.getOrDefault(meshName, meshName)
+        if secName notin donorNames:
+          stderr.writeLine "    [parts] skip '" & meshName &
+            "': no donor slot named '" & secName &
+            "' — appending a new part crashes in-game; map it to an existing" &
+            " slot with addName (e.g. \"" & meshName & "\":\"body\")"
+          continue
+        # Clone the target section as the structural template (its valid
+        # per-section metadata + material binding). It must be a CLEAN section
+        # (permCount==0 && cnt2==0); glass slots carry geometry-referencing
+        # blocks that ERANGE when cloned — fall back to the largest clean one.
+        var tpl = info.sections[tplIdx]
+        for s in info.sections:
+          if s.name == secName:
+            let hc = sectionHeaderCounts(mainBytes, s)
+            if hc.perm == 0'u32 and hc.cnt2 == 0'u32: tpl = s
+            break
+        try:
+          # glTF positions are already world-space → scale 1, place 0; size and
+          # position come from boxScale/partOffset (the written transform).
+          var subIdx = 0
+          if subName.len > 0:
+            for si, ssx in tpl.subsections:
+              if ssx.name == subName: subIdx = si; break
+          let sec = synthSectionFromMesh(mainBytes, tpl, mg.pos, mg.uv, mg.normal,
+            mg.indices, secName, boxScale, partOffset, subIdx)
+          # Replace IN PLACE (keeps ordinal position; never makes the new part
+          # the last section, whose tail has no next-marker to delimit it).
+          replaceTbl[secName] = sec
+          dropSet.excl secName
+          stderr.writeLine "    [parts] ~replace '" & secName & "' with '" &
+            meshName & "' (" & $(mg.pos.len div 3) & " v, " &
+            $(mg.indices.len div 3) & " tris)"
+        except CatchableError as e:
+          stderr.writeLine "    [parts] synth '" & meshName & "' failed: " & e.msg
+
+    # Bisect probes: mutate a REAL section in place (one field flipped) to
+    # find which difference from real→synthesis the game rejects.
+    for mo in mutateOps:
+      var si = -1
+      for i, s in info.sections:
+        if s.name == mo.section: si = i; break
+      if si < 0:
+        stderr.writeLine "    [parts] mutate: section '" & mo.section & "' not found"; continue
+      let sec = info.sections[si]
+      var mut: seq[byte]
+      case mo.op
+      of "regenquats": mut = mutateRegenQuats(mainBytes, sec)
+      of "trilist":    mut = mutateTriList(mainBytes, sec)
+      of "mergesubs":  mut = mutateMergeSubs(mainBytes, sec)
+      of "zeroatable": mut = mutateZeroAtable(mainBytes, sec)
+      of "resynth":
+        if gDoc2.isNone:
+          stderr.writeLine "    [parts] resynth needs car.gltf"; continue
+        let mg = gDoc2.get.meshGeometry(mo.section)
+        if not mg.found:
+          stderr.writeLine "    [parts] resynth: no gltf mesh '" & mo.section & "'"; continue
+        mut = synthSectionFromMesh(mainBytes, sec, mg.pos, mg.uv, mg.normal,
+          mg.indices, mo.section)
+      else:
+        stderr.writeLine "    [parts] mutate: unknown op '" & mo.op & "'"; continue
+      replaceTbl[mo.section] = mut
+      stderr.writeLine "    [parts] *mutate '" & mo.section & "' op=" & mo.op &
+        " (" & $(sec.endPos-sec.start) & "B -> " & $mut.len & "B)"
+
+    if dropSet.len == 0 and added.len == 0 and replaceTbl.len == 0: break partEdits
+    let pe = applyPartEdits(mainBytes, info, dropSet, added, replaceTbl)
+    if pe.ok:
+      result[mainEntry] = pe.bytes
+      var droppedReal = 0
+      for n in dropSet:
+        if n in donorNames: inc droppedReal
+      stderr.writeLine "    [parts] main carbin: -" & $droppedReal &
+        " dropped, ~" & $replaceTbl.len & " replaced, +" & $added.len &
+        " added (partCount " & $info.partCountDeclared & " -> " &
+        $(info.sections.len - droppedReal + added.len) & ")"
+    else:
+      stderr.writeLine "    [parts] applyPartEdits skipped: " & pe.msg
 
   # No-hitboxes mode (`exportHitboxes = false`): replace donor's
   # physicsdefinition.bin `shapesAndChildren` with a single
