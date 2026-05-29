@@ -93,12 +93,13 @@
 ## under arbitrary IDs. If Xenia rejects the synthesized id, fall back
 ## to enumerating an unused integer DLC id under `00000002/`.
 
-import std/[hashes, json, os, sets, strutils, tables]
+import std/[hashes, json, options, os, sets, strutils, tables]
 import ../core/profile
 import ../core/mounts
 import ../core/zip21
 import ../core/texture_port
 import ../core/carbin/transcode
+import ../core/carbin/gltf_pack
 import ../core/carbin/parser as carbin_parser
 import ../core/physicsdef
 export TranscodeOptions, defaultTranscodeOptions
@@ -463,6 +464,24 @@ proc collectGeometryEdits(p: DlcPortPlan;
   for e in donorIdx.entries:
     donorEntryByBase[extractFilename(e.name).toLowerAscii()] = e
 
+  # glTF-sourced geometry (Stage 2, opt-in via options.packFromGltf):
+  # load working/<slug>/car.gltf once and feed it to every main-carbin
+  # transcode so exported geometry comes from the (editable) glTF rather
+  # than the importee's original carbin pool. Loaded once; one doc serves
+  # all carbins (importwc emits every carbin's sections into one glTF).
+  # On any load failure we fall back to the binary-splice path silently.
+  var gDoc = none(GltfDoc)
+  if options.packFromGltf:
+    let gltfPath = p.workingCar / "car.gltf"
+    if fileExists(gltfPath):
+      try: gDoc = some(loadGltfDoc(gltfPath))
+      except CatchableError as e:
+        stderr.writeLine "    [transcode] glTF load failed (" & e.msg &
+          "); falling back to binary splice"
+    else:
+      stderr.writeLine "    [transcode] packFromGltf set but no " & gltfPath &
+        "; falling back to binary splice"
+
   # Textures (Stage 3 § 3.3): wire texture splice into emit. The plan's
   # `ops` list was built by planTexturePort during planPortToDlc; here
   # we consume it. CANONICAL bytes live at working/<slug>/textures/<bucket>.xds
@@ -532,7 +551,8 @@ proc collectGeometryEdits(p: DlcPortPlan;
 
       let r =
         try: transcodeCarbin(sourceBytes, donorBytesEntry, p.targetProfile,
-                             mode = tmHybridSplice, options = options)
+                             mode = tmHybridSplice, options = options,
+                             gltfDoc = gDoc)
         except CatchableError as e:
           raise newException(DlcPortError,
             "transcode failed for " & ga.zipEntryName & ": " & e.msg)

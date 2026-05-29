@@ -54,6 +54,8 @@ import std/[options, sets, tables]
 import ./model
 import ./parser
 import ./builders
+import ./gltf_pack
+import ../be
 import ../profile
 
 const TranscodeTrace {.booldefine.} = false
@@ -94,6 +96,15 @@ type
       ## fine cross-car, so the LOD0 carbin probably does too. Flag
       ## exists so we can test that without regressing today's working
       ## damage-port pipeline.
+    packFromGltf*: bool
+      ## When `true`, geometry export sources vertex POSITIONS from the
+      ## working/ glTF (`transcodeCarbinFromGltf`) instead of re-striding
+      ## the importee's original carbin pool. Per-vertex UV / tangent /
+      ## extra bytes still ride from the source pool by index (Phase 1,
+      ## matched topology). Default `false` keeps today's binary-splice
+      ## pipeline as the safety net until the glTF path is in-game-verified.
+      ## The orchestrator reads this to decide whether to load the glTF and
+      ## call the glTF-sourced entry point.
 
   TranscodeReport* = object
     mode*: TranscodeMode
@@ -115,7 +126,8 @@ type
     note*: string
 
 proc defaultTranscodeOptions*(): TranscodeOptions =
-  TranscodeOptions(exportHitboxes: true, lod0SpliceCrossCar: false)
+  TranscodeOptions(exportHitboxes: true, lod0SpliceCrossCar: false,
+                   packFromGltf: false)
 
 proc expectedDonorVersion(targetProfile: GameProfile): CarbinVersion =
   ## Validate by family, not exact TypeId — FM4 ships TypeIds 1/2/3 in
@@ -234,7 +246,8 @@ proc fh1Lod0PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
 proc spliceCarbin(sourceData, donorData: openArray[byte],
                   srcInfo, donInfo: CarbinInfo,
                   srcVer, donVer: CarbinVersion,
-                  options: TranscodeOptions):
+                  options: TranscodeOptions,
+                  gltfDoc: Option[GltfDoc] = none(GltfDoc)):
                   tuple[bytes: seq[byte]; spliced: int; fallback: int;
                         gapsPreserved: int; lod0Spliced: int] =
   ## Donor's part list is authoritative. For each donor section, look up
@@ -276,6 +289,46 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   let crossUp = (srcVer == cvFour and donVer == cvFive)
   let crossDown = (srcVer == cvFive and donVer == cvFour)
 
+  # Build the forced vertex-pool blob + section transform for one pool,
+  # in priority order:
+  #   1. cross-version stride conversion (32↔28) of the source pool when
+  #      donor/source formats differ → `basePool`.
+  #   2. if a glTF doc is supplied AND the named mesh's matching pool has
+  #      the same vertex count, overwrite basePool's POSITIONS from the
+  #      glTF (UV/quat/extra ride through by index) and return the
+  #      recomputed bbox as the section transform.
+  #   3. otherwise: a forced blob only when a stride conversion happened;
+  #      same-stride / no-glTF returns none so the builder copies the
+  #      source pool verbatim (today's behaviour). The source's 36-byte
+  #      transform is always returned so bounds transfer as before.
+  proc forcedFor(srcPool: seq[byte], srcStride: int, meshName: string,
+                 wantLod0: bool, srcXform: seq[byte]):
+                 tuple[blob: Option[seq[byte]]; size: Option[uint32];
+                       xform: Option[seq[byte]]] =
+    let dstStride = (if crossUp: Fh1VertexStride
+                     elif crossDown: Fm4VertexStride
+                     else: srcStride)
+    let needConv = (srcStride == 32 and dstStride == 28) or
+                   (srcStride == 28 and dstStride == 32)
+    let basePool =
+      if needConv and srcStride == 32: fm4PoolToFh1(srcPool)
+      elif needConv: fh1PoolToFm4(srcPool)
+      else: srcPool
+    let poolStride = if needConv: dstStride else: srcStride
+    if gltfDoc.isSome and poolStride > 0 and basePool.len mod poolStride == 0:
+      let sp = gltfDoc.get.sectionPositions(meshName, wantLod0)
+      if sp.found and sp.pos.len div 3 == basePool.len div poolStride:
+        # Section offset = first 3 BE floats of the source transform; the
+        # glTF encode keeps it so the part stays at the source's placement
+        # and re-quantizes into the pool's native range (correct scale).
+        var rdo = newBEReader(srcXform)
+        let srcOffset = [rdo.f32(), rdo.f32(), rdo.f32()]
+        let enc = encodePoolPositions(sp.pos, basePool, poolStride, srcOffset)
+        return (some(enc.pool), some(uint32(poolStride)), some(enc.transform9))
+    if needConv:
+      return (some(basePool), some(uint32(dstStride)), some(srcXform))
+    return (none(seq[byte]), none(uint32), some(srcXform))
+
   for kIdx, donSec in donInfo.sections:
     # Slice C: preserve donor bytes between consecutive parsed sections.
     # Cars like R8 carry LOD0-only sections inside the main carbin (no
@@ -314,41 +367,32 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
 
     if donSec.lodVerticesCount > 0'u32 and srcSec.lodVerticesCount > 0'u32:
       try:
-        var forcedBlob = none(seq[byte])
-        var forcedSize = none(uint32)
-        if crossUp and srcSec.lodVerticesSize == 32'u32:
-          let srcPool = block:
-            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
-            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
-            b
-          forcedBlob = some(fm4PoolToFh1(srcPool))
-          forcedSize = some(uint32(Fh1VertexStride))
-        elif crossDown and srcSec.lodVerticesSize == 28'u32:
-          let srcPool = block:
-            var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
-            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
-            b
-          forcedBlob = some(fh1PoolToFm4(srcPool))
-          forcedSize = some(uint32(Fm4VertexStride))
         # Carry the working car's 9 part-bound floats (offset.xyz +
         # targetMin.xyz + targetMax.xyz) into the rebuilt section. Without
         # this, the donor's bounds drive the spos→world decode
         # (`CalculateBoundTargetValue`) and working vertices render at
-        # donor-car scale.
-        let srcXform = block:
+        # donor-car scale. When the glTF path is active, forcedFor
+        # substitutes the bbox it recomputed from the glTF positions.
+        let srcPool = block:
+          var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
+          for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
+          b
+        let srcXformBytes = block:
           var b = newSeq[byte](36)
           for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
-          some(b)
+          b
+        let ff = forcedFor(srcPool, int(srcSec.lodVerticesSize),
+                           donSec.name, wantLod0 = false, srcXformBytes)
         let r = buildSectionConvertedToDonorLodOnDonorTemplate(
           donorData, donSec, sourceData, srcSec,
           workingLod = 1'i32, donorLod = 1'i32,
           renameMap = renames, allowedSubparts = allowed,
           upconvertIndices = true, padToDonorVpool = false,
-          forcedWorkingVertexBlob = forcedBlob,
-          forcedNewVertexSize = forcedSize,
+          forcedWorkingVertexBlob = ff.blob,
+          forcedNewVertexSize = ff.size,
           upconvertSubsectionsCvFourToCvFive = crossUp,
           downconvertSubsectionsCvFiveToCvFour = crossDown,
-          workingTransform9 = srcXform)
+          workingTransform9 = ff.xform)
 
         # Per-section validation: reparse the rebuilt bytes against the
         # target version. Reject on raise, on byte-count mismatch (parser
@@ -406,36 +450,26 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
       # stream with zero bytes of length workingLod0VCount*4 so the tail
       # length matches.
       try:
-        var forcedBlob = none(seq[byte])
-        var forcedSize = none(uint32)
-        if crossUp and srcSec.lod0VerticesSize == 32'u32:
-          let srcPool = block:
-            var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
-            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
-            b
-          forcedBlob = some(fm4Lod0PoolToFh1(srcPool))
-          forcedSize = some(uint32(Fh1VertexStride))
-        elif crossDown and srcSec.lod0VerticesSize == 28'u32:
-          let srcPool = block:
-            var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
-            for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
-            b
-          forcedBlob = some(fh1Lod0PoolToFm4(srcPool))
-          forcedSize = some(uint32(Fm4VertexStride))
-        let srcXform = block:
+        let srcPool = block:
+          var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
+          for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
+          b
+        let srcXformBytes = block:
           var b = newSeq[byte](36)
           for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
-          some(b)
+          b
+        let ff = forcedFor(srcPool, int(srcSec.lod0VerticesSize),
+                           donSec.name, wantLod0 = true, srcXformBytes)
         let r = buildSectionConvertedToDonorLodOnDonorTemplate(
           donorData, donSec, sourceData, srcSec,
           workingLod = 0'i32, donorLod = 0'i32,
           renameMap = renames, allowedSubparts = allowed,
           upconvertIndices = true, padToDonorVpool = false,
-          forcedWorkingVertexBlob = forcedBlob,
-          forcedNewVertexSize = forcedSize,
+          forcedWorkingVertexBlob = ff.blob,
+          forcedNewVertexSize = ff.size,
           upconvertSubsectionsCvFourToCvFive = crossUp,
           downconvertSubsectionsCvFiveToCvFour = crossDown,
-          workingTransform9 = srcXform)
+          workingTransform9 = ff.xform)
 
         let chk = tryParseSection(r.bytes, donVer)
         var srcLod0Subcount = 0
@@ -501,7 +535,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
 proc transcodeCarbin*(sourceData, donorData: openArray[byte],
                       targetProfile: GameProfile,
                       mode: TranscodeMode = tmDonorVerbatim,
-                      options: TranscodeOptions = defaultTranscodeOptions()
+                      options: TranscodeOptions = defaultTranscodeOptions(),
+                      gltfDoc: Option[GltfDoc] = none(GltfDoc)
                      ): tuple[bytes: seq[byte]; report: TranscodeReport] =
   ## v2 splice (mode=tmHybridSplice): cvFour→cvFive stride conversion
   ## (32→28) is plumbed via `fm4PoolToFh1`, the cvFive m_NumBoneWeights
@@ -528,7 +563,7 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
     result = (copy, report)
   of tmHybridSplice:
     let r = spliceCarbin(sourceData, donorData, srcInfo, donInfo,
-                          srcVer, donVer, options)
+                          srcVer, donVer, options, gltfDoc)
     let report = TranscodeReport(
       mode: tmHybridSplice,
       sourceVersion: srcVer, sourceTypeId: srcInfo.typeId,
@@ -538,8 +573,28 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
       sectionsSpliced: r.spliced, sectionsFallback: r.fallback,
       gapsPreserved: r.gapsPreserved,
       lod0Spliced: r.lod0Spliced,
-      note: "v1: per-section splice with donor-fallback on failure")
+      note: (if gltfDoc.isSome:
+               "v1: per-section splice, POSITIONS from glTF, donor-fallback"
+             else: "v1: per-section splice with donor-fallback on failure"))
     result = (r.bytes, report)
+
+proc transcodeCarbinFromGltf*(sourceData, donorData: openArray[byte],
+                              targetProfile: GameProfile,
+                              gltfPath: string,
+                              options: TranscodeOptions = defaultTranscodeOptions()
+                             ): tuple[bytes: seq[byte]; report: TranscodeReport] =
+  ## glTF-sourced geometry export. Identical to `transcodeCarbin` with
+  ## `mode = tmHybridSplice`, except each section's vertex POSITIONS come
+  ## from the working/ glTF at `gltfPath` (matched by mesh name == section
+  ## name). The source carbin still supplies subsection indices/headers,
+  ## damage tables, and per-vertex UV/tangent/extra bytes (Phase 1, matched
+  ## topology); the donor still supplies the section scaffold. Sections
+  ## whose mesh/pool is absent from the glTF, or whose vertex count differs,
+  ## transparently fall back to the binary-splice path.
+  let doc = loadGltfDoc(gltfPath)
+  transcodeCarbin(sourceData, donorData, targetProfile,
+                  mode = tmHybridSplice, options = options,
+                  gltfDoc = some(doc))
 
 proc passthroughCarbin*(donorData: openArray[byte]): seq[byte] =
   ## For carbin slots the transcode never touches: stripped, caliper /

@@ -27,9 +27,11 @@
 ## importwc). That gate enforces forward-compat: the day edit-emission
 ## lands, every Stage-1 glTF will already have what it needs.
 
-import std/[os, strutils]
+import std/[json, os, strutils]
 import ../zip21
 import ../gltf
+import ../profile
+import ./transcode
 
 type
   EmitReport* = object
@@ -49,17 +51,26 @@ proc writeAllBytes(path: string, data: openArray[byte]) =
   defer: f.close()
   if data.len > 0: discard f.writeBytes(data, 0, data.len)
 
-proc emitCarbinRoundtrip*(donorBytes: openArray[byte],
-                          gltfMeshName: string = ""): seq[byte] =
-  ## Today: pure donor passthrough. Tomorrow: per-vertex compare
-  ## against the named glTF mesh and splice in edited bytes.
-  ##
-  ## The `gltfMeshName` argument is reserved for the edit-emission
-  ## path (it lets the emitter find the matching mesh in car.gltf).
-  ## Currently unused — we just return donor bytes verbatim so the
-  ## scaffold is real but conservative.
+proc verbatim(donorBytes: openArray[byte]): seq[byte] =
   result = newSeq[byte](donorBytes.len)
   for i, b in donorBytes: result[i] = b
+
+proc emitCarbinRoundtrip*(donorBytes: openArray[byte],
+                          profile: GameProfile,
+                          gltfPath: string): tuple[bytes: seq[byte]; edited: bool] =
+  ## Re-encode a carbin from the working/ glTF: donor == source == this
+  ## carbin (same car, same game), with vertex POSITIONS sourced from
+  ## `car.gltf` (`transcodeCarbinFromGltf`). A round-trip without edits is
+  ## byte-near-identical — positions are re-quantized through int16, so
+  ## sub-µm drift only. On any failure (non-body carbin, parse/validate
+  ## error, missing mesh) returns donor bytes verbatim with edited=false.
+  try:
+    let r = transcodeCarbinFromGltf(donorBytes, donorBytes, profile, gltfPath)
+    result.bytes = r.bytes
+    result.edited = r.report.sectionsSpliced > 0
+  except CatchableError:
+    result.bytes = verbatim(donorBytes)
+    result.edited = false
 
 proc exportCarbinsFromWorking*(workingDir: string,
                                outDir: string = "",
@@ -90,6 +101,24 @@ proc exportCarbinsFromWorking*(workingDir: string,
         msg.add("  - " & k & "\n")
       raise newException(IOError, msg)
 
+  # Resolve the origin game's profile from carslot.json so the re-encode
+  # validates against the right carbin family. Without it, fall back to
+  # pure passthrough (today's conservative behaviour).
+  var profile: GameProfile
+  var haveProfile = false
+  let carslot = workingDir / "carslot.json"
+  if fileExists(carslot):
+    try:
+      let origin = parseJson(readFile(carslot)){"originGame"}.getStr("")
+      if origin.len > 0:
+        profile = loadProfileById(origin)
+        haveProfile = true
+    except CatchableError as e:
+      result.warnings.add("profile resolve failed: " & e.msg)
+  if not haveProfile:
+    result.warnings.add(
+      "no resolvable originGame profile; carbins pass through verbatim")
+
   let dst = if outDir.len > 0: outDir else: workingDir / "geometry"
   createDir(dst)
 
@@ -101,12 +130,17 @@ proc exportCarbinsFromWorking*(workingDir: string,
       result.warnings.add("empty donor for " & e.name)
       continue
     let baseName = extractFilename(e.name)
-    let stem = if baseName.toLowerAscii().endsWith(".carbin"):
-                 baseName[0 ..< baseName.len - ".carbin".len]
-               else: baseName
-    let bytes = emitCarbinRoundtrip(donor, stem)
+    let bytes =
+      if haveProfile:
+        let er = emitCarbinRoundtrip(donor, profile, gltfPath)
+        result.sectionsCompared.inc
+        if er.edited: result.sectionsEdited.inc
+        else: result.fellThroughToDonor.inc
+        er.bytes
+      else:
+        result.fellThroughToDonor.inc
+        verbatim(donor)
     let regen = dst / baseName & ".regen"
     writeAllBytes(regen, bytes)
     result.carbinsWritten.inc
     result.bytesWritten += bytes.len.int64
-    result.fellThroughToDonor.inc

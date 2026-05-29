@@ -126,7 +126,11 @@ usage:
                                             [--dry-run] [--uninstall]
                                             [--no-hitboxes]
                                             [--lod0-splice-cross-car]
+                                            [--pack-from-gltf]
                                             New-car port via DLC packaging.
+                                            --pack-from-gltf sources geometry
+                                            positions from working/<slug>/car.gltf
+                                            instead of the original carbin pool.
                                             Emits a complete xenia DLC tree
                                             at <content>/<profile-id>/<title>/00000002/<package>/
                                             with zipmount.xml + puboffer +
@@ -579,6 +583,7 @@ proc cmdPortToDlc(args: seq[string]) =
   let uninstall = "--uninstall" in args
   let noHitboxes = "--no-hitboxes" in args
   let lod0SpliceCrossCar = "--lod0-splice-cross-car" in args
+  let packFromGltf = "--pack-from-gltf" in args
   let dlcIdOverride = block:
     let v = parseFlag(args, "--dlc-id")
     if v.len > 0:
@@ -638,7 +643,8 @@ proc cmdPortToDlc(args: seq[string]) =
     return
   try:
     let opts = TranscodeOptions(exportHitboxes: not noHitboxes,
-                                lod0SpliceCrossCar: lod0SpliceCrossCar)
+                                lod0SpliceCrossCar: lod0SpliceCrossCar,
+                                packFromGltf: packFromGltf)
     executePortToDlc(plan, replace = replace, skipMergeSlt = skipMerge,
                       options = opts)
   except DlcPortError as e:
