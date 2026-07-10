@@ -11,6 +11,7 @@
 ## Spec: docs/APPLET_ARCHITECTURE.md §"Phase 2.5 — CLI safety layer".
 
 import std/[os, tables, times]
+import ../core/ioutil
 import ../core/profile
 import ../core/mounts
 import ../core/zip21
@@ -54,13 +55,6 @@ proc planExport*(workingCar: string, mount: Mount, prof: GameProfile): ExportPla
     targetExists: fileExists(target),
     backupExists: fileExists(target & ".bak"))
 
-proc describePlan*(p: ExportPlan): string
-
-proc readBytes(path: string): seq[byte] =
-  let s = readFile(path)
-  result = newSeq[byte](s.len)
-  for i, c in s: result[i] = byte(c)
-
 proc collectEdits(workingCar: string): Table[string, seq[byte]] =
   ## Walk the working tree (textures/, geometry/, livery/, digitalgauge/,
   ## and the root) and pick out files whose mtime is newer than the
@@ -87,7 +81,7 @@ proc collectEdits(workingCar: string): Table[string, seq[byte]] =
     for c in candidates:
       if not fileExists(c): continue
       if getLastModificationTime(c) <= importTime: continue
-      result[e.name] = readBytes(c)
+      result[e.name] = readFileBytes(c)
       break
 
 proc planEdits*(p: ExportPlan): seq[string] =
@@ -138,10 +132,7 @@ proc executeExport*(p: ExportPlan) =
   if edits.len == 0:
     copyFile(p.sourceZip, p.tmpPath)
   else:
-    let bytes = rewriteZipMixedMethod(p.sourceZip, edits)
-    var f = open(p.tmpPath, fmWrite)
-    defer: f.close()
-    if bytes.len > 0: discard f.writeBytes(bytes, 0, bytes.len)
+    writeFileBytes(p.tmpPath, rewriteZipMixedMethod(p.sourceZip, edits))
   if p.targetExists:
     moveFile(p.targetZip, p.backupPath)
   moveFile(p.tmpPath, p.targetZip)

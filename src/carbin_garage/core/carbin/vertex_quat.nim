@@ -22,9 +22,6 @@ proc toShortn*(v: float32): int16 =
   if c <= -1.0'f32: return -32768'i16
   result = int16(round(c * 32767.0))
 
-proc ushortn*(v: uint16): float32 =
-  result = float32(v) / 65535.0'f32
-
 proc toUshortn*(v: float32): uint16 =
   let c = max(0.0'f32, min(1.0'f32, v))
   result = uint16(round(c * 65535.0))

@@ -6,8 +6,7 @@ import context
 import draw
 
 const
-  AnimSecs* = 0.15'f32
-  EaseK     = 0.20'f32   ## per-frame fraction of the remaining gap to close.
+  EaseK = 0.20'f32   ## per-frame fraction of the remaining gap to close.
 
 proc tickFraction*(frac: var float32; opening: bool; dt: float32) =
   ## Animate `frac` toward 1.0 when `opening` is true, else toward 0.0.
@@ -26,12 +25,6 @@ proc modalDim*(ctx: var UiContext; frac: float32; alpha: float32 = 0.55'f32) =
   if frac <= 0: return
   ctx.pushSolid(rect(0, 0, ctx.winW, ctx.winH),
                 color(0.04, 0.05, 0.07, alpha * frac))
-
-proc slideDownPanelRect*(ctx: UiContext; frac: float32;
-                         finalH: float32): Rect =
-  ## Returns the panel rect for a top-anchored slide-down, animated by
-  ## `frac` (0 = hidden, 1 = fully revealed).
-  rect(0, 0, ctx.winW, finalH * frac)
 
 proc settleToCenteredRect*(ctx: UiContext; frac: float32;
                            availableH: float32;

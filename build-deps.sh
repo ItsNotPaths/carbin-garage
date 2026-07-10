@@ -48,6 +48,36 @@ mkdir -p "$OUT/lib" "$OUT/include"
 
 # Skip-if-built sentinels. Mirror the actual build_one calls below — keep
 # in sync if SDL3_image (currently skipped) gets re-enabled.
+# SQLite amalgamation → static libsqlite3.a, built BEFORE the SDL sentinel so a
+# tree that already has the (slow) SDL libs but not libsqlite3.a gets it without
+# re-running the SDL cmake build. Linked into the binary via nim.cfg's
+# --dynlibOverride:sqlite3 — no runtime dependency on a system libsqlite3.so /
+# sqlite3.dll. Minimal feature set on purpose: we only read plain tables from
+# each game's gamedb.slt, so FTS5/RTREE (which drag in libm and complicate
+# static link order) stay off; OMIT_LOAD_EXTENSION keeps it free of any dlopen.
+# Drops into vendor/build/<target>/lib/, which release.sh / release.yml already
+# enumerate into the link --start-group.
+if [ ! -f "$PREFIX/lib/libsqlite3.a" ]; then
+    if [ ! -f "$VENDOR/sqlite/sqlite3.c" ]; then
+        echo "error: vendor/sqlite/sqlite3.c missing — run ./download-deps.sh" >&2
+        exit 1
+    fi
+    SQLITE_CC="gcc"; SQLITE_AR="ar"
+    if [ "$TARGET" = "windows" ]; then
+        if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            echo "error: x86_64-w64-mingw32-gcc not found. Install mingw-w64." >&2
+            exit 1
+        fi
+        SQLITE_CC="x86_64-w64-mingw32-gcc"; SQLITE_AR="x86_64-w64-mingw32-ar"
+    fi
+    echo "==> building sqlite3 ($TARGET)"
+    "$SQLITE_CC" -O2 \
+        -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 \
+        -c "$VENDOR/sqlite/sqlite3.c" -o "$OUT/sqlite3.o"
+    "$SQLITE_AR" rcs "$PREFIX/lib/libsqlite3.a" "$OUT/sqlite3.o"
+    rm -f "$OUT/sqlite3.o"
+fi
+
 if [ -f "$PREFIX/lib/libSDL3.a" ] && \
    [ -f "$PREFIX/lib/libSDL3_ttf.a" ]; then
     echo "==> $TARGET deps already built at $OUT (use --clean to rebuild)"

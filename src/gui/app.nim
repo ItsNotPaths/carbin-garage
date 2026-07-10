@@ -4,6 +4,7 @@
 
 import std/[hashes, os, strformat, strutils]
 import ../render/platform/sdl3
+import ../render/gfx
 import ../render/text as rendertext
 import ui/context
 import ui/draw
@@ -30,10 +31,6 @@ const
   TickIdleMs = 16
   FontData = staticRead("../../vendor/fonts/SpaceMono-Regular.ttf")
   FontPtSize = 16'f32
-
-proc die(msg: string) =
-  stderr.writeLine "fatal: " & msg
-  quit(1)
 
 proc wid(s: string): WidgetId =
   ## Stable WidgetId from a label string. Hand-rolled widget IDs need to be
@@ -133,23 +130,13 @@ proc dispatchMenu(menu: var uimenu.ContextMenu; choice: int;
     app.activeSlug = ""
     ensurePinnedTab(app)
   elif label == "Grab part":
-    # rowName format from rpane: "<slug>::<partName>"; sourceIdx is the
-    # part index inside the active tab so we can pull lodKind+section.
+    # rowName format from rpane: "<slug>::<partName>".
     let sep = menu.rowName.find("::")
     if sep < 0: return
     let slug = menu.rowName[0 ..< sep]
     let partName = menu.rowName[sep+2 .. ^1]
-    var lodKind = ""
-    var section = partName
-    let ti = partsTabIndex(app, slug)
-    if ti >= 0 and menu.sourceIdx >= 0 and
-       menu.sourceIdx < app.partsTabs[ti].parts.len:
-      let pr = app.partsTabs[ti].parts[menu.sourceIdx]
-      lodKind = pr.lodKind
-      section = pr.section
-    app.grab = GrabSlot(active: true, donorSlug: slug, partName: partName,
-                        lodKind: lodKind, section: section)
-    stderr.writeLine &"grab: {slug}::{partName} ({lodKind})"
+    app.grab = GrabSlot(active: true, donorSlug: slug, partName: partName)
+    stderr.writeLine &"grab: {slug}::{partName}"
   elif label == "Replace with grabbed":
     # Pinned-tab-only target enforced by menuItemsForPart. Snapshot host's
     # mutable artefacts, run the swap, append an edits[] entry, refresh
@@ -288,9 +275,9 @@ proc buildFrame(ctx: var UiContext; cache: var TextCache;
   syncPaletteForActiveCar(app)
   tickPaletteStatus(app, ctx.dt)
   let rPane = rpane.paneRect(ctx.winW, ctx.winH, stripH, dropupH)
-  discard drawRPane(ctx, cache, app, frame.menu, rPane)
+  drawRPane(ctx, cache, app, frame.menu, rPane)
   let lPane = lpane.paneRect(ctx.winW, ctx.winH, stripH, dropupH)
-  discard drawLPane(ctx, cache, app, lPane)
+  drawLPane(ctx, cache, app, lPane)
 
   # Bottom-middle export palette — floats above the dropup strip when a
   # working car is loaded. Drawn after the panes so it overlays them when

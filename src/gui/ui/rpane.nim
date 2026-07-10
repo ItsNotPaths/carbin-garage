@@ -19,7 +19,6 @@ const
   TabStripBg      = (0.08'f32, 0.10'f32, 0.13'f32, 0.95'f32)
   RowH            = 22.0'f32
   RowPadX         = 12.0'f32
-  EmptyDimColor   = (0.55'f32, 0.58'f32, 0.65'f32, 1.0'f32)
 
   LodKindChipBg   = (0.20'f32, 0.24'f32, 0.30'f32, 0.85'f32)
   LodKindChipPadX = 6.0'f32
@@ -27,9 +26,6 @@ const
 
   SearchH         = 24.0'f32
   SearchPad       = 4.0'f32
-
-proc rowWid(slug, partName: string): WidgetId =
-  WidgetId(hash("rpane.row." & slug & "/" & partName))
 
 proc searchWid(slug: string): WidgetId =
   WidgetId(hash("rpane.search." & slug))
@@ -108,12 +104,10 @@ proc drawRow(ctx: var UiContext; cache: var TextCache;
 
 proc drawRPane*(ctx: var UiContext; cache: var TextCache;
                 app: var AppState; menu: var ContextMenu;
-                pane: Rect): tuple[tabRightClicked, partRightClicked: int] =
-  ## Renders the pane background, tab strip, and parts list. Returns the
-  ## indices of right-click events the caller should dispatch. (The menu
-  ## is populated for parts inline; tab right-click is reported via the
-  ## return so the caller can build the tab-specific menu.)
-  result = (-1, -1)
+                pane: Rect) =
+  ## Renders the pane background, tab strip, and parts list. Right-click
+  ## events populate `menu` inline (tab-specific and part-specific items);
+  ## the caller dispatches the chosen item.
   let (br, bg, bb, ba) = PaneBg
   ctx.pushSolid(pane, color(br, bg, bb, ba))
 
@@ -122,8 +116,6 @@ proc drawRPane*(ctx: var UiContext; cache: var TextCache;
   ctx.pushSolid(stripR, color(tr, tg, tb, ta))
 
   if app.partsTabs.len == 0:
-    let (er, eg, eb, ea) = EmptyDimColor
-    discard (er, eg, eb, ea)
     ctx.pushLabel(cache, "no car loaded — right-click a working/ row",
                   pane.x + 12, pane.y + 12)
     return
@@ -132,12 +124,11 @@ proc drawRPane*(ctx: var UiContext; cache: var TextCache;
   var tabItems: seq[TabItem] = @[]
   for t in app.partsTabs:
     tabItems.add TabItem(label: prettyDisplayName(t.slug),
-                         pinned: t.pinned, accent: false)
+                         pinned: t.pinned)
   let tabsRes = drawTabStrip(ctx, cache, stripR, tabItems, app.activeTab)
   if tabsRes.active >= 0 and tabsRes.active != app.activeTab:
     app.activeTab = tabsRes.active
   if tabsRes.rightClicked >= 0:
-    result.tabRightClicked = tabsRes.rightClicked
     menu.open      = true
     menu.anchorX   = ctx.mouseX
     menu.anchorY   = ctx.mouseY
@@ -187,8 +178,7 @@ proc drawRPane*(ctx: var UiContext; cache: var TextCache;
     if yOff < 0 or yOff + RowH > usableH: continue
     let pi = filtered[j]
     let rRect = rect(listR.x, listR.y + yOff, listR.w, RowH)
-    if drawRow(ctx, cache, tab[].parts[pi], rRect, isPinned,
-               app.grab.active, menu, tab[].slug, pi):
-      result.partRightClicked = pi
+    discard drawRow(ctx, cache, tab[].parts[pi], rRect, isPinned,
+                    app.grab.active, menu, tab[].slug, pi)
 
   drawScrollbar(ctx, ss, listR, contentH)

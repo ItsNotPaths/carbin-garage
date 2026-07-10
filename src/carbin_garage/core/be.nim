@@ -61,13 +61,19 @@ proc u16*(r: var BEReader): uint16 =
   bigEndian16(addr result, addr be[0])
   r.pos += 2
 
-proc i16*(r: var BEReader): int16 =
-  let v = r.u16()
-  result = cast[int16](v)
-
 proc f32*(r: var BEReader): float32 =
   let bits = r.u32()
   result = cast[float32](bits)
+
+proc beU32At*(data: openArray[byte], pos: int): uint32 =
+  ## Read a big-endian u32 at an absolute offset (no reader state).
+  if pos < 0 or pos + 4 > data.len:
+    raise newException(IOError, "read past EOF")
+  (uint32(data[pos]) shl 24) or (uint32(data[pos + 1]) shl 16) or
+  (uint32(data[pos + 2]) shl 8) or uint32(data[pos + 3])
+
+proc beF32At*(data: openArray[byte], pos: int): float32 =
+  cast[float32](beU32At(data, pos))
 
 proc asciiLen8*(r: var BEReader): tuple[s: string; lenPos, endPos: int] =
   let lenPos = r.tell()
@@ -108,9 +114,3 @@ proc bePackU16*(x: uint16): array[2, byte] =
 proc writeU32*(buf: var seq[byte], offset: int, x: uint32) =
   let packed = bePackU32(x)
   for i in 0 .. 3: buf[offset + i] = packed[i]
-
-proc writeI32*(buf: var seq[byte], offset: int, x: int32) =
-  writeU32(buf, offset, cast[uint32](x))
-
-proc writeF32*(buf: var seq[byte], offset: int, x: float32) =
-  writeU32(buf, offset, cast[uint32](x))

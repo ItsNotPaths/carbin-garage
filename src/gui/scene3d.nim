@@ -242,95 +242,72 @@ proc createPipelines(dev: ptr SDL_GPUDevice;
                      tuple[opaque, transparent: ptr SDL_GPUGraphicsPipeline] =
   ## Two pipelines sharing the scene shader: opaque (depth-write on,
   ## no blend) and transparent (depth-test on but no write, SRC_ALPHA /
-  ## 1-SRC_ALPHA blend). Inlined per pipeline so each gets its own
-  ## SDL_GPUColorTargetDescription with the right address embedded —
-  ## a closure capturing a `var` parameter would obscure that lifetime.
+  ## 1-SRC_ALPHA blend).
   let vsh = loadShaderBytes(dev, SceneVertSpv, SDL_GPU_SHADERSTAGE_VERTEX,
                             numUniforms = 1, tag = "scene.vert")
   let fsh = loadShaderBytes(dev, SceneFragSpv, SDL_GPU_SHADERSTAGE_FRAGMENT,
                             numUniforms = 2, numSamplers = 1, tag = "scene.frag")
 
-  var vbDesc: SDL_GPUVertexBufferDescription
-  vbDesc.slot       = 0
-  vbDesc.pitch      = SceneVertexStride
-  vbDesc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
+  proc makeScenePipeline(transparent: bool): ptr SDL_GPUGraphicsPipeline =
+    # All descriptors live inside this proc so every `addr` below points at
+    # locals that stay alive for the duration of the create call.
+    var vbDesc: SDL_GPUVertexBufferDescription
+    vbDesc.slot       = 0
+    vbDesc.pitch      = SceneVertexStride
+    vbDesc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
 
-  var attrs: array[4, SDL_GPUVertexAttribute]
-  attrs[0].location = 0
-  attrs[0].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3
-  attrs[0].offset   = 0
-  attrs[1].location = 1
-  attrs[1].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3
-  attrs[1].offset   = 12
-  attrs[2].location = 2
-  attrs[2].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2
-  attrs[2].offset   = 24
-  attrs[3].location = 3
-  attrs[3].format   = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM
-  attrs[3].offset   = 32
+    var attrs: array[4, SDL_GPUVertexAttribute]
+    attrs[0].location = 0
+    attrs[0].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3
+    attrs[0].offset   = 0
+    attrs[1].location = 1
+    attrs[1].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3
+    attrs[1].offset   = 12
+    attrs[2].location = 2
+    attrs[2].format   = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2
+    attrs[2].offset   = 24
+    attrs[3].location = 3
+    attrs[3].format   = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM
+    attrs[3].offset   = 32
 
-  # ── Opaque ────────────────────────────────────────────────────────────
-  var opaqueColor: SDL_GPUColorTargetDescription
-  opaqueColor.format = swapFormat
+    var colorDesc: SDL_GPUColorTargetDescription
+    colorDesc.format = swapFormat
+    if transparent:
+      colorDesc.blend_state.enable_blend          = true
+      colorDesc.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA
+      colorDesc.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
+      colorDesc.blend_state.color_blend_op        = SDL_GPU_BLENDOP_ADD
+      colorDesc.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE
+      colorDesc.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
+      colorDesc.blend_state.alpha_blend_op        = SDL_GPU_BLENDOP_ADD
 
-  var opaqueInfo: SDL_GPUGraphicsPipelineCreateInfo
-  opaqueInfo.vertex_shader   = vsh
-  opaqueInfo.fragment_shader = fsh
-  opaqueInfo.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST
-  opaqueInfo.vertex_input_state.vertex_buffer_descriptions = addr vbDesc
-  opaqueInfo.vertex_input_state.num_vertex_buffers         = 1
-  opaqueInfo.vertex_input_state.vertex_attributes          = addr attrs[0]
-  opaqueInfo.vertex_input_state.num_vertex_attributes      = 4
-  opaqueInfo.rasterizer_state.fill_mode  = SDL_GPU_FILLMODE_FILL
-  opaqueInfo.rasterizer_state.cull_mode  = SDL_GPU_CULLMODE_NONE
-  opaqueInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE
-  opaqueInfo.multisample_state.sample_count        = SDL_GPU_SAMPLECOUNT_1
-  opaqueInfo.depth_stencil_state.compare_op        = SDL_GPU_COMPAREOP_LESS
-  opaqueInfo.depth_stencil_state.enable_depth_test = true
-  opaqueInfo.depth_stencil_state.enable_depth_write = true
-  opaqueInfo.target_info.num_color_targets         = 1
-  opaqueInfo.target_info.color_target_descriptions = addr opaqueColor
-  opaqueInfo.target_info.has_depth_stencil_target  = true
-  opaqueInfo.target_info.depth_stencil_format      = SDL_GPU_TEXTUREFORMAT_D32_FLOAT
+    var info: SDL_GPUGraphicsPipelineCreateInfo
+    info.vertex_shader   = vsh
+    info.fragment_shader = fsh
+    info.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST
+    info.vertex_input_state.vertex_buffer_descriptions = addr vbDesc
+    info.vertex_input_state.num_vertex_buffers         = 1
+    info.vertex_input_state.vertex_attributes          = addr attrs[0]
+    info.vertex_input_state.num_vertex_attributes      = 4
+    info.rasterizer_state.fill_mode  = SDL_GPU_FILLMODE_FILL
+    info.rasterizer_state.cull_mode  = SDL_GPU_CULLMODE_NONE
+    info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE
+    info.multisample_state.sample_count        = SDL_GPU_SAMPLECOUNT_1
+    info.depth_stencil_state.compare_op        = SDL_GPU_COMPAREOP_LESS
+    info.depth_stencil_state.enable_depth_test = true
+    info.depth_stencil_state.enable_depth_write = not transparent
+    info.target_info.num_color_targets         = 1
+    info.target_info.color_target_descriptions = addr colorDesc
+    info.target_info.has_depth_stencil_target  = true
+    info.target_info.depth_stencil_format      = SDL_GPU_TEXTUREFORMAT_D32_FLOAT
 
-  result.opaque = SDL_CreateGPUGraphicsPipeline(dev, addr opaqueInfo)
-  if result.opaque == nil:
-    die("SDL_CreateGPUGraphicsPipeline(scene-opaque)")
+    result = SDL_CreateGPUGraphicsPipeline(dev, addr info)
+    if result == nil:
+      die("SDL_CreateGPUGraphicsPipeline(scene-" &
+          (if transparent: "transparent" else: "opaque") & ")")
 
-  # ── Transparent ───────────────────────────────────────────────────────
-  var blendColor: SDL_GPUColorTargetDescription
-  blendColor.format = swapFormat
-  blendColor.blend_state.enable_blend          = true
-  blendColor.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA
-  blendColor.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
-  blendColor.blend_state.color_blend_op        = SDL_GPU_BLENDOP_ADD
-  blendColor.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE
-  blendColor.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
-  blendColor.blend_state.alpha_blend_op        = SDL_GPU_BLENDOP_ADD
-
-  var transInfo: SDL_GPUGraphicsPipelineCreateInfo
-  transInfo.vertex_shader   = vsh
-  transInfo.fragment_shader = fsh
-  transInfo.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST
-  transInfo.vertex_input_state.vertex_buffer_descriptions = addr vbDesc
-  transInfo.vertex_input_state.num_vertex_buffers         = 1
-  transInfo.vertex_input_state.vertex_attributes          = addr attrs[0]
-  transInfo.vertex_input_state.num_vertex_attributes      = 4
-  transInfo.rasterizer_state.fill_mode  = SDL_GPU_FILLMODE_FILL
-  transInfo.rasterizer_state.cull_mode  = SDL_GPU_CULLMODE_NONE
-  transInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE
-  transInfo.multisample_state.sample_count        = SDL_GPU_SAMPLECOUNT_1
-  transInfo.depth_stencil_state.compare_op        = SDL_GPU_COMPAREOP_LESS
-  transInfo.depth_stencil_state.enable_depth_test = true
-  transInfo.depth_stencil_state.enable_depth_write = false
-  transInfo.target_info.num_color_targets         = 1
-  transInfo.target_info.color_target_descriptions = addr blendColor
-  transInfo.target_info.has_depth_stencil_target  = true
-  transInfo.target_info.depth_stencil_format      = SDL_GPU_TEXTUREFORMAT_D32_FLOAT
-
-  result.transparent = SDL_CreateGPUGraphicsPipeline(dev, addr transInfo)
-  if result.transparent == nil:
-    die("SDL_CreateGPUGraphicsPipeline(scene-transparent)")
+  result.opaque      = makeScenePipeline(transparent = false)
+  result.transparent = makeScenePipeline(transparent = true)
 
   SDL_ReleaseGPUShader(dev, vsh)
   SDL_ReleaseGPUShader(dev, fsh)

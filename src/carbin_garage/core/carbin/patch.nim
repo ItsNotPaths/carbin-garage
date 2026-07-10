@@ -1,7 +1,7 @@
 ## Subsection-level surgical patches. Port of probe/reference/fm4carbin/patch.py.
-## Used by builders + future stat / transcoding ops.
+## Used by builders + section_edit.
 
-import std/[strutils, tables, endians]
+import std/endians
 import ../be
 import ./model
 
@@ -21,7 +21,6 @@ proc patchSectionNameRescan*(sectionBytes: openArray[byte], newName: string): se
   r.seek(12, 1)
   let lenPos = r.tell()
   let nameLen = int(r.u8())
-  let nameStart = r.tell()
   r.seek(nameLen, 1)
   let nameEnd = r.tell()
   if nameEnd > sectionBytes.len: return @sectionBytes
@@ -33,7 +32,6 @@ proc patchSectionNameRescan*(sectionBytes: openArray[byte], newName: string): se
   let tailStart = lenPos + 1 + nb.len
   for i in 0 ..< sectionBytes.len - nameEnd:
     result[tailStart + i] = sectionBytes[nameEnd + i]
-  discard nameStart  # silence unused
 
 proc patchSubsectionName*(ssBytes: openArray[byte], ss: SubSectionInfo,
                           newName: string): seq[byte] =
@@ -218,13 +216,3 @@ proc sanitize32bitRestartMarkers*(ssBytes: openArray[byte],
   for i in 0 ..< relIdxDataStart: result.bytes[i] = ssBytes[i]
   for i in 0 ..< n * 4: result.bytes[relIdxDataStart + i] = idx[i]
   for i in relIdxDataEnd ..< ssBytes.len: result.bytes[i] = ssBytes[i]
-
-proc parseRenameMap*(text: string): Table[string, string] =
-  for raw in text.splitLines():
-    let line = raw.strip()
-    if line.len == 0 or line.startsWith("#"): continue
-    if not ('=' in line): continue
-    let parts = line.split('=', 1)
-    let a = parts[0].strip()
-    let b = parts[1].strip()
-    if a.len > 0: result[a] = b

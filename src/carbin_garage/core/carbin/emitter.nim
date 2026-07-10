@@ -1,33 +1,24 @@
-## glTF → carbin re-emit (Stage 2 of export refactor).
+## glTF → carbin re-emit (`export-carbin` CLI verb).
 ##
-## Strategy: donor-splice from `.archive/source.zip`. Stage 1 already
-## stashes the source zip at import time — that gives us the byte-level
-## ground truth for every carbin. The emitter:
+## Strategy: donor-splice from `.archive/source.zip`, which Stage 1
+## stashes at import time as the byte-level ground truth. For every
+## `.carbin` entry in the stash, run it through
+## `transcodeCarbinFromGltf` (donor == source == this carbin, vertex
+## POSITIONS re-packed from `working/<slug>/car.gltf`) and write
+## `working/<slug>/geometry/<name>.carbin.regen` next to the original
+## (kept for diffing; doesn't overwrite production geometry/<name>.carbin).
 ##
-##   1. Opens `working/<slug>/.archive/source.zip`.
-##   2. Lists every entry whose name ends with `.carbin`.
-##   3. For each carbin: extracts donor bytes; (TODO: compares each
-##      glTF section's vertex floats against the decoded donor pool;
-##      re-encodes only changed bytes) returns the bytes.
-##   4. Writes `working/<slug>/geometry/<name>.carbin.regen` next to the
-##      original (kept for diffing; doesn't overwrite production
-##      geometry/<name>.carbin yet).
+## Any per-carbin failure (non-body carbin, parse/validate error,
+## missing mesh in the glTF) falls back to donor bytes verbatim, so
+## a round-trip without edits stays byte-near-identical (positions
+## re-quantize through int16 — sub-µm drift only).
 ##
-## Round-trip without edits: byte-equal trivially because the emitter
-## returns donor bytes verbatim until edit-emission lands.
-##
-## Round-trip with edits: TODO — currently flagged via a warning and
-## still returns donor bytes. Edit-emission requires a vertex encode
-## path that matches the original game's quantizer; `core/carbin/vertex.nim`
-## has `encodeVertex` but it's untested in production. Documented in
-## stage2-gltf-to-carbin.md § 2.1.
-##
-## Stage 1 prereq guard: refuses to run if validateRoundtripExtras
+## `--strict` pre-flight: refuses to run if validateRoundtripExtras
 ## reports any missing keys (the glTF wasn't produced by Stage-1-aware
-## importwc). That gate enforces forward-compat: the day edit-emission
-## lands, every Stage-1 glTF will already have what it needs.
+## importwc).
 
 import std/[json, os, strutils]
+import ../ioutil
 import ../zip21
 import ../gltf
 import ../profile
@@ -38,22 +29,12 @@ type
     carbinsWritten*: int
     bytesWritten*: int64
     warnings*: seq[string]
-    sectionsCompared*: int
-    sectionsEdited*: int        # reserved for future edit-emission
-    fellThroughToDonor*: int    # how many sections we didn't touch
+    sectionsCompared*: int      # carbins run through the glTF re-encode
+    sectionsEdited*: int        # carbins where at least one section spliced
+    fellThroughToDonor*: int    # carbins returned as donor bytes verbatim
 
 proc isCarbinName(name: string): bool =
   name.toLowerAscii().endsWith(".carbin")
-
-proc writeAllBytes(path: string, data: openArray[byte]) =
-  ## Convenience: bytes → file. Mirrors importwc.nim's helper.
-  var f = open(path, fmWrite)
-  defer: f.close()
-  if data.len > 0: discard f.writeBytes(data, 0, data.len)
-
-proc verbatim(donorBytes: openArray[byte]): seq[byte] =
-  result = newSeq[byte](donorBytes.len)
-  for i, b in donorBytes: result[i] = b
 
 proc emitCarbinRoundtrip*(donorBytes: openArray[byte],
                           profile: GameProfile,
@@ -69,7 +50,7 @@ proc emitCarbinRoundtrip*(donorBytes: openArray[byte],
     result.bytes = r.bytes
     result.edited = r.report.sectionsSpliced > 0
   except CatchableError:
-    result.bytes = verbatim(donorBytes)
+    result.bytes = @donorBytes
     result.edited = false
 
 proc exportCarbinsFromWorking*(workingDir: string,
@@ -139,8 +120,8 @@ proc exportCarbinsFromWorking*(workingDir: string,
         er.bytes
       else:
         result.fellThroughToDonor.inc
-        verbatim(donor)
+        donor
     let regen = dst / baseName & ".regen"
-    writeAllBytes(regen, bytes)
+    writeFileBytes(regen, bytes)
     result.carbinsWritten.inc
     result.bytesWritten += bytes.len.int64

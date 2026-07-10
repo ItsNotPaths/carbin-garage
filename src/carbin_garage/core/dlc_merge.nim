@@ -69,6 +69,7 @@
 
 import std/[json, os, sets, strutils, tables]
 import db_connector/db_sqlite
+import ./sqlite_util
 
 type
   DlcMergeError* = object of CatchableError
@@ -150,11 +151,8 @@ const
   ]
 
 # ---- helpers ----
-
-proc qIdent(name: string): string =
-  ## SQLite delimited identifier. Required because real Forza schemas
-  ## use `:` and `-` in column names (e.g. `Time:0-60-sec`).
-  result = "\"" & name.replace("\"", "\"\"") & "\""
+# quoteIdent (né qIdent) / tableColumnNames / tableHasColumn /
+# jsonToSqlString / snippetRowsForTable now come from ./sqlite_util.
 
 proc tableExists(db: DbConn, tbl: string): bool =
   for r in db.fastRows(
@@ -172,30 +170,21 @@ proc createTableSql(srcDb: DbConn, tbl: string): string =
   raise newException(DlcMergeError,
     "table not found in source gamedb: " & tbl)
 
-proc tableColumnNames(db: DbConn, tbl: string): seq[string] =
-  for r in db.fastRows(sql("PRAGMA table_info(" & tbl & ")")):
-    if r.len >= 2: result.add(r[1])
-
-proc hasColumn(db: DbConn, tbl, col: string): bool =
-  for c in tableColumnNames(db, tbl):
-    if c == col: return true
-  return false
-
 proc keyColFor(db: DbConn, tbl: string): string =
   ## Per-car / per-engine key. Order matters: MediaName first (most
   ## specific), then EngineID-keyed engine-upgrade tables, then Ordinal,
   ## then CarId/CarID. List_TorqueCurve has no key match here — handled
   ## as a special case (key on TorqueCurveID range).
-  if hasColumn(db, tbl, "MediaName"): return "MediaName"
-  if hasColumn(db, tbl, "EngineID"):
+  if tableHasColumn(db, tbl, "MediaName"): return "MediaName"
+  if tableHasColumn(db, tbl, "EngineID"):
     # EngineID + Ordinal both: for the chassis tables that key on
     # Ordinal but happen to also carry an EngineID column, prefer
     # Ordinal. Engine-upgrade tables don't carry Ordinal.
-    if hasColumn(db, tbl, "Ordinal"): return "Ordinal"
+    if tableHasColumn(db, tbl, "Ordinal"): return "Ordinal"
     return "EngineID"
-  if hasColumn(db, tbl, "Ordinal"): return "Ordinal"
-  if hasColumn(db, tbl, "CarId"):   return "CarId"
-  if hasColumn(db, tbl, "CarID"):   return "CarID"
+  if tableHasColumn(db, tbl, "Ordinal"): return "Ordinal"
+  if tableHasColumn(db, tbl, "CarId"):   return "CarId"
+  if tableHasColumn(db, tbl, "CarID"):   return "CarID"
   return ""
 
 const RewritableIdColumnsLower = [
@@ -313,33 +302,6 @@ proc rewriteCell(colName, value: string, rw: IdRewrite,
     return rewriteId(value, rw)
   return value
 
-proc jsonToSqlString(v: JsonNode): string =
-  ## Project a snippet JSON cell value to the string form db_connector
-  ## binds. Mirrors cardb_writer.jsonToSqlString.
-  if v.isNil or v.kind == JNull: return ""
-  case v.kind
-  of JString: return v.getStr
-  of JInt: return $v.getInt
-  of JFloat: return $v.getFloat
-  of JBool: return (if v.getBool: "1" else: "0")
-  else: return $v
-
-proc snippetRowsForTable(snippet: JsonNode, tbl: string):
-                         seq[Table[string, JsonNode]] =
-  ## Pull `snippet.tables.<tbl>.rows` as a sequence of column→json maps.
-  ## Returns empty if the snippet doesn't carry rows for this table.
-  if snippet.isNil or snippet.kind != JObject: return
-  if not snippet.hasKey("tables"): return
-  let tables = snippet["tables"]
-  if not tables.hasKey(tbl): return
-  let entry = tables[tbl]
-  if not entry.hasKey("rows"): return
-  for r in entry["rows"]:
-    if r.kind != JObject: continue
-    var row = initTable[string, JsonNode]()
-    for k, v in r.pairs: row[k] = v
-    result.add(row)
-
 # ---- ID allocation ----
 
 ## ID allocation: pick UNUSED slots WITHIN base's range. FH1 only
@@ -429,6 +391,39 @@ proc baseRange(srcDb: DbConn, table, idCol: string): tuple[lo, hi: int] =
       try: result.lo = parseInt(r[0]) except CatchableError: discard
       try: result.hi = parseInt(r[1]) except CatchableError: discard
 
+proc findUnusedId(srcDb: DbConn, table, idCol: string, dlcId: int,
+                  extraSlts: openArray[string],
+                  fallbackId, pickMultiplier: int,
+                  withAliasCarSlots: bool): int =
+  ## Shared free-ID scanner behind findUnusedCarId / findUnusedEngineId /
+  ## findUnusedWheelId. Collects used IDs across base + sibling DLC
+  ## merge.slts, walks DOWN from base's max collecting up to 64 free
+  ## slots, then picks `freeSlots[(dlcId * pickMultiplier) mod len]` so
+  ## re-running the same port gets the same ID deterministically while
+  ## sibling DLCs (different dlcIds) land on different slots.
+  ## `withAliasCarSlots` additionally blocks carId*1000 sub-id buckets
+  ## occupied by shared-FK tables (see collectAliasCarSlots) — only
+  ## meaningful for the Data_Car.Id scan.
+  let usedSet = collectUsedIds(srcDb, table, idCol, extraSlts)
+  let aliasSet =
+    if withAliasCarSlots: collectAliasCarSlots(srcDb, extraSlts)
+    else: initHashSet[int]()
+  let blocked = usedSet + aliasSet
+  let (lo, hi) = baseRange(srcDb, table, idCol)
+  if hi < 0: return fallbackId
+  var freeSlots: seq[int] = @[]
+  for i in countdown(hi, lo):
+    if i notin blocked:
+      freeSlots.add(i)
+      if freeSlots.len >= 64: break
+  if freeSlots.len == 0:
+    var msg = "no free " & table & "." & idCol &
+              " slot in base range [" & $lo & ", " & $hi & "]"
+    if withAliasCarSlots:
+      msg.add " (used=" & $usedSet.len & " alias=" & $aliasSet.len & ")"
+    raise newException(DlcMergeError, msg)
+  result = freeSlots[(dlcId * pickMultiplier) mod freeSlots.len]
+
 proc findUnusedCarId(srcDb: DbConn, dlcId: int,
                      extraSlts: openArray[string] = []): int =
   ## Picks a carId that's not in Data_Car.Id AND not aliased as a
@@ -437,36 +432,15 @@ proc findUnusedCarId(srcDb: DbConn, dlcId: int,
   ## merge.slt whose List_UpgradeCarBodyFrontBumper / List_UpgradeRearWing
   ## rows reference AeroPhysicsIDs that ALREADY EXIST in base gamedb and
   ## belong to a different car, breaking FK joins at car-load time.
-  let usedSet = collectUsedIds(srcDb, "Data_Car", "Id", extraSlts)
-  let aliasSet = collectAliasCarSlots(srcDb, extraSlts)
-  let blocked = usedSet + aliasSet
-  let (lo, hi) = baseRange(srcDb, "Data_Car", "Id")
-  if hi < 0: return 1500
-  var freeSlots: seq[int] = @[]
-  for i in countdown(hi, lo):
-    if i notin blocked:
-      freeSlots.add(i)
-      if freeSlots.len >= 64: break
-  if freeSlots.len == 0:
-    raise newException(DlcMergeError,
-      "no free Data_Car.Id slot in base range [" & $lo & ", " & $hi & "] " &
-      "(used=" & $usedSet.len & " alias=" & $aliasSet.len & ")")
-  result = freeSlots[dlcId mod freeSlots.len]
+  findUnusedId(srcDb, "Data_Car", "Id", dlcId, extraSlts,
+               fallbackId = 1500, pickMultiplier = 1,
+               withAliasCarSlots = true)
 
 proc findUnusedEngineId(srcDb: DbConn, dlcId: int,
                         extraSlts: openArray[string] = []): int =
-  let usedSet = collectUsedIds(srcDb, "Data_Engine", "EngineID", extraSlts)
-  let (lo, hi) = baseRange(srcDb, "Data_Engine", "EngineID")
-  if hi < 0: return 500
-  var freeSlots: seq[int] = @[]
-  for i in countdown(hi, lo):
-    if i notin usedSet:
-      freeSlots.add(i)
-      if freeSlots.len >= 64: break
-  if freeSlots.len == 0:
-    raise newException(DlcMergeError,
-      "no free Data_Engine.EngineID slot in base range [" & $lo & ", " & $hi & "]")
-  result = freeSlots[(dlcId * 7919) mod freeSlots.len]
+  findUnusedId(srcDb, "Data_Engine", "EngineID", dlcId, extraSlts,
+               fallbackId = 500, pickMultiplier = 7919,
+               withAliasCarSlots = false)
 
 proc findUnusedWheelId(srcDb: DbConn, dlcId: int,
                        extraSlts: openArray[string] = []): int =
@@ -479,26 +453,13 @@ proc findUnusedWheelId(srcDb: DbConn, dlcId: int,
   ## that gets passed through into a HostPathDevice path lookup → infinite
   ## load on free-roam resume. Bug isolated 2026-05-02 PM (RAD_SR8LM_10
   ## TEST DLC).
-  let usedSet = collectUsedIds(srcDb, "List_Wheels", "ID", extraSlts)
-  let (lo, hi) = baseRange(srcDb, "List_Wheels", "ID")
-  if hi < 0: return 100000
-  # Search above base's max — wheel IDs aren't in carId*1000 alias space,
-  # so anywhere outside the existing range is safe. Stay near base for
-  # debuggability; bias by (dlcId * 9007) so sibling DLCs don't collide.
-  var freeSlots: seq[int] = @[]
-  for i in countdown(hi, lo):
-    if i notin usedSet:
-      freeSlots.add(i)
-      if freeSlots.len >= 64: break
-  if freeSlots.len == 0:
-    raise newException(DlcMergeError,
-      "no free List_Wheels.ID slot in base range [" & $lo & ", " & $hi & "]")
-  result = freeSlots[(dlcId * 9007) mod freeSlots.len]
-
-# Kept for back-compat with the smoke test; both now defer to the
-# in-base-range allocators above when called with a real srcDb context.
-proc allocateCarId*(dlcId: int): int = 1600 + (dlcId mod 400)
-proc allocateEngineId*(dlcId: int): int = 1100 + (dlcId mod 400)
+  ##
+  ## Wheel IDs aren't in carId*1000 alias space, so anywhere outside the
+  ## existing range is safe. Stay near base for debuggability; bias by
+  ## (dlcId * 9007) so sibling DLCs don't collide.
+  findUnusedId(srcDb, "List_Wheels", "ID", dlcId, extraSlts,
+               fallbackId = 100000, pickMultiplier = 9007,
+               withAliasCarSlots = false)
 
 # ---- main builder ----
 
@@ -563,9 +524,9 @@ proc selectDonorRows(srcDb: DbConn, tbl, keyCol: string, rw: IdRewrite):
         else: rw.donorCarId
       let lo = $(parentId * 1000)
       let hi = $((parentId + 1) * 1000)
-      let q = "SELECT * FROM " & qIdent(tbl) &
-              " WHERE " & qIdent(entry.idCol) & " >= ? AND " &
-              qIdent(entry.idCol) & " < ?"
+      let q = "SELECT * FROM " & quoteIdent(tbl) &
+              " WHERE " & quoteIdent(entry.idCol) & " >= ? AND " &
+              quoteIdent(entry.idCol) & " < ?"
       for r in srcDb.fastRows(sql(q), lo, hi):
         result.add(r)
       return
@@ -576,7 +537,7 @@ proc selectDonorRows(srcDb: DbConn, tbl, keyCol: string, rw: IdRewrite):
   of "Ordinal", "CarId", "CarID": keyVal = $rw.donorCarId
   of "EngineID": keyVal = $rw.donorEngineId
   else: return
-  let q = "SELECT * FROM " & qIdent(tbl) & " WHERE " & qIdent(keyCol) & "=?"
+  let q = "SELECT * FROM " & quoteIdent(tbl) & " WHERE " & quoteIdent(keyCol) & "=?"
   for r in srcDb.fastRows(sql(q), keyVal):
     result.add(r)
 
@@ -598,9 +559,9 @@ proc insertRow(dstDb: DbConn, tbl: string, colNames: seq[string],
   var colSqls: seq[string] = @[]
   var placeholders: seq[string] = @[]
   for c in colNames:
-    colSqls.add(qIdent(c))
+    colSqls.add(quoteIdent(c))
     placeholders.add("?")
-  let q = "INSERT INTO " & qIdent(tbl) & " (" & colSqls.join(", ") &
+  let q = "INSERT INTO " & quoteIdent(tbl) & " (" & colSqls.join(", ") &
           ") VALUES (" & placeholders.join(", ") & ")"
   var bound: seq[string] = @[]
   for i, c in colNames:

@@ -1,4 +1,4 @@
-# Hand-written SDL3 / SDL3_image / SDL3_mixer shim for the triangle prototype.
+# Hand-written SDL3 / SDL3_ttf shim.
 #
 # Opaque handle types plus just enough create-info structs to stand up the GPU
 # pipeline. Fields use the exact spellings from the C headers so Nim's codegen
@@ -9,8 +9,6 @@
 const
   SDL_Header      = "SDL3/SDL.h"
   SDL_GPUHeader   = "SDL3/SDL_gpu.h"
-  SDL_ImageHeader = "SDL3_image/SDL_image.h"
-  SDL_MixerHeader = "SDL3_mixer/SDL_mixer.h"
   SDL_TTFHeader   = "SDL3_ttf/SDL_ttf.h"
 
 type
@@ -47,15 +45,12 @@ type
   SDL_IOStream* {.importc: "SDL_IOStream", header: SDL_Header, incompleteStruct.} = object
 
 const
-  SDL_INIT_AUDIO* = 0x00000010'u32
   SDL_INIT_VIDEO* = 0x00000020'u32
   SDL_EVENT_QUIT*        = 0x100'u32
   SDL_EVENT_KEY_DOWN*    = 0x300'u32
   SDL_EVENT_KEY_UP*      = 0x301'u32
   SDL_EVENT_TEXT_INPUT*  = 0x303'u32
   SDL_EVENT_MOUSE_WHEEL* = 0x403'u32
-  SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK*  = 0xFFFFFFFF'u32
-  SDL_AUDIO_DEVICE_DEFAULT_RECORDING* = 0xFFFFFFFE'u32
 
 type
   SDL_MouseWheelEvent* {.importc: "SDL_MouseWheelEvent", header: SDL_Header, bycopy.} = object
@@ -613,13 +608,6 @@ proc SDL_GetClipboardText*(): cstring {.importc, header: SDL_Header.}
 proc SDL_free*(p: pointer) {.importc, header: SDL_Header.}
 
 # ---------------------------------------------------------------------------
-# SDL3_image
-
-proc IMG_Load*(file: cstring): ptr SDL_Surface {.importc, header: SDL_ImageHeader.}
-proc IMG_Load_IO*(src: ptr SDL_IOStream; closeio: bool): ptr SDL_Surface
-  {.importc, header: SDL_ImageHeader.}
-
-# ---------------------------------------------------------------------------
 # SDL3_ttf
 
 type
@@ -633,27 +621,3 @@ proc TTF_CloseFont*(font: ptr TTF_Font) {.importc, header: SDL_TTFHeader.}
 proc TTF_RenderText_Blended*(font: ptr TTF_Font; text: cstring; length: csize_t;
                              fg: SDL_Color): ptr SDL_Surface
   {.importc, header: SDL_TTFHeader.}
-
-# ---------------------------------------------------------------------------
-# SDL3_mixer
-
-type
-  MIX_Mixer* {.importc: "MIX_Mixer", header: SDL_MixerHeader, incompleteStruct.} = object
-  MIX_Audio* {.importc: "MIX_Audio", header: SDL_MixerHeader, incompleteStruct.} = object
-  MIX_Track* {.importc: "MIX_Track", header: SDL_MixerHeader, incompleteStruct.} = object
-
-proc MIX_Init*(): bool {.importc, header: SDL_MixerHeader.}
-proc MIX_Quit*() {.importc, header: SDL_MixerHeader.}
-proc MIX_CreateMixerDevice*(devid: uint32; spec: pointer): ptr MIX_Mixer
-  {.importc, header: SDL_MixerHeader.}
-proc MIX_DestroyMixer*(mixer: ptr MIX_Mixer) {.importc, header: SDL_MixerHeader.}
-proc MIX_LoadAudio*(mixer: ptr MIX_Mixer; path: cstring; predecode: bool): ptr MIX_Audio
-  {.importc, header: SDL_MixerHeader.}
-proc MIX_DestroyAudio*(audio: ptr MIX_Audio) {.importc, header: SDL_MixerHeader.}
-proc MIX_CreateTrack*(mixer: ptr MIX_Mixer): ptr MIX_Track
-  {.importc, header: SDL_MixerHeader.}
-proc MIX_DestroyTrack*(track: ptr MIX_Track) {.importc, header: SDL_MixerHeader.}
-proc MIX_SetTrackAudio*(track: ptr MIX_Track; audio: ptr MIX_Audio): bool
-  {.importc, header: SDL_MixerHeader.}
-proc MIX_PlayTrack*(track: ptr MIX_Track; options: uint32): bool
-  {.importc, header: SDL_MixerHeader.}

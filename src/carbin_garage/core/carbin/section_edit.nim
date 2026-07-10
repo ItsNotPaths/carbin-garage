@@ -12,11 +12,11 @@
 ## "clone a donor template" philosophy the splice path already uses.
 ##
 ## Sections are referenced only by NAME anywhere it matters (physicsdef,
-## gamedb, transcode all key off the name; SectionInfo.index is unused), so
-## adding/removing a section needs nothing beyond rebuilding the byte stream
-## and patching the u32 `partCount`.
+## gamedb, transcode all key off the name), so adding/removing a section
+## needs nothing beyond rebuilding the byte stream and patching the u32
+## `partCount`.
 
-import std/[sets, tables, math]
+import std/[sets, tables]
 import ../be
 import ./model
 import ./parser
@@ -36,11 +36,6 @@ proc wU16(buf: var seq[byte], off: int, v: uint16) =
 
 proc wI16(buf: var seq[byte], off: int, v: int16) =
   let p = bePackU16(cast[uint16](v)); buf[off] = p[0]; buf[off + 1] = p[1]
-
-proc remap1(v, sa, sb, ta, tb: float32): float32 =
-  let r = sb - sa
-  if abs(r) < 1e-12'f32: return ta
-  result = ta + ((v - sa) / r) * (tb - ta)
 
 proc poolRange(carbin: openArray[byte], sec: SectionInfo):
               tuple[mn, mx: array[3, float32]] =
@@ -123,11 +118,7 @@ proc resizeTail(carbin: openArray[byte], tpl: SectionInfo,
   let aFieldOk = tpl.aFieldPos > 0 and tpl.aTableEnd > tpl.aTableStart
   let donorATableLen = tpl.aTableEnd - tpl.aTableStart
   let donorAField =
-    if aFieldOk:
-      uint32(carbin[tpl.aFieldPos]) shl 24 or
-      uint32(carbin[tpl.aFieldPos + 1]) shl 16 or
-      uint32(carbin[tpl.aFieldPos + 2]) shl 8 or
-      uint32(carbin[tpl.aFieldPos + 3])
+    if aFieldOk: beU32At(carbin, tpl.aFieldPos)
     else: 0'u32
   let recordB =
     if aFieldOk and donorAField > 0'u32: donorATableLen div int(donorAField)
@@ -177,12 +168,8 @@ proc synthSectionFromMesh*(carbin: openArray[byte], tpl: SectionInfo,
   # Donor slot's target bbox (9 floats: offset + tMin + tMax) and pool range.
   var dTMin, dTMax: array[3, float32]
   for a in 0 .. 2:
-    let oMin = tpl.transformPos + 12 + a*4
-    let oMax = tpl.transformPos + 24 + a*4
-    dTMin[a] = cast[float32](uint32(carbin[oMin]) shl 24 or uint32(carbin[oMin+1]) shl 16 or
-                             uint32(carbin[oMin+2]) shl 8 or uint32(carbin[oMin+3]))
-    dTMax[a] = cast[float32](uint32(carbin[oMax]) shl 24 or uint32(carbin[oMax+1]) shl 16 or
-                             uint32(carbin[oMax+2]) shl 8 or uint32(carbin[oMax+3]))
+    dTMin[a] = beF32At(carbin, tpl.transformPos + 12 + a*4)
+    dTMax[a] = beF32At(carbin, tpl.transformPos + 24 + a*4)
   # Scale the target bbox by boxScale (about its center).
   var sTMin, sTMax: array[3, float32]
   for a in 0 .. 2:
@@ -192,6 +179,9 @@ proc synthSectionFromMesh*(carbin: openArray[byte], tpl: SectionInfo,
   let nr = poolRange(carbin, tpl)
   let pool = buildMeshPoolFit(positions, uvs, normals, sTMin, sTMax, nr.mn, nr.mx)
   let vcount = pool.len div 28
+  if vcount > 0xFFFF:
+    raise newException(SectionEditError,
+      "mesh has " & $vcount & " vertices; u16 index encoding caps at 65535")
 
   # --- subsection: clone the chosen template subsection (its m_MaterialSets
   # binding — i.e. which texture/shader the game uses — rides along) ---
@@ -223,9 +213,7 @@ proc synthSectionFromMesh*(carbin: openArray[byte], tpl: SectionInfo,
     let tRel = tpl.transformPos - tpl.start
     for a in 0 .. 2:
       # offset = donor offset + posOffset (shift the part in world)
-      let oOff = tpl.transformPos + a*4
-      let donorOff = cast[float32](uint32(carbin[oOff]) shl 24 or uint32(carbin[oOff+1]) shl 16 or
-                                   uint32(carbin[oOff+2]) shl 8 or uint32(carbin[oOff+3]))
+      let donorOff = beF32At(carbin, tpl.transformPos + a*4)
       let pOff = bePackF32(donorOff + posOffset[a])
       let pMin = bePackF32(sTMin[a]); let pMax = bePackF32(sTMax[a])
       for j in 0 .. 3:
@@ -243,10 +231,6 @@ proc synthSectionFromMesh*(carbin: openArray[byte], tpl: SectionInfo,
   sec = patchSectionNameRescan(sec, newName)
   result = sec
 
-proc rdU32(carbin: openArray[byte], o: int): uint32 =
-  uint32(carbin[o]) shl 24 or uint32(carbin[o+1]) shl 16 or
-  uint32(carbin[o+2]) shl 8 or uint32(carbin[o+3])
-
 proc sectionHeaderCounts*(carbin: openArray[byte], sec: SectionInfo):
                          tuple[perm, cnt2: uint32] =
   ## permCount and cnt2 from a section header. Glass sections carry
@@ -257,159 +241,11 @@ proc sectionHeaderCounts*(carbin: openArray[byte], sec: SectionInfo):
   ## are clean; glass* are not.
   let permPos = sec.transformPos + 36 + 28
   if permPos + 4 > carbin.len: return (uint32.high, uint32.high)
-  let perm = rdU32(carbin, permPos)
+  let perm = beU32At(carbin, permPos)
   let cnt2Pos = permPos + 4 + int(perm) * 16 + 4
   if perm > 1_000_000'u32 or cnt2Pos + 4 > carbin.len:
     return (perm, uint32.high)
-  result = (perm, rdU32(carbin, cnt2Pos))
-
-proc perSectionIdRel(sec: SectionInfo): int =
-  ## Byte offset of perSectionId within the section, or -1 if the section
-  ## has none (m_NumBoneWeights==0). cvFive: pool starts at
-  ## lodVertexSizePos+12 when perSectionId present (size+4 mbw, +4 id),
-  ## +8 when absent.
-  let gap = sec.lodVerticesStart - sec.lodVertexSizePos
-  if gap >= 12: return (sec.lodVertexSizePos + 8) - sec.start
-  return -1
-
-proc readPerSectionIds*(carbin: openArray[byte], info: CarbinInfo): HashSet[uint32] =
-  result = initHashSet[uint32]()
-  for s in info.sections:
-    let rel = perSectionIdRel(s)
-    if rel < 0: continue
-    let o = s.start + rel
-    result.incl(uint32(carbin[o]) shl 24 or uint32(carbin[o+1]) shl 16 or
-                uint32(carbin[o+2]) shl 8 or uint32(carbin[o+3]))
-
-proc rdI16BE(b: openArray[byte], o: int): int16 =
-  cast[int16]((uint16(b[o]) shl 8) or uint16(b[o+1]))
-
-proc rdU16BE(b: openArray[byte], o: int): uint16 =
-  (uint16(b[o]) shl 8) or uint16(b[o+1])
-
-proc mutateRegenQuats*(carbin: openArray[byte], sec: SectionInfo): seq[byte] =
-  ## REAL section, but every LOD vertex's tangent quaternion replaced by
-  ## normalToQuat(decoded normal). Bisect probe: isolates "generated quats"
-  ## (the one field synthesis fabricates; working paths copy it verbatim).
-  result = sliceB(carbin, sec.start, sec.endPos)
-  let n = int(sec.lodVerticesCount)
-  let stride = int(sec.lodVerticesSize)
-  let baseRel = sec.lodVerticesStart - sec.start
-  for i in 0 ..< n:
-    let q0 = baseRel + i*stride + 16
-    let q: Quat = [shortn(rdI16BE(result, q0)), shortn(rdI16BE(result, q0+2)),
-                   shortn(rdI16BE(result, q0+4)), shortn(rdI16BE(result, q0+6))]
-    let nq = normalToQuat(quatToMatrixRow0(q))
-    for k in 0 .. 3: wI16(result, q0 + k*2, nq[k])
-
-proc isRestart(v: uint32, idxSize: int): bool =
-  if idxSize == 2: return v == 0xFFFF'u32
-  v == 0xFFFFFFFF'u32 or v == 0x00FFFFFF'u32 or v == 0x0000FFFF'u32
-
-proc stripToList(idx: seq[uint32], idxSize: int): seq[uint32] =
-  ## Expand a triangle strip (with restart sentinels) to a flat triangle
-  ## list, alternating winding within each sub-strip (parity resets on
-  ## restart). Mirrors gltf.nim:tristripToTris.
-  result = @[]
-  var i = 0
-  var stripBase = 0
-  while i + 2 < idx.len:
-    if isRestart(idx[i], idxSize) or isRestart(idx[i+1], idxSize) or isRestart(idx[i+2], idxSize):
-      while i < idx.len and not isRestart(idx[i], idxSize): inc i
-      while i < idx.len and isRestart(idx[i], idxSize): inc i
-      stripBase = i; continue
-    if idx[i] == idx[i+1] or idx[i+1] == idx[i+2] or idx[i] == idx[i+2]:
-      inc i; continue
-    if ((i - stripBase) and 1) == 0:
-      result.add idx[i]; result.add idx[i+1]; result.add idx[i+2]
-    else:
-      result.add idx[i]; result.add idx[i+2]; result.add idx[i+1]
-    inc i
-
-proc mutateTriList*(carbin: openArray[byte], sec: SectionInfo): seq[byte] =
-  ## REAL section, every TriStrip subsection converted to TriList (indexType
-  ## 6→4, strips expanded to flat triangle lists). Bisect probe: isolates
-  ## the index-encoding choice (synthesis emits TriList; real uses TriStrip).
-  var prefix = sliceB(carbin, sec.start, sec.subsections[0].start)
-  var ssBlob: seq[byte] = @[]
-  for ss in sec.subsections:
-    let isz = int(ss.idxSize)
-    var idx = newSeq[uint32](int(ss.idxCount))
-    for k in 0 ..< int(ss.idxCount):
-      if isz == 2: idx[k] = uint32(rdU16BE(carbin, ss.idxDataStart + k*2))
-      else: idx[k] = (uint32(carbin[ss.idxDataStart+k*4]) shl 24) or
-                     (uint32(carbin[ss.idxDataStart+k*4+1]) shl 16) or
-                     (uint32(carbin[ss.idxDataStart+k*4+2]) shl 8) or
-                      uint32(carbin[ss.idxDataStart+k*4+3])
-    let tris = (if ss.indexType == 6'u32: stripToList(idx, isz) else: idx)
-    var ssp = sliceB(carbin, ss.start, ss.idxCountPos)
-    # indexType=4 at lodPos+4
-    block:
-      let ip = ss.lodPos + 4 - ss.start
-      let p = bePackU32(4'u32)
-      for j in 0..3: ssp[ip+j] = p[j]
-    var idxData = newSeq[byte](tris.len * isz)
-    for k, v in tris:
-      if isz == 2:
-        let p = bePackU16(uint16(v)); idxData[k*2]=p[0]; idxData[k*2+1]=p[1]
-      else:
-        let p = bePackU32(v); for j in 0..3: idxData[k*4+j]=p[j]
-    let ssTrail = sliceB(carbin, ss.afterIdxPos, ss.endPos)
-    ssBlob.add(ssp & @(bePackI32(int32(tris.len))) & @(bePackI32(int32(isz))) & idxData & ssTrail)
-  let suffix = sliceB(carbin, sec.subsections[^1].endPos, sec.endPos)
-  result = prefix & ssBlob & suffix
-
-proc mutateMergeSubs*(carbin: openArray[byte], sec: SectionInfo): seq[byte] =
-  ## REAL section, but all subsections merged into ONE TriList subsection
-  ## (verts/quats/a*b untouched). Bisect probe: isolates the subsection-count
-  ## change (synthesis emits 1; real hooda has 9).
-  var allTris: seq[uint32] = @[]
-  for ss in sec.subsections:
-    let isz = int(ss.idxSize)
-    var idx = newSeq[uint32](int(ss.idxCount))
-    for k in 0 ..< int(ss.idxCount):
-      if isz == 2: idx[k] = uint32(rdU16BE(carbin, ss.idxDataStart + k*2))
-      else: idx[k] = (uint32(carbin[ss.idxDataStart+k*4]) shl 24) or
-                     (uint32(carbin[ss.idxDataStart+k*4+1]) shl 16) or
-                     (uint32(carbin[ss.idxDataStart+k*4+2]) shl 8) or
-                      uint32(carbin[ss.idxDataStart+k*4+3])
-    let tris = (if ss.indexType == 6'u32: stripToList(idx, isz) else: idx)
-    for v in tris: allTris.add v
-  let ss0 = sec.subsections[0]
-  var ssp = sliceB(carbin, ss0.start, ss0.idxCountPos)
-  block:   # indexType = 4
-    let ip = ss0.lodPos + 4 - ss0.start
-    let p = bePackU32(4'u32)
-    for j in 0..3: ssp[ip+j] = p[j]
-  var idxData = newSeq[byte](allTris.len * 2)   # all hooda verts < 65536 → u16
-  for k, v in allTris:
-    let p = bePackU16(uint16(v)); idxData[k*2]=p[0]; idxData[k*2+1]=p[1]
-  let ssTrail = sliceB(carbin, ss0.afterIdxPos, ss0.endPos)
-  let merged = ssp & @(bePackI32(int32(allTris.len))) & @(bePackI32(2'i32)) & idxData & ssTrail
-  result = sliceB(carbin, sec.start, sec.subpartCountPos) & @(bePackU32(1'u32)) &
-           merged & sliceB(carbin, sec.subsections[^1].endPos, sec.endPos)
-
-proc mutateZeroAtable*(carbin: openArray[byte], sec: SectionInfo): seq[byte] =
-  ## REAL section, but the a*b per-vertex table zeroed. Bisect probe: does
-  ## the a*b table's CONTENT matter for load? (penger gets cycled/wrong a*b.)
-  result = sliceB(carbin, sec.start, sec.endPos)
-  for o in (sec.aTableStart - sec.start) ..< (sec.aTableEnd - sec.start):
-    result[o] = 0
-
-proc cloneSectionRenamed*(carbin: openArray[byte], sec: SectionInfo,
-                          newName: string, newPerSecId: int = -1): seq[byte] =
-  ## Verbatim byte-copy of an existing section, renamed. Used to isolate
-  ## "is appending a 34th part the problem" from "is my synthesized
-  ## geometry the problem" — the bytes are guaranteed game-valid.
-  ## `newPerSecId >= 0` overwrites the section's perSectionId (so an
-  ## appended copy gets a unique id instead of colliding with its source).
-  var raw = sliceB(carbin, sec.start, sec.endPos)
-  if newPerSecId >= 0:
-    let rel = perSectionIdRel(sec)
-    if rel >= 0:
-      let p = bePackU32(uint32(newPerSecId))
-      for j in 0 .. 3: raw[rel + j] = p[j]
-  result = patchSectionNameRescan(raw, newName)
+  result = (perm, beU32At(carbin, cnt2Pos))
 
 # ---- drop + append, rebuilding the carbin with partCount fixed ----
 

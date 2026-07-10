@@ -114,7 +114,6 @@ proc validateRoundtripExtras*(gltfPath: string): seq[string] =
 const
   GLTF_FLOAT*          = 5126
   GLTF_UNSIGNED_INT*   = 5125
-  GLTF_UNSIGNED_SHORT* = 5123
   GLTF_ARRAY_BUFFER*       = 34962
   GLTF_ELEMENT_ARRAY_BUFFER* = 34963
   PRIMITIVE_TRIANGLES* = 4
@@ -259,13 +258,13 @@ proc extractRawQuat(pool: openArray[byte], stride: int): seq[byte] =
       result[i*8 + j] = pool[i*stride + 16 + j]
 
 proc writeFloatsAt(b: var GltfBuilder, off: int, vals: openArray[float32]) =
+  ## glTF buffers are little-endian.
   for i, v in vals:
     let bits = cast[uint32](v)
-    let p = bePackU32(bits)   # we want LE; flip
-    b.binBuf[off + i*4 + 0] = p[3]
-    b.binBuf[off + i*4 + 1] = p[2]
-    b.binBuf[off + i*4 + 2] = p[1]
-    b.binBuf[off + i*4 + 3] = p[0]
+    b.binBuf[off + i*4 + 0] = byte(bits and 0xff'u32)
+    b.binBuf[off + i*4 + 1] = byte((bits shr 8) and 0xff'u32)
+    b.binBuf[off + i*4 + 2] = byte((bits shr 16) and 0xff'u32)
+    b.binBuf[off + i*4 + 3] = byte((bits shr 24) and 0xff'u32)
 
 proc addVec3FloatAccessor(b: var GltfBuilder, data: openArray[float32],
                           minB, maxB: array[3, float32]): int =
@@ -300,11 +299,10 @@ proc addIndexAccessor(b: var GltfBuilder, indices: openArray[uint32]): int =
   let bv = addBufferView(b, indices.len * 4, GLTF_ELEMENT_ARRAY_BUFFER)
   let off = b.bufferViews[bv]["byteOffset"].getInt
   for i, v in indices:
-    var le = v
-    b.binBuf[off + i*4 + 0] = byte(le and 0xff'u32)
-    b.binBuf[off + i*4 + 1] = byte((le shr 8) and 0xff'u32)
-    b.binBuf[off + i*4 + 2] = byte((le shr 16) and 0xff'u32)
-    b.binBuf[off + i*4 + 3] = byte((le shr 24) and 0xff'u32)
+    b.binBuf[off + i*4 + 0] = byte(v and 0xff'u32)
+    b.binBuf[off + i*4 + 1] = byte((v shr 8) and 0xff'u32)
+    b.binBuf[off + i*4 + 2] = byte((v shr 16) and 0xff'u32)
+    b.binBuf[off + i*4 + 3] = byte((v shr 24) and 0xff'u32)
   let acc = %*{
     "bufferView": bv,
     "componentType": GLTF_UNSIGNED_INT,
@@ -406,11 +404,6 @@ proc readSectionTransform*(data: openArray[byte], sec: SectionInfo): SectionTran
   for i in 0 .. 2: result.offset[i]    = r.f32()
   for i in 0 .. 2: result.targetMin[i] = r.f32()
   for i in 0 .. 2: result.targetMax[i] = r.f32()
-
-proc remap1(v, srcMin, srcMax, tgtMin, tgtMax: float32): float32 =
-  let r = srcMax - srcMin
-  if abs(r) < 1e-12'f32: return tgtMin
-  result = tgtMin + ((v - srcMin) / r) * (tgtMax - tgtMin)
 
 proc decodePoolToFloats(blob: openArray[byte], stride: int, xform: SectionTransform):
                        tuple[pos, uv0, uv1, normal: seq[float32];

@@ -28,8 +28,9 @@
 ## the donor section template via `builders`' `workingTransform9` hook so
 ## the collision/damage AABB stays consistent with the geometry.
 
-import std/[json, os, math, tables]
+import std/[json, os, tables]
 import ../be
+import ../ioutil
 import ../obj
 import ./vertex
 import ./vertex_quat
@@ -47,16 +48,6 @@ const
   GLTF_FLOAT = 5126
   GLTF_UNSIGNED_INT = 5125
   POS_EPS = 1e-9'f32
-
-proc readBytes(path: string): seq[byte] =
-  let s = readFile(path)
-  result = newSeq[byte](s.len)
-  for i, c in s: result[i] = byte(c)
-
-proc writeAllBytes2(path: string, data: openArray[byte]) =
-  var f = open(path, fmWrite)
-  defer: f.close()
-  if data.len > 0: discard f.writeBytes(data, 0, data.len)
 
 proc loadGltfDoc*(gltfPath: string): GltfDoc =
   ## Parse car.gltf and read the sibling car.bin (uri from buffers[0]).
@@ -89,6 +80,9 @@ proc accFloatsVec3(d: GltfDoc, accIdx: int): seq[float32] =
   let bv = d.j["bufferViews"][acc["bufferView"].getInt]
   let off = bv{"byteOffset"}.getInt(0) + acc{"byteOffset"}.getInt(0)
   let count = acc["count"].getInt
+  if off < 0 or off + count * 12 > d.bin.len:
+    raise newException(GltfPackError,
+      "accessor " & $accIdx & " reads past end of car.bin")
   result = newSeq[float32](count * 3)
   if count > 0:
     copyMem(addr result[0], unsafeAddr d.bin[off], count * 12)
@@ -120,11 +114,6 @@ proc sectionPositions*(d: GltfDoc, meshName: string,
 proc writeI16BE(buf: var seq[byte], off: int, v: int16) =
   let p = bePackU16(cast[uint16](v))
   buf[off] = p[0]; buf[off + 1] = p[1]
-
-proc remap1(v, srcMin, srcMax, tgtMin, tgtMax: float32): float32 =
-  let r = srcMax - srcMin
-  if abs(r) < 1e-12'f32: return tgtMin
-  result = tgtMin + ((v - srcMin) / r) * (tgtMax - tgtMin)
 
 proc encodePoolPositions*(positions: seq[float32], basePool: openArray[byte],
                           stride: int,
@@ -226,6 +215,9 @@ proc accFloatsVec2(d: GltfDoc, accIdx: int): seq[float32] =
   let bv = d.j["bufferViews"][acc["bufferView"].getInt]
   let off = bv{"byteOffset"}.getInt(0) + acc{"byteOffset"}.getInt(0)
   let count = acc["count"].getInt
+  if off < 0 or off + count * 8 > d.bin.len:
+    raise newException(GltfPackError,
+      "accessor " & $accIdx & " reads past end of car.bin")
   result = newSeq[float32](count * 2)
   if count > 0: copyMem(addr result[0], unsafeAddr d.bin[off], count * 8)
 
@@ -299,7 +291,7 @@ proc addMeshToGltf*(gltfPath, objPath, name: string,
   var j = parseFile(gltfPath)
   let uri = j["buffers"][0]{"uri"}.getStr("")
   let binPath = parentDir(gltfPath) / uri
-  var buf = readBytes(binPath)
+  var buf = readFileBytes(binPath)
   let mesh = loadObj(objPath)
   let vcount = mesh.positions.len div 3
 
@@ -394,4 +386,4 @@ proc addMeshToGltf*(gltfPath, objPath, name: string,
 
   j["buffers"][0]["byteLength"] = %buf.len
   writeFile(gltfPath, $j)
-  writeAllBytes2(binPath, buf)
+  writeFileBytes(binPath, buf)

@@ -128,7 +128,8 @@ proc drawRow(ctx: var UiContext; cache: var TextCache;
                 rowRect.y + (rowRect.h - 14) * 0.5'f32)
 
 proc expandedPanelRect(ctx: UiContext; app: AppState; i: int): Rect =
-  ## Geometry must match `drawDropupRow`'s inline computation.
+  ## Single source of truth for a source's expanded-panel geometry — used
+  ## by both `dropupClaimsInput` and `drawDropupRow`.
   let stripH = ctx.winH * TileH
   let stripY = ctx.winH - stripH
   let tileW  = ctx.winW / float32(app.sources.len)
@@ -150,7 +151,6 @@ proc dropupClaimsInput*(ctx: var UiContext; app: var AppState): bool =
   if app.sources.len == 0: return
   let stripH = ctx.winH * TileH
   let stripY = ctx.winH - stripH
-  let tileW  = ctx.winW / float32(app.sources.len)
 
   var anyVisible = -1
   var hovering = false
@@ -221,22 +221,16 @@ proc drawDropupRow*(ctx: var UiContext; cache: var TextCache;
       app.sources[i].expanded = (i == clickedIdx) and not curr
 
   # animate + draw expanded panels
-  let panelMax = ctx.winH * PanelMaxFrac
   for i in 0 ..< app.sources.len:
     var src = addr app.sources[i]
     modal.tickFraction(src[].expandFrac, src[].expanded, ctx.dt)
     if src[].expandFrac <= 0: continue
 
-    let panelH = panelMax * src[].expandFrac
-    let panelW = max(tileW, 360.0'f32)
-    var panelX = float32(i) * tileW + (tileW - panelW) * 0.5'f32
-    if panelX < 0: panelX = 0
-    if panelX + panelW > ctx.winW: panelX = ctx.winW - panelW
-    let panelY = stripY - panelH
+    let panel = expandedPanelRect(ctx, app, i)
+    let (panelX, panelY, panelW, panelH) = (panel.x, panel.y, panel.w, panel.h)
 
     # panel background
-    ctx.pushSolid(rect(panelX, panelY, panelW, panelH),
-                  color(0.10, 0.12, 0.16, 0.96))
+    ctx.pushSolid(panel, color(0.10, 0.12, 0.16, 0.96))
 
     # Build filtered car-index list — query persists per source.
     let q = src[].search.text.strip()

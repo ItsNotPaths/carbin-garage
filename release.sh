@@ -69,7 +69,8 @@ if [ $DO_LOCAL -eq 1 ]; then
     # build-deps.sh entirely (Phase 1 doesn't link SDL3, so the .a's
     # aren't needed yet).
     if [ $SKIP_DEPS -eq 0 ]; then
-        if [ ! -d "$PROJECT_DIR/vendor/sdl3" ]; then
+        if [ ! -d "$PROJECT_DIR/vendor/sdl3" ] || \
+           [ ! -f "$PROJECT_DIR/vendor/sqlite/sqlite3.c" ]; then
             echo "  vendor missing; running download-deps.sh"
             "$PROJECT_DIR/download-deps.sh"
         fi
@@ -93,6 +94,14 @@ if [ $DO_LOCAL -eq 1 ]; then
 
     if [ "$TARGET" = "windows" ]; then
         BIN_NAME="${PROJECT_NAME}.exe"
+        # SDL3's static lib pulls in Win32 system DLLs (gdi32/ole32/…). GNU ld
+        # processes the link line left-to-right and drops an archive's unused
+        # symbols on sight, so the system libs MUST come AFTER the SDL3
+        # --end-group or their imports won't resolve. Mirrors release.yml.
+        for sysl in winmm ole32 oleaut32 uuid gdi32 user32 shell32 \
+                    advapi32 setupapi imm32 version cfgmgr32 ws2_32; do
+            PASSL_ARGS+=("--passL:-l$sysl")
+        done
         nimble -y build -d:release --os:windows --cpu:amd64 -d:mingw \
             --gcc.exe:x86_64-w64-mingw32-gcc \
             --gcc.linkerexe:x86_64-w64-mingw32-gcc \
@@ -103,7 +112,7 @@ if [ $DO_LOCAL -eq 1 ]; then
     fi
 
     # Stage release: overwrite only the files we own (binary, LICENSE,
-    # README, profiles/, shaders/). Preserve working/ and any other
+    # README, profiles/). Preserve working/ and any other
     # user-side state — `rm -rf "$DEST"` would blow up imports between
     # rebuilds. Use --clear-working to drop working/ explicitly.
     mkdir -p "$DEST"
@@ -114,15 +123,14 @@ if [ $DO_LOCAL -eq 1 ]; then
     cp -f "$PROJECT_DIR/build/${BIN_NAME}" "$DEST/"
     [ -f "$PROJECT_DIR/README.md" ] && cp -f "$PROJECT_DIR/README.md" "$DEST/" || true
     [ -f "$PROJECT_DIR/LICENSE" ]   && cp -f "$PROJECT_DIR/LICENSE"   "$DEST/" || true
-    # profiles/ and shaders/: refresh contents (overwrite same-named files,
-    # add new ones) without nuking unrelated files a user may have dropped in.
+    # profiles/: refresh contents (overwrite same-named files, add new ones)
+    # without nuking unrelated files a user may have dropped in.
+    # shaders/ is NOT staged: the SPIR-V is baked into the binary at compile
+    # time via staticRead (gui/scene3d.nim, gui/ui/render.nim), so the runtime
+    # never reads shader files from disk.
     if [ -d "$PROJECT_DIR/profiles" ]; then
         mkdir -p "$DEST/profiles"
         cp -f "$PROJECT_DIR/profiles/"* "$DEST/profiles/" 2>/dev/null || true
-    fi
-    if [ -d "$PROJECT_DIR/shaders" ]; then
-        mkdir -p "$DEST/shaders"
-        cp -rf "$PROJECT_DIR/shaders/"* "$DEST/shaders/" 2>/dev/null || true
     fi
 
     echo "==> Local done: $DEST"

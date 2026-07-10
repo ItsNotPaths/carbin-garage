@@ -10,9 +10,10 @@
 ## ## Vertex-pool stride conversion
 ##
 ## FM4 ships 32-byte vertices: `pos[8] uv0[4] uv1[4] quat[8] extra8[8]`.
-## FH1 ships 28-byte vertices: same layout with **UV1 dropped** at
-## offset 0x0C. To splice an FM4 vertex pool into an FH1 section, we
-## strip bytes [0x0C..0x10) from each vertex.
+## FH1 ships 28-byte vertices: SAME layout for bytes [0..24) (UV1 is
+## KEPT), with the trailing extra8 truncated to extra4. To splice an
+## FM4 vertex pool into an FH1 section, truncate each vertex's last 4
+## bytes (see `fm4PoolToFh1` for the empirical verification notes).
 ##
 ## ## Section-by-section policy
 ##
@@ -147,6 +148,8 @@ proc validateDonor(donorData: openArray[byte],
     try: parseFm4Carbin(donorData)
     except CatchableError as e:
       raise newException(TranscodeError, "donor carbin parse failed: " & e.msg)
+  if info.sections.len == 0:
+    raise newException(TranscodeError, "donor carbin parsed to zero sections")
   let expected = expectedDonorVersion(targetProfile)
   if expected != cvUnknown and ver != expected:
     raise newException(TranscodeError,
@@ -208,13 +211,6 @@ proc fm4PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
       result[dst + 26] = 0
       result[dst + 27] = 0
 
-proc fm4Lod0PoolToFh1*(fm4Pool: openArray[byte]): seq[byte] =
-  ## LOD0 pool stride conversion. Same 32→28 truncation as the LOD pool —
-  ## FM4 lod0/cockpit carbins ship 32-byte vertices in the same layout
-  ## (pos+uv0+uv1+quat+extra8). FH1 keeps pos+uv0+uv1+quat+extra4. Same
-  ## extra4-bytes-1..3 zero (paint fix) applies under SliceDExtra4Zero.
-  fm4PoolToFh1(fm4Pool)
-
 proc fh1PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
   ## Inverse of `fm4PoolToFh1`: extend each 28-byte FH1 vertex to FM4's 32
   ## bytes by appending 4 zero bytes. FH1 `pos[8] uv0[4] uv1[4] quat[8]
@@ -236,17 +232,11 @@ proc fh1PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
       result[dst + j] = fh1Pool[src + j]
     # bytes [dst+28 .. dst+32) stay zero (newSeq default)
 
-proc fh1Lod0PoolToFm4*(fh1Pool: openArray[byte]): seq[byte] =
-  ## LOD0 pool stride conversion, fh1→fm4 (28→32). Mirror of
-  ## `fm4Lod0PoolToFh1` for the reverse direction.
-  fh1PoolToFm4(fh1Pool)
-
 # ---- the splice driver ----
 
 proc spliceCarbin(sourceData, donorData: openArray[byte],
                   srcInfo, donInfo: CarbinInfo,
                   srcVer, donVer: CarbinVersion,
-                  options: TranscodeOptions,
                   gltfDoc: Option[GltfDoc] = none(GltfDoc)):
                   tuple[bytes: seq[byte]; spliced: int; fallback: int;
                         gapsPreserved: int; lod0Spliced: int] =
@@ -264,15 +254,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
   var srcByName = initTable[string, int]()
   for i, s in srcInfo.sections: srcByName[s.name] = i
 
-  let preBytes = block:
-    var b = newSeq[byte](donInfo.sections[0].start)
-    for i in 0 ..< b.len: b[i] = donorData[i]
-    b
-  let postBytes = block:
-    let lastEnd = donInfo.sections[^1].endPos
-    var b = newSeq[byte](donorData.len - lastEnd)
-    for i in 0 ..< b.len: b[i] = donorData[lastEnd + i]
-    b
+  let preBytes = donorData[0 ..< donInfo.sections[0].start]
+  let postBytes = donorData[donInfo.sections[^1].endPos ..< donorData.len]
 
   var newSecs: seq[seq[byte]] = @[]
   var spliced = 0
@@ -343,15 +326,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
     if kIdx > 0:
       let prev = donInfo.sections[kIdx - 1]
       if prev.endPos < donSec.start:
-        var gap = newSeq[byte](donSec.start - prev.endPos)
-        for i in 0 ..< gap.len: gap[i] = donorData[prev.endPos + i]
-        newSecs.add(gap)
+        newSecs.add(donorData[prev.endPos ..< donSec.start])
         inc gapsPreserved
 
-    let donorSecBytes = block:
-      var b = newSeq[byte](donSec.endPos - donSec.start)
-      for i in 0 ..< b.len: b[i] = donorData[donSec.start + i]
-      b
+    let donorSecBytes = donorData[donSec.start ..< donSec.endPos]
 
     if donSec.name notin srcByName:
       when TranscodeTrace:
@@ -373,14 +351,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
         # (`CalculateBoundTargetValue`) and working vertices render at
         # donor-car scale. When the glTF path is active, forcedFor
         # substitutes the bbox it recomputed from the glTF positions.
-        let srcPool = block:
-          var b = newSeq[byte](srcSec.lodVerticesEnd - srcSec.lodVerticesStart)
-          for i in 0 ..< b.len: b[i] = sourceData[srcSec.lodVerticesStart + i]
-          b
-        let srcXformBytes = block:
-          var b = newSeq[byte](36)
-          for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
-          b
+        let srcPool = sourceData[srcSec.lodVerticesStart ..< srcSec.lodVerticesEnd]
+        let srcXformBytes = sourceData[srcSec.transformPos ..< srcSec.transformPos + 36]
         let ff = forcedFor(srcPool, int(srcSec.lodVerticesSize),
                            donSec.name, wantLod0 = false, srcXformBytes)
         let r = buildSectionConvertedToDonorLodOnDonorTemplate(
@@ -435,10 +407,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
               " subs(srcLod1)=" & $srcLodSubcount &
               " lod0Vc(splice)=" & $chk.info.lod0VerticesCount &
               " lod0Vc(donor)=" & $donSec.lod0VerticesCount
-      except CatchableError as e:
+      except CatchableError:
         when TranscodeTrace:
           stderr.writeLine "    [splice] '" & donSec.name &
-            "' raise: " & e.msg
+            "' raise: " & getCurrentExceptionMsg()
         thisSecBytes = donorSecBytes
     elif donSec.lod0VerticesCount > 0'i32 and srcSec.lod0VerticesCount > 0'i32:
       # LOD0-only section (lod0/cockpit body sections — visible in
@@ -450,14 +422,8 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
       # stream with zero bytes of length workingLod0VCount*4 so the tail
       # length matches.
       try:
-        let srcPool = block:
-          var b = newSeq[byte](srcSec.lod0VerticesEnd - srcSec.lod0VerticesStart)
-          for i in 0 ..< b.len: b[i] = sourceData[srcSec.lod0VerticesStart + i]
-          b
-        let srcXformBytes = block:
-          var b = newSeq[byte](36)
-          for i in 0 ..< 36: b[i] = sourceData[srcSec.transformPos + i]
-          b
+        let srcPool = sourceData[srcSec.lod0VerticesStart ..< srcSec.lod0VerticesEnd]
+        let srcXformBytes = sourceData[srcSec.transformPos ..< srcSec.transformPos + 36]
         let ff = forcedFor(srcPool, int(srcSec.lod0VerticesSize),
                            donSec.name, wantLod0 = true, srcXformBytes)
         let r = buildSectionConvertedToDonorLodOnDonorTemplate(
@@ -498,10 +464,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
               " lod0Vs(splice)=" & $chk.info.lod0VerticesSize &
               " subs(splice)=" & $chk.info.subsections.len &
               " subs(srcLod0)=" & $srcLod0Subcount
-      except CatchableError as e:
+      except CatchableError:
         when TranscodeTrace:
           stderr.writeLine "    [splice-lod0] '" & donSec.name &
-            "' raise: " & e.msg
+            "' raise: " & getCurrentExceptionMsg()
         thisSecBytes = donorSecBytes
     else:
       when TranscodeTrace:
@@ -517,14 +483,10 @@ proc spliceCarbin(sourceData, donorData: openArray[byte],
 
   var outLen = preBytes.len + postBytes.len
   for s in newSecs: outLen += s.len
-  result.bytes = newSeq[byte](outLen)
-  var off = 0
-  for i in 0 ..< preBytes.len: result.bytes[off + i] = preBytes[i]
-  off += preBytes.len
-  for s in newSecs:
-    for i in 0 ..< s.len: result.bytes[off + i] = s[i]
-    off += s.len
-  for i in 0 ..< postBytes.len: result.bytes[off + i] = postBytes[i]
+  result.bytes = newSeqOfCap[byte](outLen)
+  result.bytes.add(preBytes)
+  for s in newSecs: result.bytes.add(s)
+  result.bytes.add(postBytes)
   result.spliced = spliced
   result.fallback = fallback
   result.gapsPreserved = gapsPreserved
@@ -550,8 +512,7 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
 
   case mode
   of tmDonorVerbatim:
-    var copy = newSeq[byte](donorData.len)
-    for i in 0 ..< donorData.len: copy[i] = donorData[i]
+    let copy = @donorData
     let report = TranscodeReport(
       mode: tmDonorVerbatim,
       sourceVersion: srcVer, sourceTypeId: srcInfo.typeId,
@@ -563,7 +524,7 @@ proc transcodeCarbin*(sourceData, donorData: openArray[byte],
     result = (copy, report)
   of tmHybridSplice:
     let r = spliceCarbin(sourceData, donorData, srcInfo, donInfo,
-                          srcVer, donVer, options, gltfDoc)
+                          srcVer, donVer, gltfDoc)
     let report = TranscodeReport(
       mode: tmHybridSplice,
       sourceVersion: srcVer, sourceTypeId: srcInfo.typeId,
@@ -600,5 +561,4 @@ proc passthroughCarbin*(donorData: openArray[byte]): seq[byte] =
   ## For carbin slots the transcode never touches: stripped, caliper /
   ## rotor LOD0s, and the lod0 / cockpit special carbins (those need
   ## the post-pool stream which we don't synthesize yet).
-  result = newSeq[byte](donorData.len)
-  for i in 0 ..< donorData.len: result[i] = donorData[i]
+  @donorData

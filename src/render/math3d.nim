@@ -33,9 +33,6 @@ proc normalize*(v: Vec3): Vec3 =
 
 # --- Mat4 ------------------------------------------------------------------
 
-proc mat4Identity*(): Mat4 =
-  result[0]  = 1; result[5]  = 1; result[10] = 1; result[15] = 1
-
 proc mat4Mul*(a, b: Mat4): Mat4 =
   # result = a * b, column-major: r[c][r] = Σk a[k][r] * b[c][k]
   for c in 0 ..< 4:
@@ -68,50 +65,3 @@ proc mat4Perspective*(fovYRad, aspect, zNear, zFar: float32): Mat4 =
   result[11] = -1
   result[14] = (zNear * zFar) / (zNear - zFar)
   result[15] = 0
-
-# --- Frustum culling -------------------------------------------------------
-
-type
-  Plane* = array[4, float32]   ## (nx, ny, nz, d); inside iff n·p + d >= 0
-  Frustum* = array[6, Plane]
-
-proc normalizePlane(p: Plane): Plane =
-  let l = sqrt(p[0]*p[0] + p[1]*p[1] + p[2]*p[2])
-  if l > EpsilonF32:
-    [p[0]/l, p[1]/l, p[2]/l, p[3]/l]
-  else:
-    p
-
-proc extractFrustum*(m: Mat4): Frustum =
-  ## Extract 6 frustum planes (left, right, bottom, top, near, far) from a
-  ## column-major clip-space matrix. A point p is inside iff n·p + d >= 0 for
-  ## every plane. Clip-space convention: x,y in [-w, w], z in [0, w].
-  # row_i of M as (M[0*4+i], M[1*4+i], M[2*4+i], M[3*4+i])
-  template row(i: int): Plane =
-    [m[0*4+i], m[1*4+i], m[2*4+i], m[3*4+i]]
-  template add4(a, b: Plane): Plane =
-    [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]]
-  template sub4(a, b: Plane): Plane =
-    [a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]]
-  let r0 = row(0)
-  let r1 = row(1)
-  let r2 = row(2)
-  let r3 = row(3)
-  result[0] = normalizePlane(add4(r3, r0))  # left
-  result[1] = normalizePlane(sub4(r3, r0))  # right
-  result[2] = normalizePlane(add4(r3, r1))  # bottom
-  result[3] = normalizePlane(sub4(r3, r1))  # top
-  result[4] = normalizePlane(r2)            # near (z >= 0)
-  result[5] = normalizePlane(sub4(r3, r2))  # far
-
-proc aabbOutsideFrustum*(f: Frustum; lo, hi: Vec3): bool =
-  ## Conservative AABB-vs-frustum reject using the p-vertex trick: for each
-  ## plane, pick the box corner furthest along the plane normal; if that
-  ## corner is outside, the whole box is outside.
-  for plane in f:
-    let px = (if plane[0] >= 0: hi[0] else: lo[0])
-    let py = (if plane[1] >= 0: hi[1] else: lo[1])
-    let pz = (if plane[2] >= 0: hi[2] else: lo[2])
-    if plane[0]*px + plane[1]*py + plane[2]*pz + plane[3] < 0:
-      return true
-  false

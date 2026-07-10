@@ -228,10 +228,8 @@ proc parseSection(r: var BEReader, index: int, ver: CarbinVersion = cvFour): Sec
         let m = r.data[k+3]
         if r.data[k] == 0 and r.data[k+1] == 0 and r.data[k+2] == 0 and
            (m == 5 or m == 2):
-          var rr = newBEReader(r.data)
-          rr.seek(k + 4)
           var floats: array[9, float32]
-          for j in 0 .. 8: floats[j] = rr.f32()
+          for j in 0 .. 8: floats[j] = beF32At(r.data, k + 4 + j*4)
           var sane = 0
           for f in floats:
             if abs(f) < 100.0'f32: inc sane
@@ -363,22 +361,18 @@ proc parseFm4Carbin*(data: openArray[byte]): CarbinInfo =
     # for each candidate, run the full section parse and remember the
     # candidate that yielded the most sections. This is robust because
     # parseSection raises on misalignment, so wrong candidates fail fast.
-    sections = @[]
     var bestSections: seq[SectionInfo] = @[]
     var bestPC: uint32 = 0
     var bestPos = -1
     let scanLimit = min(data.len - 8, 0x10000)
     var i = 0x4DC  # body start; partCount can't precede this
     while i < scanLimit:
-      let pc = uint32((int(data[i]) shl 24) or (int(data[i+1]) shl 16) or
-                      (int(data[i+2]) shl 8) or int(data[i+3]))
-      let marker = uint32((int(data[i+4]) shl 24) or (int(data[i+5]) shl 16) or
-                          (int(data[i+6]) shl 8) or int(data[i+7]))
+      let pc = beU32At(data, i)
+      let marker = beU32At(data, i + 4)
       if pc >= 1'u32 and pc <= 255'u32 and (marker == 2'u32 or marker == 5'u32):
         var rr = newBEReader(data)
         rr.seek(i + 4)
         var cand: seq[SectionInfo] = @[]
-        var ok = true
         for k in 0 ..< int(pc):
           let beforeAttempt = rr.tell()
           try:
@@ -395,10 +389,8 @@ proc parseFm4Carbin*(data: openArray[byte]): CarbinInfo =
             var s = beforeAttempt + 4   # skip past the byte that just failed
             while s <= scanEnd:
               if data[s] == 0 and data[s+1] == 0 and data[s+2] == 0 and data[s+3] == 5:
-                var rr2 = newBEReader(data)
-                rr2.seek(s + 4)
                 var floats: array[9, float32]
-                for j in 0 .. 8: floats[j] = rr2.f32()
+                for j in 0 .. 8: floats[j] = beF32At(data, s + 4 + j*4)
                 var sane = 0
                 for f in floats:
                   if abs(f) < 100.0'f32: inc sane
@@ -406,7 +398,7 @@ proc parseFm4Carbin*(data: openArray[byte]): CarbinInfo =
                   found = s; break
               inc s
             if found < 0:
-              ok = false; break
+              break
             rr.seek(found)
             # don't add a placeholder; just try the next section index here
             continue
@@ -421,7 +413,6 @@ proc parseFm4Carbin*(data: openArray[byte]): CarbinInfo =
           bestSections = cand
           bestPC = pc
           bestPos = i
-        discard ok
       i += 4
     if bestPos < 0:
       raise newException(ValueError,

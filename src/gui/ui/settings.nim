@@ -26,7 +26,6 @@ import ../../carbin_garage/core/[mounts, profile, appconfig]
 import ../../carbin_garage/orchestrator/dlc_clear
 
 const
-  RowH            = 32.0'f32
   RowPadX         = 24.0'f32
   HeaderY         = 24.0'f32
 
@@ -62,9 +61,40 @@ type
     profileIds*: seq[string]                    ## stable iteration order
     clearArmedAt*: Table[string, float]         ## profileId → epochTime() of 1st click
     clearLastCount*: Table[string, int]         ## profileId → packages removed last fire
+    # Per-open disk-IO cache — profiles, auto-detected paths, and DLC
+    # package counts are loaded once per panel-open (and re-scanned when
+    # the content-path input changes or a clear action fires) instead of
+    # per profile per frame.
+    cacheValid*: bool
+    cacheContent*: string                       ## content path the cache was built for
+    cachedProfiles*: Table[string, GameProfile]
+    cachedAutoPaths*: Table[string, string]     ## profileId → auto-detected folder
+    cachedPkgCounts*: Table[string, int]        ## profileId → carbin-garage DLC count
 
 proc rowId(label: string; gameId: string): WidgetId =
   WidgetId(hash("settings." & label & "." & gameId))
+
+proc refreshCache(s: var SettingsState; liveContent: string) =
+  ## (Re)compute everything the panel would otherwise hit the disk for on
+  ## every frame: loadProfileById, autoMountFolder, enumerateCarbinGarageDlcs.
+  s.cachedProfiles = initTable[string, GameProfile]()
+  s.cachedAutoPaths = initTable[string, string]()
+  s.cachedPkgCounts = initTable[string, int]()
+  for id in s.profileIds:
+    let prof =
+      try: loadProfileById(id)
+      except CatchableError: GameProfile()
+    s.cachedProfiles[id] = prof
+    s.cachedAutoPaths[id] =
+      if liveContent.len == 0 or prof.id.len == 0: ""
+      else: autoMountFolder(liveContent, prof)
+    s.cachedPkgCounts[id] =
+      if id in ClearDlcEnabledFor and liveContent.len > 0 and
+         prof.titleId.len > 0:
+        enumerateCarbinGarageDlcs(liveContent, prof).len
+      else: 0
+  s.cacheContent = liveContent
+  s.cacheValid = true
 
 proc beginSession*(s: var SettingsState) =
   ## Snapshot mounts.json + config.json on settings-open so cancellation
@@ -86,6 +116,7 @@ proc beginSession*(s: var SettingsState) =
     if mi >= 0: ti.text = s.sessionMounts[mi].folder
     ti.cursor = ti.text.len
     s.perGameInputs[id] = ti
+  s.cacheValid = false        # first drawn frame populates the IO cache
   s.initialized = true
 
 proc endSession*(s: var SettingsState; commit: bool; app: var AppState) =
@@ -116,14 +147,12 @@ proc endSession*(s: var SettingsState; commit: bool; app: var AppState) =
   s.profileIds = @[]
   s.clearArmedAt = initTable[string, float]()
   s.clearLastCount = initTable[string, int]()
+  s.cacheValid = false
+  s.cacheContent = ""
+  s.cachedProfiles = initTable[string, GameProfile]()
+  s.cachedAutoPaths = initTable[string, string]()
+  s.cachedPkgCounts = initTable[string, int]()
   s.initialized = false
-
-proc autoPathFor(profileId, xeniaContent: string): string =
-  if xeniaContent.strip().len == 0: return ""
-  let prof =
-    try: loadProfileById(profileId)
-    except CatchableError: return ""
-  autoMountFolder(xeniaContent.strip(), prof)
 
 proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
                         s: var SettingsState; panel: Rect;
@@ -156,6 +185,8 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
                 panel.x + RowPadX, panel.y + GamesHintY)
 
   let liveContent = s.contentInput.text.strip()
+  if not s.cacheValid or s.cacheContent != liveContent:
+    refreshCache(s, liveContent)
   let nowT = epochTime()
   var rowI = 0
   for id in s.profileIds:
@@ -174,7 +205,7 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
     var ti = addr s.perGameInputs[id]
     discard textInput(ctx, cache, rowId("game", id), inR, ti[])
     if ti[].text.len == 0:
-      let auto = autoPathFor(id, liveContent)
+      let auto = s.cachedAutoPaths.getOrDefault(id)
       let placeholder =
         if auto.len > 0: "(auto: " & auto & ")"
         else: "(no auto-detect — set xenia content path or override here)"
@@ -189,13 +220,8 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
        nowT - s.clearArmedAt[id] > ClearArmTimeout:
       s.clearArmedAt.del(id)
     let armed = s.clearArmedAt.hasKey(id)
-    let prof =
-      try: loadProfileById(id)
-      except CatchableError: GameProfile()
-    let pkgCount =
-      if enabled and liveContent.len > 0 and prof.titleId.len > 0:
-        enumerateCarbinGarageDlcs(liveContent, prof).len
-      else: 0
+    let prof = s.cachedProfiles.getOrDefault(id)
+    let pkgCount = s.cachedPkgCounts.getOrDefault(id)
     let lastCount =
       if s.clearLastCount.hasKey(id): s.clearLastCount[id] else: -1
     let clearLabel =
@@ -230,6 +256,7 @@ proc drawSettingsPanel*(ctx: var UiContext; cache: var TextCache;
         let removed = clearCarbinGarageDlcs(liveContent, prof)
         s.clearLastCount[id] = removed
         s.clearArmedAt.del(id)
+        s.cacheValid = false     # package counts changed — re-scan next frame
         stderr.writeLine "settings: cleared " & $removed &
           " carbin-garage DLC package(s) for " & id
       else:

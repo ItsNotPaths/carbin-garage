@@ -63,6 +63,7 @@
 import std/[json, os, sequtils, strutils, tables]
 import db_connector/db_sqlite
 import ./cardb
+import ./sqlite_util
 
 type
   CardbWriteError* = object of CatchableError
@@ -91,24 +92,9 @@ type
     rowsToInsert*: int
 
 # ---- helpers ----
-
-proc quoteIdent(name: string): string =
-  ## Wrap a SQL identifier in double quotes (SQLite delimited identifier
-  ## syntax). Required because real Forza schemas contain colons,
-  ## hyphens, and other punctuation in column names — e.g.
-  ## `Time:0-60-sec`, `QuarterMileSpeed-mph`. Bare names with `:` get
-  ## parsed as SQL parameters and prepare-fails. Embedded double quotes
-  ## get doubled per SQL spec.
-  result = "\"" & name.replace("\"", "\"\"") & "\""
-
-proc tableHasColumn(db: DbConn, tbl, col: string): bool =
-  for r in db.fastRows(sql("PRAGMA table_info(" & tbl & ")")):
-    if r.len >= 2 and r[1] == col: return true
-  return false
-
-proc allTableNames(db: DbConn): seq[string] =
-  for r in db.fastRows(sql"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
-    if r.len > 0: result.add(r[0])
+# quoteIdent / tableHasColumn / allTableNames / tableColumns /
+# carIdByMediaName / snippetRowsForTable / jsonToSqlString all come
+# from ./sqlite_util now.
 
 proc perCarKeyFor(db: DbConn, tbl: string): string =
   ## Returns "MediaName" / "CarId" / "CarID" if the table is per-car
@@ -117,30 +103,6 @@ proc perCarKeyFor(db: DbConn, tbl: string): string =
   if tableHasColumn(db, tbl, "CarId"):     return "CarId"
   if tableHasColumn(db, tbl, "CarID"):     return "CarID"
   return ""
-
-proc tableColumns(db: DbConn, tbl: string): seq[CardbColumn] =
-  for r in db.fastRows(sql("PRAGMA table_info(" & tbl & ")")):
-    if r.len < 6: continue
-    var colType: CardbColType
-    let lc = r[2].toLowerAscii()
-    if lc.contains("int"):
-      colType = cctInt
-    elif lc.contains("real") or lc.contains("float") or
-         lc.contains("doub") or lc.contains("num"):
-      colType = cctReal
-    else:
-      colType = cctText
-    result.add(CardbColumn(
-      name: r[1], sqlType: r[2], typ: colType,
-      nullable: r[3] == "0", pk: r[5] != "0"))
-
-proc carIdFor(db: DbConn, mediaName: string): int =
-  result = -1
-  for r in db.fastRows(sql"SELECT Id FROM Data_Car WHERE MediaName=? LIMIT 1", mediaName):
-    if r.len > 0:
-      try: result = parseInt(r[0])
-      except CatchableError: discard
-    break
 
 proc fetchRowsAsDicts(db: DbConn, tbl, keyCol: string,
                      keyVal: string,
@@ -155,37 +117,6 @@ proc fetchRowsAsDicts(db: DbConn, tbl, keyCol: string,
       if i < r.len: row[ci.name] = r[i]
     result.add(row)
 
-proc snippetRowsForTable(snippet: JsonNode, tbl: string): seq[Table[string, JsonNode]] =
-  ## Re-cast the snippet's `tables.<tbl>.rows` into per-row dicts.
-  if not snippet.hasKey("tables"): return
-  let tables = snippet["tables"]
-  if not tables.hasKey(tbl): return
-  let entry = tables[tbl]
-  if not entry.hasKey("rows"): return
-  for r in entry["rows"]:
-    if r.kind != JObject: continue
-    var row = initTable[string, JsonNode]()
-    for k, v in r.pairs: row[k] = v
-    result.add(row)
-
-proc jsonToSqlString(v: JsonNode, ci: CardbColumn): string =
-  ## Project a JSON value back to the string form db_connector's exec
-  ## takes. JNull → empty string (db_connector binds it as NULL when
-  ## paired with the column's default; for non-null cols this can fail —
-  ## v0 accepts that risk, the donor's row almost always has a value).
-  if v.isNil or v.kind == JNull: return ""
-  case v.kind
-  of JString:
-    return v.getStr
-  of JInt:
-    return $v.getInt
-  of JFloat:
-    return $v.getFloat
-  of JBool:
-    return (if v.getBool: "1" else: "0")
-  else:
-    return $v
-
 # ---- planning ----
 
 proc planCardbPatch*(targetGamedb: string, snippet: JsonNode,
@@ -195,7 +126,7 @@ proc planCardbPatch*(targetGamedb: string, snippet: JsonNode,
     raise newException(CardbWriteError, "target gamedb missing: " & targetGamedb)
   let db = open(targetGamedb, "", "", "")
   defer: db.close()
-  let donorCarId = carIdFor(db, donorMediaName)
+  let donorCarId = carIdByMediaName(db, donorMediaName)
   if donorCarId < 0:
     raise newException(CardbWriteError,
       "donor MediaName not in Data_Car: " & donorMediaName)
@@ -203,7 +134,7 @@ proc planCardbPatch*(targetGamedb: string, snippet: JsonNode,
   result.donorMediaName = donorMediaName
   result.donorCarId = donorCarId
   result.newMediaName = newMediaName
-  result.willReplace = replace and carIdFor(db, newMediaName) >= 0
+  result.willReplace = replace and carIdByMediaName(db, newMediaName) >= 0
 
   for tbl in allTableNames(db):
     let keyCol = perCarKeyFor(db, tbl)
@@ -256,7 +187,7 @@ proc describePatchPlan*(p: CardbPatchPlan): string =
 proc deleteExistingRows(db: DbConn, mediaName: string) =
   ## Wipe every per-car row keyed on this MediaName (or its corresponding
   ## CarId in Data_Car). Used by --replace.
-  let oldCarId = carIdFor(db, mediaName)
+  let oldCarId = carIdByMediaName(db, mediaName)
   for tbl in allTableNames(db):
     let keyCol = perCarKeyFor(db, tbl)
     if keyCol.len == 0: continue
@@ -285,7 +216,7 @@ proc buildInsertRow(donorRow: Table[string, string],
       result.add(overrides[ci.name])
       continue
     if ci.name in snipRow:
-      result.add(jsonToSqlString(snipRow[ci.name], ci))
+      result.add(jsonToSqlString(snipRow[ci.name]))
       continue
     if ci.name in donorRow:
       result.add(donorRow[ci.name])
@@ -345,12 +276,12 @@ proc applyCardbToTarget*(targetGamedb: string, snippet: JsonNode,
   let db = open(targetGamedb, "", "", "")
   defer: db.close()
 
-  let donorCarId = carIdFor(db, donorMediaName)
+  let donorCarId = carIdByMediaName(db, donorMediaName)
   if donorCarId < 0:
     raise newException(CardbWriteError,
       "donor MediaName not in Data_Car: " & donorMediaName)
 
-  let collision = carIdFor(db, newMediaName) >= 0
+  let collision = carIdByMediaName(db, newMediaName) >= 0
   if collision and not replace:
     raise newException(CardbWriteError,
       "newMediaName already exists in Data_Car: " & newMediaName &

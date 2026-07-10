@@ -1,8 +1,8 @@
-## Section builders that combine donor + target byte ranges into rebuilt sections.
-## Port of probe/reference/fm4carbin/builders.py.
-## Powers FH1 transcoding in Phase 2; Phase 1 uses buildSectionAsIs for round-trip.
+## Section builders that combine donor + working byte ranges into rebuilt
+## sections. Port of probe/reference/fm4carbin/builders.py. Powers the
+## hybrid-splice transcode path (transcode.nim).
 
-import std/[tables, sets, options, algorithm, sequtils]
+import std/[tables, sets, options]
 import ../be
 import ./model
 import ./patch
@@ -170,7 +170,7 @@ proc buildSectionConvertedToDonorLodOnDonorTemplate*(
 
     if desiredIdxSize == 4:
       var ssTmp = ss
-      if ss.idxSize == 2 and desiredIdxSize == 4:
+      if ss.idxSize == 2:
         let origLen = ss.endPos - ss.start
         let delta = b.len - origLen
         ssTmp = SubSectionInfo(
@@ -379,18 +379,14 @@ proc buildSectionConvertedToDonorLodOnDonorTemplate*(
                  donorSec.aTableEnd > donorSec.aTableStart
   let donorATableLen = donorSec.aTableEnd - donorSec.aTableStart
   let donorAField =
-    if aFieldOk:
-      uint32(donorData[donorSec.aFieldPos]) shl 24 or
-      uint32(donorData[donorSec.aFieldPos + 1]) shl 16 or
-      uint32(donorData[donorSec.aFieldPos + 2]) shl 8 or
-      uint32(donorData[donorSec.aFieldPos + 3])
+    if aFieldOk: beU32At(donorData, donorSec.aFieldPos)
     else: 0'u32
   let recordB =
     if aFieldOk and donorAField > 0'u32:
       donorATableLen div int(donorAField)
     else: 0
   let needsResize = aFieldOk and recordB > 0 and
-                    uint32(newLodCount) != donorAField
+                    newLodCount != donorAField
   let suffix =
     if needsResize:
       let beforeAField = sliceBytes(donorBytes,
@@ -412,7 +408,7 @@ proc buildSectionConvertedToDonorLodOnDonorTemplate*(
       # those vertices get a "neutral" damage record instead of garbage.
       concatBytes(
         beforeAField,
-        @(bePackU32(uint32(newLodCount))),
+        @(bePackU32(newLodCount)),
         bAndReserved,
         newTable,
         afterATable)
@@ -432,62 +428,3 @@ proc buildSectionConvertedToDonorLodOnDonorTemplate*(
     betweenSubsAndVc,
     suffix)
   return (rebuilt, idxConverted, rstFixed)
-
-proc buildSectionConvertedToLod0OnDonorTemplate*(
-    donorData: openArray[byte], donorSec: SectionInfo,
-    workingData: openArray[byte], workingSec: SectionInfo,
-    lodPick: int32,
-    renameMap: Table[string, string],
-    allowedSubparts: Option[HashSet[string]] = none(HashSet[string]),
-    upconvertIndices: bool = true,
-    padToDonorVpool: bool = true): tuple[bytes: seq[byte]; idxConverted, rstFixed: int] =
-  buildSectionConvertedToDonorLodOnDonorTemplate(
-    donorData, donorSec, workingData, workingSec,
-    lodPick, 0'i32, renameMap, allowedSubparts,
-    upconvertIndices, padToDonorVpool)
-
-proc buildSectionAsIs*(donorData: openArray[byte], donorSec: SectionInfo,
-                       renameMap: Table[string, string],
-                       allowedSubparts: Option[HashSet[string]] = none(HashSet[string])): seq[byte] =
-  let secBytes = sliceBytes(donorData, donorSec.start, donorSec.endPos)
-
-  let lodBlob = sliceBytes(donorData, donorSec.lodVerticesStart, donorSec.lodVerticesEnd)
-  let lod0Blob = sliceBytes(donorData, donorSec.lod0VerticesStart, donorSec.lod0VerticesEnd)
-
-  let partA = sliceBytes(secBytes,
-                donorSec.lodVertexCountPos - donorSec.start,
-                donorSec.lodVerticesStart - donorSec.start) & lodBlob
-  let midToSubcount = sliceBytes(secBytes,
-                donorSec.lodVerticesEnd - donorSec.start,
-                donorSec.subpartCountPos - donorSec.start)
-
-  var subsForBuild: seq[SubSectionInfo] = donorSec.subsections
-  if allowedSubparts.isSome:
-    subsForBuild = subsForBuild.filterIt(it.name in allowedSubparts.get)
-  let subcount = subsForBuild.len.uint32
-
-  var ssBlob: seq[byte] = @[]
-  for ss in subsForBuild:
-    var b = sliceBytes(donorData, ss.start, ss.endPos)
-    if ss.name in renameMap:
-      b = patchSubsectionName(b, ss, renameMap[ss.name])
-    ssBlob.add(b)
-
-  let betweenSubsAndVc = sliceBytes(secBytes,
-                donorSec.subsectionsEnd - donorSec.start,
-                donorSec.vertexCountPos - donorSec.start)
-  let lod0Header = sliceBytes(secBytes,
-                donorSec.vertexCountPos - donorSec.start,
-                donorSec.lod0VerticesStart - donorSec.start)
-  let tail = sliceBytes(secBytes,
-                donorSec.tailStart - donorSec.start, secBytes.len)
-
-  result = concatBytes(
-    sliceBytes(secBytes, 0, donorSec.lodVertexCountPos - donorSec.start),
-    partA,
-    midToSubcount,
-    @(bePackU32(subcount)),
-    ssBlob,
-    betweenSubsAndVc,
-    lod0Header, lod0Blob,
-    tail)

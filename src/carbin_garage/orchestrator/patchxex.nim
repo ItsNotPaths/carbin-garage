@@ -14,6 +14,7 @@
 ## back over the active .xex.
 
 import std/[os, strutils]
+import ../core/ioutil
 import ../core/xex2/unpack
 import ../core/xex2_patches
 
@@ -39,64 +40,16 @@ type
     allSitesAlreadyPatched*: bool  ## true if every site already has patched bytes (idempotent re-run)
     image*: UnpackResult       ## kept around so executePatch doesn't re-unpack
 
-proc readBytes(path: string): seq[uint8] =
-  let s = readFile(path)
-  result = newSeq[uint8](s.len)
-  for i, c in s: result[i] = uint8(ord(c))
-
-proc writeAllBytes(path: string, data: openArray[uint8]) =
-  var f = open(path, fmWrite)
-  defer: f.close()
-  if data.len > 0: discard f.writeBytes(data, 0, data.len)
-
 proc bytesEq(a, b: openArray[uint8]): bool =
   if a.len != b.len: return false
   for i in 0 ..< a.len:
     if a[i] != b[i]: return false
   return true
 
-proc planPatchFromTemplate*(targetPath, templatePath: string,
-                            patchSet: XexPatchSet): PatchPlan =
-  ## Template mode: decrypt `templatePath` (a known-good patched xex from
-  ## another tool), apply OUR patch bytes on top of theirs at the same
-  ## offsets, re-encrypt, and write the result over `targetPath`. Skips
-  ## all the header-integrity guesswork by reusing theirs' headers
-  ## verbatim — they're already structured to satisfy the loader.
-  if not fileExists(templatePath):
-    raise newException(PatchXexError, "template xex not found: " & templatePath)
-  if not fileExists(targetPath):
-    raise newException(PatchXexError, "target xex not found: " & targetPath)
-  let templateRaw = readBytes(templatePath)
-  let img = unpackXex(templateRaw)
-  result.xexPath = targetPath
-  result.backupPath = targetPath & ".vanillabak"
-  result.tmpPath = targetPath & ".tmp"
-  result.targetExists = true
-  result.backupExists = fileExists(result.backupPath)
-  result.keyUsed = img.keyUsed
-  result.patchSet = patchSet
-  result.image = img
-  result.allSitesMatch = true
-  result.allSitesAlreadyPatched = false  # in template mode the sites
-                                          # already carry theirs' scramble,
-                                          # not vanilla — but we apply
-                                          # OUR patches regardless.
-  for s in patchSet.sites:
-    if s.imageOffset + s.vanilla.len > img.imageBytes.len:
-      raise newException(PatchXexError,
-        "patch site " & toHex(s.imageOffset) & " (" & s.note &
-        ") past end of image")
-    var actual = newSeq[uint8](s.vanilla.len)
-    for i in 0 ..< s.vanilla.len:
-      actual[i] = img.imageBytes[s.imageOffset + i]
-    result.sites.add(PatchPlanSite(
-      site: s, matchesVanilla: bytesEq(actual, s.vanilla),
-      matchesPatched: bytesEq(actual, s.patched), actualBytes: actual))
-
 proc planPatch*(xexPath: string, patchSet: XexPatchSet): PatchPlan =
   if not fileExists(xexPath):
     raise newException(PatchXexError, "xex file not found: " & xexPath)
-  let raw = readBytes(xexPath)
+  let raw = readFileBytes(xexPath)
   let img = unpackXex(raw)
   result.xexPath = xexPath
   result.backupPath = xexPath & ".vanillabak"
@@ -144,16 +97,12 @@ proc describePlan*(p: PatchPlan): string =
     result.add "    " & toHex(ps.site.imageOffset, 7) & "  " &
                $ps.site.vanilla.len & "B  " & ps.site.note & "  [" & mark & "]\n"
 
-proc executePatch*(p: PatchPlan; templateBytes: seq[uint8] = @[]) =
+proc executePatch*(p: PatchPlan) =
   ## Apply the patch and write the new xex bytes to disk atomically.
-  ##
-  ## When `templateBytes` is non-empty, repack against the template's
-  ## bytes (template-mode) instead of the target's. The target gets
-  ## overwritten with the template's headers + our re-encrypted payload.
   if p.allSitesAlreadyPatched:
     raise newException(PatchXexError,
       "all sites already patched — nothing to do (re-running would be a no-op)")
-  if not p.allSitesMatch and templateBytes.len == 0:
+  if not p.allSitesMatch:
     raise newException(PatchXexError,
       "refusing to patch: some sites don't match expected vanilla bytes " &
       "(this xex is a different version than our patch set knows about)")
@@ -172,12 +121,11 @@ proc executePatch*(p: PatchPlan; templateBytes: seq[uint8] = @[]) =
   # plaintext image came from the user's vanilla xex.
   let templateHeader = fh1HeaderTemplateBytes()
   let templateProbe = probeXex(templateHeader)
-  let baseBytes = if templateBytes.len > 0: templateBytes
-                  else: readBytes(p.xexPath)
+  let baseBytes = readFileBytes(p.xexPath)
   let repacked = repackXex(baseBytes, image, templateProbe, p.image.keyUsed,
                            templateHeader)
   # Write tmp, then atomic rename via .vanillabak.
-  writeAllBytes(p.tmpPath, repacked)
+  writeFileBytes(p.tmpPath, repacked)
   moveFile(p.xexPath, p.backupPath)
   moveFile(p.tmpPath, p.xexPath)
 

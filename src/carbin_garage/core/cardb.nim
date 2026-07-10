@@ -46,37 +46,16 @@
 import std/[json, os, sequtils, strutils]
 import db_connector/db_sqlite
 import ./profile
+import ./sqlite_util
+
+# Re-export the shared column types (CardbColType / CardbColumn used to
+# live here; downstream modules still reach them via `import ./cardb`).
+export sqlite_util
 
 const SchemaTag* = "carbin-garage.cardb/1"
 
 type
-  CardbColType* = enum cctInt, cctReal, cctText
-  CardbColumn* = object
-    name*: string
-    sqlType*: string
-    typ*: CardbColType
-    nullable*: bool
-    pk*: bool
-
   CardbExtractError* = object of CatchableError
-
-proc classifyType(t: string): CardbColType =
-  let lc = t.toLowerAscii()
-  if lc.contains("int"): cctInt
-  elif lc.contains("real") or lc.contains("float") or lc.contains("doub") or lc.contains("num"):
-    cctReal
-  else: cctText
-
-proc tableSchema(db: DbConn, table: string): seq[CardbColumn] =
-  ## PRAGMA table_info returns rows of [cid, name, type, notnull, dflt_value, pk].
-  for r in db.fastRows(sql("PRAGMA table_info(" & table & ")")):
-    if r.len < 6: continue
-    result.add(CardbColumn(
-      name: r[1],
-      sqlType: r[2],
-      typ: classifyType(r[2]),
-      nullable: r[3] == "0",
-      pk: r[5] != "0"))
 
 proc valueAsJson(v: string, ci: CardbColumn): JsonNode =
   if v.len == 0:
@@ -91,17 +70,6 @@ proc valueAsJson(v: string, ci: CardbColumn): JsonNode =
   of cctText:
     return %v
 
-proc carIdByMediaName(db: DbConn, mediaName: string): int =
-  ## -1 if the car is not in Data_Car. The MediaName comparison is
-  ## case-sensitive on the SQL side; both FM4 and FH1 store the upper-
-  ## cased zip basename verbatim so this matches the file system.
-  result = -1
-  for r in db.fastRows(sql"SELECT Id FROM Data_Car WHERE MediaName=? LIMIT 1", mediaName):
-    if r.len > 0:
-      try: result = parseInt(r[0])
-      except CatchableError: discard
-    break
-
 proc encodeRows(db: DbConn, schema: seq[CardbColumn], query: string,
                 args: varargs[string]): JsonNode =
   result = newJArray()
@@ -111,10 +79,6 @@ proc encodeRows(db: DbConn, schema: seq[CardbColumn], query: string,
       if i < r.len:
         rowObj[ci.name] = valueAsJson(r[i], ci)
     result.add(rowObj)
-
-proc allTableNames(db: DbConn): seq[string] =
-  for r in db.fastRows(sql"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
-    if r.len > 0: result.add(r[0])
 
 proc listMediaNames*(gamedbPath: string): seq[string] =
   ## Enumerate every `Data_Car.MediaName` in the game DB. Used by the GUI
@@ -148,7 +112,7 @@ proc extractCarDb*(gamedbPath: string, mediaName: string,
 
   var tablesNode = newJObject()
   for tbl in allTableNames(db):
-    let cols = tableSchema(db, tbl)
+    let cols = tableColumns(db, tbl)
     if cols.len == 0: continue
     let colNames = cols.mapIt(it.name)
     var keyMode = ""

@@ -3,7 +3,7 @@
 ## mutate the working tree go through gui/verbs.nim — this module is a
 ## passive view of mounts + per-source car lists + selection.
 
-import std/[os, sets, algorithm, strutils, tables, json]
+import std/[os, sets, algorithm, strutils, tables, json, math]
 import ../carbin_garage/core/[profile, mounts, cardb, gltf_runtime,
                               workspace, appconfig, physicsdef]
 import ../carbin_garage/orchestrator/scan
@@ -38,7 +38,6 @@ type
     name*: string          ## mesh name from car.gltf (e.g. "hooda", "wheel-fl")
     section*: string       ## carbin section tag ("body", "hooda", "bumperFa", ...)
     lodKind*: string       ## "main" / "lod0" / "cockpit" / "corner"
-    visible*: bool
     modified*: bool
 
   PartsTab* = object
@@ -52,8 +51,6 @@ type
     active*: bool
     donorSlug*: string     ## working/ slug the part lives in
     partName*: string      ## mesh name (e.g. "hooda")
-    lodKind*:  string
-    section*:  string
 
   LPaneField* = object
     stat*:        EditableStat
@@ -89,8 +86,6 @@ type
     lpane*: LPaneState
     palette*: ExportPaletteState
     selection*: HashSet[tuple[sourceIdx: int, name: string]]
-    settingsOpen*: bool
-    settingsFrac*: float32
 
 proc defaultWorkingRoot*(): string =
   ## Prefer working/ next to the binary (release.sh stages it that way), but
@@ -161,7 +156,9 @@ proc loadWorkingSource(workingRoot: string): Source =
 proc reloadSources*(s: var AppState) =
   ## Rebuild s.sources from disk. Called at startup and after Settings
   ## commits. Combines manual mounts.json overrides with the auto-detected
-  ## standard-install layout under cfg.xeniaContent.
+  ## standard-install layout under cfg.xeniaContent. Clears the selection —
+  ## its sourceIdx keys would go stale across a rebuild.
+  s.selection.clear()
   s.sources.setLen(0)
   for m in effectiveMounts(s.cfg.xeniaContent):
     s.sources.add(loadGameSource(m, s.workingRoot))
@@ -173,17 +170,6 @@ proc initAppState*(workingRoot = ""): AppState =
   result.cfg = loadAppConfig()
   result.selection = initHashSet[tuple[sourceIdx: int, name: string]]()
   reloadSources(result)
-
-proc selectedCount*(s: AppState): int =
-  s.selection.len
-
-proc selectedRows*(s: AppState): seq[tuple[sourceIdx: int, row: CarRow]] =
-  for sel in s.selection:
-    if sel.sourceIdx < 0 or sel.sourceIdx >= s.sources.len: continue
-    for r in s.sources[sel.sourceIdx].cars:
-      if r.name == sel.name:
-        result.add((sel.sourceIdx, r))
-        break
 
 proc partsTabIndex*(s: AppState; slug: string): int =
   ## -1 if no tab exists for this slug.
@@ -204,7 +190,6 @@ proc loadPartsForTab(s: var AppState; tabIdx: int) =
       name:    meta.name,
       section: meta.section,
       lodKind: meta.lodKind,
-      visible: true,
       modified: false))
 
 proc ensurePinnedTab*(s: var AppState) =
@@ -379,6 +364,9 @@ proc resetLPaneField*(s: var AppState; idx: int) =
 proc parseStatValue(kind: EditableStatKind; v: string): JsonNode =
   ## Convert a raw text input to the typed JsonNode the field expects.
   ## Returns nil on parse failure — the caller should skip the field.
+  ## Non-finite floats (NaN/±Inf) count as parse failure: parseFloat
+  ## accepts "nan"/"inf", and a NaN JsonNode would serialize an invalid
+  ## `nan` token into carslot.json.
   case kind
   of eskInt:
     try: result = %parseInt(v)
@@ -389,7 +377,10 @@ proc parseStatValue(kind: EditableStatKind; v: string): JsonNode =
     elif lc in ["0","false","no","off"]: result = %0
     else: result = nil
   else:
-    try: result = %parseFloat(v)
+    try:
+      let f = parseFloat(v)
+      if classify(f) in {fcNan, fcInf, fcNegInf}: result = nil
+      else: result = %f
     except ValueError: result = nil
 
 proc saveLPane*(s: var AppState) =

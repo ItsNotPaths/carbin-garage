@@ -1,66 +1,9 @@
-## camera.nim — free-fly camera for the Z-up Source 2 coordinate system.
-##
-## Yaw rotates around +Z, pitch around the local right axis. At yaw=0, pitch=0
-## the camera looks down +X. Pitch is clamped to ±89° to avoid gimbal flips.
+## camera.nim — OrbitCamera: third-person "helicopter" camera that rotates
+## around a focus point. Z-up world; yaw rotates around +Z, pitch around the
+## local right axis, clamped to ±89° to avoid gimbal flips.
 
 import std/math
 import math3d
-
-type
-  Camera* = object
-    position*: Vec3
-    yaw*: float32        ## radians, around +Z
-    pitch*: float32      ## radians, around local right axis
-    moveSpeed*: float32  ## world units per second (inches)
-    boostMult*: float32  ## multiplier while shift held
-    sensitivity*: float32## radians per pixel
-
-proc newCamera*(pos: Vec3; yaw = 0'f32; pitch = 0'f32): Camera =
-  Camera(
-    position: pos,
-    yaw: yaw,
-    pitch: pitch,
-    moveSpeed: 512'f32,       # 512 inches/s ≈ standard Source player speed
-    boostMult: 4'f32,
-    sensitivity: 0.0025'f32,
-  )
-
-proc forward*(c: Camera): Vec3 =
-  let cp = cos(c.pitch)
-  vec3(cos(c.yaw) * cp, sin(c.yaw) * cp, sin(c.pitch))
-
-proc right*(c: Camera): Vec3 =
-  normalize(cross(c.forward(), vec3(0, 0, 1)))
-
-proc handleMouse*(c: var Camera, dx, dy: float32) =
-  c.yaw   -= dx * c.sensitivity
-  c.pitch -= dy * c.sensitivity
-  let limit = (PI * 0.5'f32) - 0.01'f32
-  if c.pitch >  limit: c.pitch =  limit
-  if c.pitch < -limit: c.pitch = -limit
-
-proc move*(c: var Camera, dt: float32;
-           forwardAxis, rightAxis, upAxis: float32;
-           boost: bool) =
-  var speed = c.moveSpeed
-  if boost: speed *= c.boostMult
-  let step = speed * dt
-  let f = c.forward()
-  let r = c.right()
-  let u = vec3(0, 0, 1)
-  c.position = c.position + f * (forwardAxis * step)
-  c.position = c.position + r * (rightAxis   * step)
-  c.position = c.position + u * (upAxis      * step)
-
-proc viewProj*(c: Camera, aspect: float32): Mat4 =
-  let view = mat4LookAt(c.position, c.position + c.forward(), vec3(0, 0, 1))
-  let proj = mat4Perspective(70.0'f32 * float32(PI) / 180.0'f32,
-                             aspect, 1.0'f32, 16384.0'f32)
-  mat4Mul(proj, view)
-
-# ---------------------------------------------------------------------------
-# OrbitCamera — third-person "helicopter" camera that rotates around a focus
-# point. Used by leveledit's helicopter mode. World is still Z-up.
 
 type
   OrbitCamera* = object
@@ -122,10 +65,3 @@ proc orbitZoom*(c: var OrbitCamera, ticks: float32) =
     c.distance = c.distance * pow(c.zoomStep, -ticks)
   if c.distance < 1.0'f32:    c.distance = 1.0'f32
   if c.distance > 16384'f32:  c.distance = 16384'f32
-
-proc viewProj*(c: OrbitCamera, aspect: float32): Mat4 =
-  let eye = c.position()
-  let view = mat4LookAt(eye, c.focus, vec3(0, 0, 1))
-  let proj = mat4Perspective(70.0'f32 * float32(PI) / 180.0'f32,
-                             aspect, 1.0'f32, 16384.0'f32)
-  mat4Mul(proj, view)

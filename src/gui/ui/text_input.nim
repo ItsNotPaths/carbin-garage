@@ -57,11 +57,26 @@ proc setText*(s: var TextInputState; v: string) =
 proc isFocused*(ctx: UiContext; id: WidgetId): bool =
   ctx.focusedId == id
 
+proc isUtf8Cont(c: char): bool =
+  ## True for UTF-8 continuation bytes (0b10xxxxxx).
+  (uint8(c) and 0b1100_0000'u8) == 0b1000_0000'u8
+
+proc prevCodepointStart(s: string; i: int): int =
+  ## Byte index where the codepoint ending just before byte `i` starts.
+  result = i - 1
+  while result > 0 and isUtf8Cont(s[result]): dec result
+
+proc nextCodepointStart(s: string; i: int): int =
+  ## Byte index just past the codepoint starting at byte `i`.
+  result = i + 1
+  while result < s.len and isUtf8Cont(s[result]): inc result
+
 proc handleInput(s: var TextInputState; ctx: var UiContext) =
-  ## Apply this frame's typed glyphs + key events to `s`. Writes happen at
-  ## byte indices — fine for ASCII; for multi-byte UTF-8 the caret may
-  ## land mid-codepoint when arrow-keys are used (acceptable for stats
-  ## form which is numeric).
+  ## Apply this frame's typed glyphs + key events to `s`. The cursor is a
+  ## byte index, but caret movement and deletion step over UTF-8
+  ## continuation bytes so they always operate on whole codepoints —
+  ## SDL TEXT_INPUT delivers multi-byte UTF-8 and byte-wise deletes would
+  ## corrupt the string.
   if ctx.textInput.len > 0:
     s.text.insert(ctx.textInput, s.cursor)
     s.cursor += ctx.textInput.len
@@ -88,15 +103,16 @@ proc handleInput(s: var TextInputState; ctx: var UiContext) =
     case k.key
     of SDLK_BACKSPACE:
       if s.cursor > 0:
-        s.text.delete(s.cursor - 1 .. s.cursor - 1)
-        dec s.cursor
+        let start = prevCodepointStart(s.text, s.cursor)
+        s.text.delete(start .. s.cursor - 1)
+        s.cursor = start
     of SDLK_DELETE:
       if s.cursor < s.text.len:
-        s.text.delete(s.cursor .. s.cursor)
+        s.text.delete(s.cursor .. nextCodepointStart(s.text, s.cursor) - 1)
     of SDLK_LEFT:
-      if s.cursor > 0: dec s.cursor
+      if s.cursor > 0: s.cursor = prevCodepointStart(s.text, s.cursor)
     of SDLK_RIGHT:
-      if s.cursor < s.text.len: inc s.cursor
+      if s.cursor < s.text.len: s.cursor = nextCodepointStart(s.text, s.cursor)
     of SDLK_HOME:
       s.cursor = 0
     of SDLK_END:
@@ -199,6 +215,12 @@ proc tryClamp*(s: var TextInputState;
   try:
     v = parseFloat(s.text.strip())
   except ValueError:
+    s.flashS = 0.6'f32
+    return false
+  if classify(v) in {fcNan, fcInf, fcNegInf}:
+    # parseFloat accepts "nan"/"inf"; NaN sails through the clamps below
+    # (all comparisons false) and would end up serialized into
+    # carslot.json as an invalid `nan` token. Treat as parse failure.
     s.flashS = 0.6'f32
     return false
   let clamped = (v < minV) or (v > maxV)

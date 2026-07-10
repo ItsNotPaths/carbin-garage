@@ -99,6 +99,40 @@ else
     echo "  done."
 fi
 
+echo "==> sqlite (amalgamation, for static link)"
+# Vendored so the binary statically links SQLite (see build-deps.sh +
+# nim.cfg --dynlibOverride) instead of dlopen'ing a system libsqlite3.so /
+# sqlite3.dll at runtime. Pin the version + sha3-256 from sqlite.org's
+# download page. The autoconf .tar.gz (not the .zip) is used so plain `tar`
+# extracts it — no `unzip` dependency in CI.
+SQLITE_YEAR="2026"
+SQLITE_VER="3530200"   # 3.53.2
+SQLITE_SHA3="025328da165109f48abccc6e7478508060804412bed2bd81d47e98ba1b72983b"
+if [ -f "$VENDOR/sqlite/sqlite3.c" ] && [ -f "$VENDOR/sqlite/sqlite3.h" ]; then
+    echo "  already present: sqlite"
+else
+    echo "  downloading sqlite-autoconf-$SQLITE_VER..."
+    mkdir -p "$VENDOR/sqlite"
+    tmp="$VENDOR/sqlite/.autoconf.tar.gz"
+    curl -fsSL "https://www.sqlite.org/$SQLITE_YEAR/sqlite-autoconf-$SQLITE_VER.tar.gz" -o "$tmp"
+    # Best-effort integrity check (openssl >=1.1.1 ships sha3-256). Fail on a
+    # real mismatch; skip silently only if the digest isn't available at all.
+    if printf '' | openssl dgst -sha3-256 >/dev/null 2>&1; then
+        got=$(openssl dgst -sha3-256 "$tmp" | awk '{print $NF}')
+        if [ "$got" != "$SQLITE_SHA3" ]; then
+            echo "  error: sqlite checksum mismatch (got $got, want $SQLITE_SHA3)" >&2
+            rm -f "$tmp"; exit 1
+        fi
+        echo "  sha3-256 ok"
+    else
+        echo "  (openssl sha3-256 unavailable; skipping checksum)"
+    fi
+    tar xz --strip-components=1 -C "$VENDOR/sqlite" -f "$tmp" --wildcards \
+        '*/sqlite3.c' '*/sqlite3.h' '*/sqlite3ext.h'
+    rm -f "$tmp"
+    echo "  done."
+fi
+
 echo "==> stb (image + image_write + dxt)"
 mkdir -p "$VENDOR/stb"
 for h in stb_image.h stb_image_write.h stb_dxt.h; do

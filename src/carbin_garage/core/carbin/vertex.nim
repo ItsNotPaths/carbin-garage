@@ -5,7 +5,7 @@
 ## Port of probe/reference/fm4_obj.py:159-285.
 ## Spec: docs/FM4_CARBIN_CONDENSED.md §3.
 
-import std/[endians, math]
+import std/endians
 import ./vertex_quat
 
 export vertex_quat
@@ -30,17 +30,12 @@ proc readU16BE(buf: openArray[byte], off: int): uint16 =
   var be: array[2, byte] = [buf[off], buf[off + 1]]
   bigEndian16(addr result, addr be[0])
 
-proc writeI16BE(buf: var seq[byte], off: int, v: int16) =
-  var src = v
-  var dst: array[2, byte]
-  bigEndian16(addr dst[0], addr src)
-  buf[off] = dst[0]; buf[off + 1] = dst[1]
-
-proc writeU16BE(buf: var seq[byte], off: int, v: uint16) =
-  var src = v
-  var dst: array[2, byte]
-  bigEndian16(addr dst[0], addr src)
-  buf[off] = dst[0]; buf[off + 1] = dst[1]
+proc remap1*(v, srcMin, srcMax, tgtMin, tgtMax: float32): float32 =
+  ## Linear range remap; degenerate source range collapses to tgtMin.
+  ## Shared by the glTF decode/encode paths and section synthesis.
+  let r = srcMax - srcMin
+  if abs(r) < 1e-12'f32: return tgtMin
+  result = tgtMin + ((v - srcMin) / r) * (tgtMax - tgtMin)
 
 # ---- decode ----
 
@@ -78,41 +73,6 @@ proc decodeVertex*(blob: openArray[byte], off: int): Vertex =
   result.normal = quatToMatrixRow0(q)
   for i in 0 .. 7:
     result.extra8[i] = blob[off + 24 + i]
-
-# ---- encode ----
-
-proc encodeVertex*(pos: Vec3, uv0, uv1: array[2, float32], normal: Vec3,
-                   tangent: Vec3 = [0.0'f32, 0.0'f32, 0.0'f32],
-                   extra8: array[8, byte] = default(array[8, byte])): array[VERTEX_SIZE, byte] =
-  ## Encode one 0x20-stride vertex. Caller picks the per-subsection inverse
-  ## UV transform before calling. extra8 must be the original pool bytes
-  ## from the source vertex (suspected second tangent — see docs §11.1).
-  let maxAbs = max(max(abs(pos[0]), abs(pos[1])), max(abs(pos[2]), 1e-8'f32))
-  let s = if maxAbs <= 1.0'f32: maxAbs else: maxAbs
-  let nx = pos[0] / s
-  let ny = pos[1] / s
-  let nz = pos[2] / s
-
-  let useTangent = tangent[0] != 0.0'f32 or tangent[1] != 0.0'f32 or tangent[2] != 0.0'f32
-  let q: Quat16 =
-    if useTangent: tangentSpaceToQuat(normal, tangent)
-    else: normalToQuat(normal)
-
-  var buf = newSeq[byte](VERTEX_SIZE)
-  writeI16BE(buf, 0, toShortn(nx))
-  writeI16BE(buf, 2, toShortn(ny))
-  writeI16BE(buf, 4, toShortn(nz))
-  writeI16BE(buf, 6, toShortn(min(1.0'f32, s)))
-  writeU16BE(buf, 8,  toUshortn(uv0[0]))
-  writeU16BE(buf, 10, toUshortn(uv0[1]))
-  writeU16BE(buf, 12, toUshortn(uv1[0]))
-  writeU16BE(buf, 14, toUshortn(uv1[1]))
-  writeI16BE(buf, 16, q[0])
-  writeI16BE(buf, 18, q[1])
-  writeI16BE(buf, 20, q[2])
-  writeI16BE(buf, 22, q[3])
-  for i in 0 .. 7: buf[24 + i] = extra8[i]
-  for i in 0 ..< VERTEX_SIZE: result[i] = buf[i]
 
 proc decodeVertex28*(blob: openArray[byte], off: int): Vertex =
   ## FH1 28-byte vertex layout (corrected 2026-05-01):

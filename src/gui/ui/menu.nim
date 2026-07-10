@@ -5,10 +5,11 @@
 ## clearing `open`).
 ##
 ## The widget is rendered LAST in the frame (after dropup + settings) so
-## its hit region wins over anything underneath. It also raises
-## `ctx.inputBlocked` for the rest of the frame's hit-testing once it
-## consumes a click — but since it's drawn last there's nothing left to
-## block.
+## its hit region wins over anything underneath. It never touches
+## `ctx.inputBlocked`; being drawn last means the click that picks or
+## dismisses an item has already been seen by everything below it this
+## frame — callers guard against that with a menu-was-open-at-frame-start
+## check where it matters.
 
 import std/hashes
 import context

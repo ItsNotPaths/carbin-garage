@@ -10,6 +10,7 @@ import text as uitext
 import scroll
 import button
 import text_input
+from dropup import matchesSearch
 import ../state
 import ../car_names
 import ../../carbin_garage/core/profile
@@ -31,7 +32,6 @@ const
   SearchPad         = 4.0'f32
 
   ModifiedDot       = (0.95'f32, 0.70'f32, 0.20'f32, 1.0'f32)
-  HelpDim           = (0.55'f32, 0.58'f32, 0.65'f32, 1.0'f32)
 
   PanePadX*         = 48.0'f32      ## inset from window's left edge
   PanePadTop        = 48.0'f32
@@ -39,10 +39,6 @@ const
 
 proc searchWid(slug: string): WidgetId =
   WidgetId(hash("lpane.search." & slug))
-
-proc matchesSearch(query, name: string): bool =
-  if query.len == 0: return true
-  name.toLowerAscii.contains(query.toLowerAscii.strip())
 
 proc fieldWid(slug, col: string): WidgetId =
   WidgetId(hash("lpane.field." & slug & "/" & col))
@@ -60,9 +56,7 @@ proc paneRect*(winW, winH, stripH, dropupH: float32): Rect =
        winH - stripH - dropupH - PanePadTop - PanePadBot)
 
 proc drawLPane*(ctx: var UiContext; cache: var TextCache;
-                app: var AppState; pane: Rect): bool =
-  ## Returns true if the user pressed Save this frame.
-  result = false
+                app: var AppState; pane: Rect) =
   let (br, bg, bb, ba) = PaneBg
   ctx.pushSolid(pane, color(br, bg, bb, ba))
 
@@ -77,8 +71,6 @@ proc drawLPane*(ctx: var UiContext; cache: var TextCache;
                 header.y + (header.h - 14) * 0.5'f32 - 5)
 
   if app.lpane.slug.len == 0 or app.lpane.fields.len == 0:
-    let (dr, dg, db, da) = HelpDim
-    discard (dr, dg, db, da)
     ctx.pushLabel(cache, "no car loaded",
                   pane.x + RowPadX, pane.y + HeaderH + 12)
     return
@@ -101,7 +93,6 @@ proc drawLPane*(ctx: var UiContext; cache: var TextCache;
   if button(ctx, cache, fieldWid(app.lpane.slug, "__save"), saveBtnR,
             "Save", saveStyle):
     saveLPane(app)
-    result = true
 
   # Search bar between header and the scrollable form.
   let searchR = rect(pane.x + SearchPad,

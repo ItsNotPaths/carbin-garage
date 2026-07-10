@@ -3,17 +3,12 @@
 ## Generic buffer/texture upload, shader loading, depth texture and sampler
 ## creation. No game- or tool-specific types live here.
 
-import std/[os, strformat]
+import std/strformat
 import platform/sdl3
 
 proc die*(msg: string) {.noreturn.} =
-  echo &"fatal: {msg}: {SDL_GetError()}"
+  stderr.writeLine &"fatal: {msg}: {SDL_GetError()}"
   quit(1)
-
-proc readBinaryFile*(path: string): string =
-  if not fileExists(path):
-    die("missing file " & path)
-  result = readFile(path)
 
 proc loadShaderBytes*(dev: ptr SDL_GPUDevice;
                       spv: string;
@@ -32,14 +27,6 @@ proc loadShaderBytes*(dev: ptr SDL_GPUDevice;
   result = SDL_CreateGPUShader(dev, addr info)
   if result == nil:
     die("SDL_CreateGPUShader(" & tag & ")")
-
-proc loadShader*(dev: ptr SDL_GPUDevice;
-                 spvPath: string;
-                 stage: SDL_GPUShaderStage;
-                 numUniforms: uint32 = 0;
-                 numSamplers: uint32 = 0): ptr SDL_GPUShader =
-  loadShaderBytes(dev, readBinaryFile(spvPath),
-                  stage, numUniforms, numSamplers, spvPath)
 
 proc uploadBuffer*(dev: ptr SDL_GPUDevice;
                    src: pointer; byteSize: uint32;
@@ -88,12 +75,6 @@ proc uploadVertexBuffer*[T](dev: ptr SDL_GPUDevice;
 proc uploadIndexBufferU32*(dev: ptr SDL_GPUDevice;
                            data: seq[uint32]): ptr SDL_GPUBuffer =
   let byteSize = uint32(data.len * sizeof(uint32))
-  uploadBuffer(dev, data[0].unsafeAddr, byteSize,
-               SDL_GPU_BUFFERUSAGE_INDEX, "index")
-
-proc uploadIndexBufferU16*(dev: ptr SDL_GPUDevice;
-                           data: seq[uint16]): ptr SDL_GPUBuffer =
-  let byteSize = uint32(data.len * sizeof(uint16))
   uploadBuffer(dev, data[0].unsafeAddr, byteSize,
                SDL_GPU_BUFFERUSAGE_INDEX, "index")
 
@@ -179,16 +160,3 @@ proc createLinearClampSampler*(dev: ptr SDL_GPUDevice): ptr SDL_GPUSampler =
   result = SDL_CreateGPUSampler(dev, addr info)
   if result == nil:
     die("SDL_CreateGPUSampler(linear-clamp)")
-
-proc createNearestRepeatSampler*(dev: ptr SDL_GPUDevice): ptr SDL_GPUSampler =
-  ## Nearest filter, wrap-repeat — used for tiled procedural level textures.
-  var info: SDL_GPUSamplerCreateInfo
-  info.min_filter     = SDL_GPU_FILTER_NEAREST
-  info.mag_filter     = SDL_GPU_FILTER_NEAREST
-  info.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST
-  info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT
-  info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT
-  info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT
-  result = SDL_CreateGPUSampler(dev, addr info)
-  if result == nil:
-    die("SDL_CreateGPUSampler(nearest-repeat)")

@@ -1,6 +1,7 @@
 ## CLI subcommand router. Phase-1 commands target FM4 only.
 
 import std/[json, os, sets, strutils, times]
+import ./core/ioutil
 import ./core/profile
 import ./core/carbin/gltf_pack
 import ./core/xds
@@ -22,7 +23,7 @@ const
   NAME = "carbin-garage"
   VERSION = "0.0.1"
 
-proc usage*() =
+proc usage() =
   echo NAME & " " & VERSION & """
 
 usage:
@@ -107,12 +108,10 @@ usage:
   carbin-garage port-to <working-car> <target-game-id> --donor <donor-slug>
                                             [--name <new-slug>] [--dry-run]
                                             [--replace-db]
-                                            Cross-game port. Donor's archive
+                                            SAME-GAME port. Donor's archive
                                             scaffolds the export; source's
                                             textures + carbin slots are
-                                            spliced in (v0: carbins are
-                                            donor-verbatim, real transcode
-                                            lands in Slice B). DB row is
+                                            transcoded/spliced in. DB row is
                                             patched into target gamedb.slt
                                             using donor's row as template;
                                             BaseCost=1 forced. Atomic zip
@@ -120,9 +119,13 @@ usage:
                                             --replace-db deletes any
                                             existing rows for the new
                                             MediaName before insert.
+                                            Cross-game / new-car ports use
+                                            port-to-dlc instead.
   carbin-garage port-to-dlc <working-car> <target-game-id> --donor <donor-slug>
                                             --content <xenia-content-dir>
                                             [--name <new-slug>] [--profile-id <hex>]
+                                            [--dlc-id <n>] [--car-id <n>]
+                                            [--engine-id <n>]
                                             [--replace] [--skip-merge-slt]
                                             [--dry-run] [--uninstall]
                                             [--no-hitboxes]
@@ -159,7 +162,23 @@ usage:
                                             Atomic: <xex>.vanillabak holds the
                                             original. --restore swaps the bak
                                             back over the active xex.
-  carbin-garage diff <a.zip> <b.zip>        (Phase 1, TODO)
+  carbin-garage dump-physicsdef <bin> [--json <out>] | --from-json <in> --out <bin>
+                                            Print the labelled fields of a
+                                            physicsdefinition.bin, dump the
+                                            editable JSON intermediate, or
+                                            round-trip edited JSON back into
+                                            a bin.
+  carbin-garage export-carbin <slug-or-working-dir> [--strict]
+                                            glTF -> carbin re-emit into
+                                            working/<slug>/geometry/*.regen.
+  carbin-garage add-part <working-car> <obj> --name <n> [--place x,y,z] [--scale s]
+                                            Inject an OBJ as a new mesh into
+                                            the working car's car.gltf; the
+                                            next port-to-dlc picks it up.
+  carbin-garage drop-part <working-car> <name>[,<name>...]
+                                            Record section names to remove
+                                            from the exported car in
+                                            working/<slug>/part_edits.json.
 """
 
 proc parseFlag(args: openArray[string], flag: string): string =
@@ -167,16 +186,24 @@ proc parseFlag(args: openArray[string], flag: string): string =
     if a == flag and i + 1 < args.len: return args[i + 1]
   return ""
 
+proc parseFlag(args: openArray[string], flag, default: string): string =
+  let v = parseFlag(args, flag)
+  if v.len > 0: v else: default
+
+proc parseIntFlag(args: openArray[string], flag, cmdName: string,
+                  default: int = 0): int =
+  let v = parseFlag(args, flag)
+  if v.len == 0: return default
+  try: parseInt(v)
+  except CatchableError:
+    echo cmdName, ": ", flag, " must be an integer"; quit 1
+
 proc cmdImport(args: seq[string]) =
   if args.len == 0:
     echo "import: missing <car.zip>"; quit 1
   let zipPath = args[0]
-  let outDir = block:
-    let v = parseFlag(args, "--out")
-    if v.len > 0: v else: "working"
-  let profileId = block:
-    let v = parseFlag(args, "--profile")
-    if v.len > 0: v else: "fm4"
+  let outDir = parseFlag(args, "--out", "working")
+  let profileId = parseFlag(args, "--profile", "fm4")
   let slug = parseFlag(args, "--slug")
   let allVariants = "--all-variants" in args
   let prof = loadProfileById(profileId)
@@ -213,9 +240,7 @@ proc cmdRoundtrip(args: seq[string]) =
   if args.len == 0:
     echo "roundtrip: missing <car.zip>"; quit 1
   let zipPath = args[0]
-  let profileId = block:
-    let v = parseFlag(args, "--profile")
-    if v.len > 0: v else: "fm4"
+  let profileId = parseFlag(args, "--profile", "fm4")
   let prof = loadProfileById(profileId)
   let tmpRoot = getTempDir() / "carbin-garage-roundtrip"
   removeDir(tmpRoot)
@@ -242,10 +267,7 @@ proc cmdDecodeXds(args: seq[string]) =
     if args.len >= 2 and not args[1].startsWith("--"): args[1]
     else: inPath & (if asPpm: ".ppm" else: ".png")
 
-  let raw = readFile(inPath)
-  var bytes = newSeq[byte](raw.len)
-  for i, c in raw: bytes[i] = byte(c)
-
+  let bytes = readFileBytes(inPath)
   let h = parseXdsHeader(bytes)
   echo "  header: ", formatName(h.dataFormat), "  ",
        h.width, "x", h.height,
@@ -257,7 +279,7 @@ proc cmdDecodeXds(args: seq[string]) =
   else:     writePng(outPath, img)
   echo "decoded -> ", outPath
 
-proc reencodeTextureDir*(texDir: string, mode: cint = StbDxtNormal): int =
+proc reencodeTextureDir(texDir: string, mode: cint = StbDxtNormal): int =
   ## Re-encode every .xds in `texDir` whose sibling .xds.png is newer
   ## (the user-visible edit signal). Returns the count of rewritten .xds
   ## files. Idempotent — running twice on a clean tree does nothing.
@@ -275,9 +297,7 @@ proc reencodeTextureDir*(texDir: string, mode: cint = StbDxtNormal): int =
     if getLastModificationTime(pngPath) <= getLastModificationTime(p): continue
     try:
       let img = readPng(pngPath)
-      let raw = readFile(p)
-      var orig = newSeq[byte](raw.len)
-      for i, c in raw: orig[i] = byte(c)
+      let orig = readFileBytes(p)
       let h = parseXdsHeader(orig)
       if img.width != h.width or img.height != h.height:
         echo "  - reencode skipped (dim mismatch): ", extractFilename(p),
@@ -285,9 +305,7 @@ proc reencodeTextureDir*(texDir: string, mode: cint = StbDxtNormal): int =
         continue
       let encoded = encodeXdsFromOriginal(img.rgba, img.width, img.height,
                                            orig, mode)
-      var f = open(p, fmWrite)
-      defer: f.close()
-      if encoded.len > 0: discard f.writeBytes(encoded, 0, encoded.len)
+      writeFileBytes(p, encoded)
       echo "  + reencoded ", extractFilename(p), " (", encoded.len, " bytes)"
       inc result
     except CatchableError as e:
@@ -326,9 +344,7 @@ proc cmdEncodeXds(args: seq[string]) =
     else: cint(StbDxtNormal)
 
   let img = readPng(pngPath)
-  let raw = readFile(origPath)
-  var orig = newSeq[byte](raw.len)
-  for i, c in raw: orig[i] = byte(c)
+  let orig = readFileBytes(origPath)
   let h = parseXdsHeader(orig)
   if img.width != h.width or img.height != h.height:
     echo "encode-xds: dim mismatch — original ", h.width, "x", h.height,
@@ -341,9 +357,7 @@ proc cmdEncodeXds(args: seq[string]) =
        "  mode=", (if mode == cint(StbDxtHighQual): "highqual" else: "normal")
   let encoded = encodeXdsFromOriginal(img.rgba, img.width, img.height,
                                        orig, mode)
-  var f = open(outPath, fmWrite)
-  defer: f.close()
-  if encoded.len > 0: discard f.writeBytes(encoded, 0, encoded.len)
+  writeFileBytes(outPath, encoded)
   echo "encoded -> ", outPath, " (", encoded.len, " bytes)"
 
 proc cmdDumpCardb(args: seq[string]) =
@@ -354,9 +368,7 @@ proc cmdDumpCardb(args: seq[string]) =
     echo "dump-cardb: missing <game-folder> <car-name>"; quit 1
   let gameFolder = args[0]
   let carName = args[1]
-  let profileId = block:
-    let v = parseFlag(args, "--profile")
-    if v.len > 0: v else: "fm4"
+  let profileId = parseFlag(args, "--profile", "fm4")
   let outPath = parseFlag(args, "--out")
   let prof = loadProfileById(profileId)
   if prof.gamedbPath.len == 0:
@@ -369,10 +381,6 @@ proc cmdDumpCardb(args: seq[string]) =
     echo "wrote -> ", outPath, " (", snippet["tables"].len, " tables)"
   else:
     echo body
-
-proc readBytes(p: string): seq[byte] =
-  let s = readFile(p); result = newSeq[byte](s.len)
-  for i, c in s: result[i] = byte(c)
 
 proc cmdDumpPhysicsdef(args: seq[string]) =
   ## Parse a `physicsdefinition.bin` and print the labelled fields.
@@ -387,9 +395,7 @@ proc cmdDumpPhysicsdef(args: seq[string]) =
       echo "dump-physicsdef --from-json requires --out <bin>"; quit 1
     let pd = fromJson(parseFile(fromJsonPath))
     let bytes = emitPhysicsDef(pd)
-    var s = newString(bytes.len)
-    for i, b in bytes: s[i] = char(b)
-    writeFile(outPath, s)
+    writeFileBytes(outPath, bytes)
     echo "wrote -> ", outPath, " (", bytes.len, " B)"
     return
 
@@ -397,7 +403,7 @@ proc cmdDumpPhysicsdef(args: seq[string]) =
     echo "dump-physicsdef: missing <bin> [--json <out>] | --from-json <in> --out <bin>"
     quit 1
   let binPath = args[0]
-  let data = readBytes(binPath)
+  let data = readFileBytes(binPath)
   let pd = parsePhysicsDef(data)
   let jsonOut = parseFlag(args, "--json")
   if jsonOut.len > 0:
@@ -537,8 +543,6 @@ proc cmdPortTo(args: seq[string]) =
   let newName = parseFlag(args, "--name")
   let dryRun = "--dry-run" in args
   let replaceDb = "--replace-db" in args
-  let fromDonorOnly = "--from-donor-only" in args
-  let noEntryRename = "--no-entry-rename" in args
   let all = loadMounts()
   let i = findMount(all, gameId)
   if i < 0:
@@ -547,7 +551,7 @@ proc cmdPortTo(args: seq[string]) =
     quit 1
   let prof = loadProfileById(gameId)
   let plan =
-    try: planPort(workingCar, all[i], prof, donor, newName, fromDonorOnly, noEntryRename)
+    try: planPort(workingCar, all[i], prof, donor, newName)
     except PortError as e:
       echo "port-to: ", e.msg; quit 1
   echo "port-to [", gameId, "]: ", plan.sourceSlug, " -> ", plan.newSlug,
@@ -575,9 +579,7 @@ proc cmdPortToDlc(args: seq[string]) =
   let donor = parseFlag(args, "--donor")
   var contentRoot = parseFlag(args, "--content")
   let newName = parseFlag(args, "--name")
-  let profileId = block:
-    let v = parseFlag(args, "--profile-id")
-    if v.len > 0: v else: "0000000000000000"
+  let profileId = parseFlag(args, "--profile-id", DefaultProfileId)
   let replace = "--replace" in args
   let skipMerge = "--skip-merge-slt" in args
   let dryRun = "--dry-run" in args
@@ -585,27 +587,9 @@ proc cmdPortToDlc(args: seq[string]) =
   let noHitboxes = "--no-hitboxes" in args
   let lod0SpliceCrossCar = "--lod0-splice-cross-car" in args
   let packFromGltf = "--pack-from-gltf" in args
-  let dlcIdOverride = block:
-    let v = parseFlag(args, "--dlc-id")
-    if v.len > 0:
-      try: parseInt(v)
-      except CatchableError:
-        echo "port-to-dlc: --dlc-id must be an integer"; quit 1
-    else: 0
-  let forcedCarId = block:
-    let v = parseFlag(args, "--car-id")
-    if v.len > 0:
-      try: parseInt(v)
-      except CatchableError:
-        echo "port-to-dlc: --car-id must be an integer"; quit 1
-    else: 0
-  let forcedEngineId = block:
-    let v = parseFlag(args, "--engine-id")
-    if v.len > 0:
-      try: parseInt(v)
-      except CatchableError:
-        echo "port-to-dlc: --engine-id must be an integer"; quit 1
-    else: 0
+  let dlcIdOverride = parseIntFlag(args, "--dlc-id", "port-to-dlc")
+  let forcedCarId = parseIntFlag(args, "--car-id", "port-to-dlc")
+  let forcedEngineId = parseIntFlag(args, "--engine-id", "port-to-dlc")
   if donor.len == 0:
     echo "port-to-dlc: --donor <donor-slug> is required"; quit 1
   if contentRoot.len == 0:
@@ -700,15 +684,18 @@ proc cmdAddPart(args: seq[string]) =
   let pf = parseFlag(args, "--place")
   if pf.len > 0:
     let parts = pf.split(',')
-    if parts.len == 3:
-      for i in 0 .. 2:
-        try: place[i] = parseFloat(parts[i].strip()).float32
-        except CatchableError: discard
+    if parts.len != 3:
+      echo "add-part: --place expects x,y,z"; quit 1
+    for i in 0 .. 2:
+      try: place[i] = parseFloat(parts[i].strip()).float32
+      except CatchableError:
+        echo "add-part: bad --place component: ", parts[i]; quit 1
   var scale = 1.0'f32
   let sf = parseFlag(args, "--scale")
   if sf.len > 0:
     try: scale = parseFloat(sf).float32
-    except CatchableError: discard
+    except CatchableError:
+      echo "add-part: bad --scale value: ", sf; quit 1
   let gltf = workingCar / "car.gltf"
   if not fileExists(gltf): echo "add-part: no car.gltf in ", workingCar; quit 1
   if not fileExists(objPath): echo "add-part: no such OBJ: ", objPath; quit 1
@@ -787,11 +774,5 @@ proc mainWithArgs*(args: openArray[string]) =
   of "drop-part":
     cmdDropPart(rest)
   else:
-    echo "TODO: command '" & cmd & "' not yet implemented"
+    echo "unknown command '" & cmd & "' (run `carbin-garage help` for usage)"
     quit(1)
-
-proc main*() =
-  var args: seq[string] = @[]
-  for i in 1 .. paramCount():
-    args.add(paramStr(i))
-  mainWithArgs(args)

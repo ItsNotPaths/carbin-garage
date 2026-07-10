@@ -3,6 +3,7 @@
 ## Spec: docs/APPLET_ARCHITECTURE.md §"Operation contracts".
 
 import std/[json, os, strutils]
+import ../core/ioutil
 import ../core/zip21
 import ../core/lzx
 import ../core/profile
@@ -22,28 +23,18 @@ proc isStripped(name: string): bool =
   ## those in the glTF emit — they have no geometry.
   extractFilename(name).toLowerAscii().startsWith("stripped_")
 
-proc writeAllBytes(path: string, data: openArray[byte]) =
-  var f = open(path, fmWrite)
-  defer: f.close()
-  if data.len > 0: discard f.writeBytes(data, 0, data.len)
-
 proc baseNameNoExt(name: string): string =
   let b = extractFilename(name)
   let dot = b.rfind('.')
   result = if dot < 0: b else: b[0 ..< dot]
 
-proc readFileBytes(path: string): seq[byte] =
-  let s = readFile(path)
-  result = newSeq[byte](s.len)
-  for i, c in s: result[i] = byte(c)
-
 type
-  EmittedSection* = object
-    name*: string
-    meshIdx*: int
-    offset*: array[3, float32]
-    boundMin*: array[3, float32]
-    boundMax*: array[3, float32]
+  EmittedSection = object
+    name: string
+    meshIdx: int
+    offset: array[3, float32]
+    boundMin: array[3, float32]
+    boundMax: array[3, float32]
 
 proc readMaxDataDimensions(workingRoot: string): tuple[wheelbase, frontTrack, rearTrack: float32; ok: bool] =
   ## Pull Wheelbase, FrontTrackOuter, RearTrackOuter from maxdata.xml.
@@ -176,7 +167,7 @@ proc importToWorking*(zipPath: string, profile: GameProfile,
       else:
         root / extractFilename(e.name)
     createDir(parentDir(target))
-    writeAllBytes(target, bytes)
+    writeFileBytes(target, bytes)
 
   # Stash the source zip for byte-exact export. Cheap, deterministic, and
   # the zip is already on disk — copying it sidesteps the "you can't

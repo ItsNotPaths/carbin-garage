@@ -1,19 +1,7 @@
-## port-to (DLC mode): emit a Forza Horizon DLC package for a new car.
-##
-## ## Two backend modes for cross-game / new-car export
-##
-## The backend now exposes two distinct write paths. The UI surface stays
-## flat — a single "save as" picker chooses the slug; this module is
-## reached when the user picked a slug that does NOT already exist in the
-## target game (i.e. "add a new car"). The other path,
-## `orchestrator/portto.nim`, is reached for an existing slug
-## (i.e. "overwrite this car"). The dispatcher between them is the CLI
-## verb / future orchestrator entry; this file does not own that choice.
-##
-## | Mode                | Module             | What it touches                                 | Status                                     |
-## |---------------------|--------------------|-------------------------------------------------|--------------------------------------------|
-## | overwrite-existing  | portto.nim         | media/cars/<slug>.zip + gamedb.slt row          | works same-game; cross-game pipeline-broken |
-## | add-new-car (DLC)   | portto_dlc.nim     | xenia content/<profile>/<TitleID>/00000002/<id>/| **scaffold** — see "Scaffold scope" below  |
+## port-to-dlc: emit a Forza Horizon DLC package for a new car. This is
+## THE shipping path for cross-game / new-car ports (in-game validated).
+## Same-game overwrite of an existing slug goes through
+## `orchestrator/portto.nim` instead; the CLI verb picks between them.
 ##
 ## ## Why DLC packaging
 ##
@@ -21,79 +9,54 @@
 ## `gamedb.slt` edits. The audio engine's init-time SQL chain returns 0
 ## rows for our newly-cloned car, SQL CE substitutes its error string
 ## into asset paths, and the open-world spawn nukes the global render
-## pipeline. ~30 tables of cloning across two sessions did not isolate
-## the offending join. Working car-add mods exist in the wild and they
-## all package as DLC: a separate `<id>00_merge.slt` is loaded and merged
-## into the live DB at boot, exercising a different code path that the
-## audio subsystem honors. Authoritative roadmap: `docs/PLAN_DLC_PIVOT.md`.
+## pipeline. Working car-add mods all package as DLC: a separate
+## `<id>00_merge.slt` is merged into the live DB at boot, exercising a
+## code path the audio subsystem honors.
 ##
 ## ## DLC package layout (decoded from the example at
 ##   xenia_canary_windows/content/0000000000000000/4D5309C9/00000002/4D5309C900000729)
 ##
 ## ```
-## <packageDir>/                                       # named <TitleID><DlcId8hex>
+## <packageDir>/                                       # named <TitleID><dlcId 8-digit>
 ## └── Media/
 ##     ├── <dlcId>.puboffer                            # 3-byte marker (CR LF LF)
 ##     └── DLCZips/
 ##         ├── zipmount.xml                            # declares mount points
-##         ├── <packageId>_pri_99/                     # extracted "main overlay"
+##         ├── <dlcId>_pri_99/                         # merge overlay (auto-discovered)
 ##         │   └── Media/
-##         │       └── db/
-##         │           └── patch/
-##         │               └── <dlcId>00_merge.slt     # 56-table partial gamedb
-##         ├── cars_pri_<dlcId>/<MediaName>.zip        # geometry (NEW)
-##         └── wheels_pri_<dlcId>/<MediaName>.zip      # wheels (NEW)
+##         │       ├── db/patch/<dlcId>00_merge.slt    # 56-table partial gamedb
+##         │       └── Audio/Cars/...                  # donor CMT/ET XMLs, renamed
+##         ├── cars_pri_<dlcId>/<MediaName>/           # geometry, LOOSE files
+##         └── wheels_pri_<dlcId>/<MediaName>/         # wheels, LOOSE files
 ## ```
+##
+## Plus a `.header` sidecar at `<TitleID>/Headers/00000002/<packageId>.header`
+## so xenia enumerates the package with a display name and FH1 honors its
+## license (merge.slt rows are ignored without it).
 ##
 ## Mount point semantics (from sample's zipmount.xml):
 ##   - `cars_pri_<id>`     mounts at `game:\Media\cars\`
 ##   - `wheels_pri_<id>`   mounts at `game:\Media\wheels\`
 ##   - `_pri_<NNN>` priority encoding: higher number = higher priority
+##   - the `<dlcId>_pri_99/` overlay dir is NOT registered in
+##     zipmount.xml — FH1 auto-discovers it by name pattern.
 ##
-## ## Scaffold scope (this file, today)
+## ## Pipeline (executePortToDlc)
 ##
-## What this scaffold DOES:
-##   - Compute every output path on disk (no writes during planning).
-##   - Synthesize a deterministic DLC id + package id from the new-car
-##     slug, so re-running the same port re-targets the same package.
-##   - Drive the geometry zip emit via `rewriteZipMixedMethod` against
-##     the donor (same engine `portto.nim` uses). v0 carbin transcode is
-##     donor-verbatim; the rename mechanism re-targets entries to the new
-##     MediaName. The texture splice plan is built but not yet wired into
-##     edits (mirror of portto.nim's collectEdits — keep parity).
-##   - Emit `<dlcId>.puboffer` (3-byte marker) and `zipmount.xml`.
-##   - Provide an `uninstall` op that removes the package dir cleanly.
-##
-## What this scaffold STUBS (raises with a clear TODO until wired):
-##   - **`buildMergeSlt`**: producing the per-DLC `<dlcId>00_merge.slt`
-##     SQLite file. This is the load-blocking piece — without it the new
-##     car is invisible to the game. The 56-table subset + per-car PK
-##     conventions (`Data_Engine.EngineID` independent ID space,
-##     `List_TorqueCurve.TorqueCurveID = <EngineID>NNN`, single-semantics
-##     `List_Upgrade*.EngineID`) are documented in PLAN_DLC_PIVOT.md
-##     §"DLC architecture" / §"Implementation plan §B step 4".
-##   - **Audio CMT / ET XMLs**: `<MediaName>_CMT.xml` + `<MediaName>_ET.xml`.
-##     PLAN found 13 base-game cars without ET files load fine, so missing
-##     audio config is degrade-graceful — deferred until base path proves
-##     in-game.
-##   - **StringTables**: per-language `Data_Car` display name entry.
-##     Open question per PLAN — may degrade gracefully via resource-id
-##     lookup.
-##   - **`0x1123` extra field**: known fix needed in `core/zip21_writer.nim`
-##     (see project memory `project_zip21_extra_field.md`). Same fix
-##     applies here — DLC zip emit will inherit it once the writer is
-##     patched. No work here, just the dependency.
-##
-## ## Open questions deferred to follow-up
-##
-## All five open questions from PLAN_DLC_PIVOT.md §"Open questions" map
-## directly to TODOs here. The riskiest is package-id format — the
-## scaffold uses `<TitleID><24-bit-slug-hash padded to 8 hex>` which
-## matches the example DLC's shape but has not been verified to mount
-## under arbitrary IDs. If Xenia rejects the synthesized id, fall back
-## to enumerating an unused integer DLC id under `00000002/`.
+##   1. header sidecar + puboffer + zipmount.xml
+##   2. cars overlay: donor archive extracted LOOSE, with texture edits
+##      (working/<slug>/textures/*.xds) and transcoded carbins
+##      (hybrid splice; optional glTF-sourced positions via
+##      `--pack-from-gltf`; part drop/replace via part_edits.json)
+##      spliced over it, entry names re-prefixed donor→new slug
+##   3. wheels overlay: donor wheels extracted loose + renamed
+##   4. donor audio CMT/ET XMLs copied + renamed into the merge overlay
+##   5. `<dlcId>00_merge.slt` built from the target gamedb (donor rows
+##      cloned, IDs re-allocated, source cardb.json snippet overlaid)
 
 import std/[hashes, json, options, os, sets, strutils, tables]
+import ./port_common
+import ../core/ioutil
 import ../core/profile
 import ../core/mounts
 import ../core/zip21
@@ -113,7 +76,6 @@ type
   DlcGeometryActionKind* = enum
     dgaTranscode       ## both source + donor have this carbin → transcode
     dgaDonorOnly       ## donor has it, source doesn't → keep donor's bytes
-    dgaSourceExtra     ## source has it, donor doesn't → drop
 
   DlcGeometryAction* = object
     kind*: DlcGeometryActionKind
@@ -147,10 +109,10 @@ type
     pubofferPath*:  string
     dlcZipsDir*:    string         # packageDir/Media/DLCZips
     zipmountPath*:  string         # dlcZipsDir/zipmount.xml
-    mergeOverlayDir*: string       # dlcZipsDir/<packageId>_pri_99
+    mergeOverlayDir*: string       # dlcZipsDir/<dlcId>_pri_99
     mergeSltPath*:  string         # mergeOverlayDir/Media/db/patch/<dlcId>00_merge.slt
-    carsZipPath*:   string         # dlcZipsDir/cars_pri_<dlcId>/<newSlug>.zip
-    wheelsZipPath*: string         # dlcZipsDir/wheels_pri_<dlcId>/<newSlug>.zip
+    carsOutDir*:    string         # dlcZipsDir/cars_pri_<dlcId>/<newSlug>/ (loose files)
+    wheelsOutDir*:  string         # dlcZipsDir/wheels_pri_<dlcId>/<newSlug>/ (loose files)
     headerPath*:    string         # contentRoot/<profileId>/<TitleID>/Headers/00000002/<packageId>.header
 
     # Source pieces from the target mount
@@ -186,33 +148,6 @@ const
   PubofferMarker = "\r\n\n"
     ## 3-byte marker observed in the sample DLC's `Media/729.puboffer`.
     ## Treated as opaque content for now (PLAN open question §2).
-
-proc readFileBytes(path: string): seq[byte] =
-  let s = readFile(path)
-  result = newSeq[byte](s.len)
-  for i, c in s: result[i] = byte(c)
-
-proc writeAllBytes(path: string, data: openArray[byte]) =
-  var f = open(path, fmWrite)
-  defer: f.close()
-  if data.len > 0: discard f.writeBytes(data, 0, data.len)
-
-proc isCarbinName(name: string): bool =
-  name.toLowerAscii().endsWith(".carbin")
-
-proc isStrippedCarbin(name: string): bool =
-  extractFilename(name).toLowerAscii().startsWith("stripped_")
-
-proc isXdsName(name: string): bool =
-  name.toLowerAscii().endsWith(".xds")
-
-proc indexZipEntries(zipPath: string): tuple[entries: seq[Entry];
-                                              byBase: Table[string, Entry]] =
-  let entries = listEntries(zipPath)
-  var byBase = initTable[string, Entry]()
-  for e in entries:
-    byBase[extractFilename(e.name).toLowerAscii()] = e
-  result = (entries, byBase)
 
 proc synthDlcId*(slug: string): int =
   ## Deterministic 24-bit id from the new-car slug. Range chosen to
@@ -309,8 +244,8 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
     mergeOverlayDir: mergeOverlayDir,
     mergeSltPath: mergeOverlayDir / "Media" / "db" / "patch" /
                   ($dlcId & "00_merge.slt"),
-    carsZipPath: dlcZipsDir / ("cars_pri_" & $dlcId) / finalSlug,
-    wheelsZipPath: dlcZipsDir / ("wheels_pri_" & $dlcId) / finalSlug,
+    carsOutDir: dlcZipsDir / ("cars_pri_" & $dlcId) / finalSlug,
+    wheelsOutDir: dlcZipsDir / ("wheels_pri_" & $dlcId) / finalSlug,
     headerPath: titleIdDir / "Headers" / DlcContentTypeDir /
                 (packageId & ".header"),
     donorCarsZip: donorZip,
@@ -327,9 +262,9 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
     for kind, p in walkDir(workingTexDir):
       if kind != pcFile: continue
       if isXdsName(p): sourceTextures.add(extractFilename(p))
-  let donorIdx = indexZipEntries(donorZip)
+  let donorEntries = listEntries(donorZip)
   var donorTextures: seq[string] = @[]
-  for e in donorIdx.entries:
+  for e in donorEntries:
     if isXdsName(e.name): donorTextures.add(extractFilename(e.name))
 
   var sourceProfileId = "fm4"
@@ -354,7 +289,7 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
 
   # Geometry actions (donor's part list is authoritative — same as portto.nim).
   let workingGeomDir = abs / "geometry"
-  for e in donorIdx.entries:
+  for e in donorEntries:
     if not isCarbinName(e.name): continue
     let baseLc = extractFilename(e.name).toLowerAscii()
     if isStrippedCarbin(baseLc):
@@ -382,7 +317,7 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
     if sourcePath.len > 0:
       plan.geometryActions.add(DlcGeometryAction(
         kind: dgaTranscode, zipEntryName: e.name, sourcePath: sourcePath,
-        note: "v0: stub transcode emits donor bytes verbatim"))
+        note: "hybrid splice from working source onto donor scaffold"))
     else:
       plan.geometryActions.add(DlcGeometryAction(
         kind: dgaDonorOnly, zipEntryName: e.name,
@@ -405,8 +340,8 @@ proc describePlan*(p: DlcPortPlan): string =
   result.add "    " & p.pubofferPath.relativePath(p.packageDir) & "\n"
   result.add "    " & p.zipmountPath.relativePath(p.packageDir) & "\n"
   result.add "    " & p.mergeSltPath.relativePath(p.packageDir) & "\n"
-  result.add "    " & p.carsZipPath.relativePath(p.packageDir) & "\n"
-  result.add "    " & p.wheelsZipPath.relativePath(p.packageDir) & "\n"
+  result.add "    " & p.carsOutDir.relativePath(p.packageDir) & "\n"
+  result.add "    " & p.wheelsOutDir.relativePath(p.packageDir) & "\n"
   result.add "  textures: copy=" & $p.texturePlan.sourceCount &
              " splice=" & $p.texturePlan.donorCount &
              " drop=" & $p.texturePlan.droppedCount & "\n"
@@ -415,35 +350,11 @@ proc describePlan*(p: DlcPortPlan): string =
     case a.kind
     of dgaTranscode: inc transcodeN
     of dgaDonorOnly: inc donorOnlyN
-    of dgaSourceExtra: discard
   result.add "  geometry: transcode=" & $transcodeN &
              " donor-only=" & $donorOnlyN &
-             "  (Slice B v2: main carbin spliced, LOD0-only sections donor-passthrough)\n"
+             "  (main carbin spliced; lod0/cockpit donor-passthrough)\n"
 
 # ---- emit ----
-
-proc renamePrefixIn(name, fromPrefix, toPrefix: string): string =
-  ## Same casing-preserving rename as portto.nim. Duplicated here to
-  ## keep portto_dlc independent of portto's internals; if a third
-  ## consumer shows up, extract to a shared module.
-  let lc = name.toLowerAscii()
-  let needle = fromPrefix.toLowerAscii()
-  let idx = lc.find(needle)
-  if idx < 0: return name
-  let donorOcc = name[idx ..< idx + needle.len]
-  let replacement =
-    if donorOcc == donorOcc.toLowerAscii(): toPrefix.toLowerAscii()
-    else: toPrefix
-  result = name[0 ..< idx] & replacement & name[idx + needle.len .. ^1]
-
-proc buildRenames(donorEntries: seq[Entry], donorSlug, newSlug: string):
-                  Table[string, string] =
-  result = initTable[string, string]()
-  if donorSlug == newSlug: return
-  for e in donorEntries:
-    let renamed = renamePrefixIn(e.name, donorSlug, newSlug)
-    if renamed != e.name:
-      result[e.name] = renamed
 
 proc collectGeometryEdits(p: DlcPortPlan;
                           options: TranscodeOptions): Table[string, seq[byte]] =
@@ -461,28 +372,29 @@ proc collectGeometryEdits(p: DlcPortPlan;
   ##   - topDropExtra: same — source-only buckets aren't in donor, nothing
   ##     to drop.
   result = initTable[string, seq[byte]]()
-  let donorIdx = indexZipEntries(p.donorCarsZip)
+  let donorEntries = listEntries(p.donorCarsZip)
   var donorEntryByBase = initTable[string, Entry]()
-  for e in donorIdx.entries:
+  for e in donorEntries:
     donorEntryByBase[extractFilename(e.name).toLowerAscii()] = e
 
-  # glTF-sourced geometry (Stage 2, opt-in via options.packFromGltf):
-  # load working/<slug>/car.gltf once and feed it to every main-carbin
-  # transcode so exported geometry comes from the (editable) glTF rather
-  # than the importee's original carbin pool. Loaded once; one doc serves
-  # all carbins (importwc emits every carbin's sections into one glTF).
-  # On any load failure we fall back to the binary-splice path silently.
-  var gDoc = none(GltfDoc)
-  if options.packFromGltf:
-    let gltfPath = p.workingCar / "car.gltf"
-    if fileExists(gltfPath):
-      try: gDoc = some(loadGltfDoc(gltfPath))
-      except CatchableError as e:
-        stderr.writeLine "    [transcode] glTF load failed (" & e.msg &
-          "); falling back to binary splice"
-    else:
-      stderr.writeLine "    [transcode] packFromGltf set but no " & gltfPath &
-        "; falling back to binary splice"
+  # working/<slug>/car.gltf, loaded ONCE and shared by both consumers:
+  # the transcode path (only when options.packFromGltf — exported
+  # geometry positions come from the editable glTF rather than the
+  # importee's original carbin pool) and the part add/replace pass
+  # below (always, when the file exists). One doc serves all carbins
+  # (importwc emits every carbin's sections into one glTF). On any
+  # load failure we fall back to the binary-splice path.
+  var gltfDoc = none(GltfDoc)
+  let gltfPath = p.workingCar / "car.gltf"
+  if fileExists(gltfPath):
+    try: gltfDoc = some(loadGltfDoc(gltfPath))
+    except CatchableError as e:
+      stderr.writeLine "    [transcode] glTF load failed (" & e.msg &
+        "); falling back to binary splice"
+  let gDoc = if options.packFromGltf: gltfDoc else: none(GltfDoc)
+  if options.packFromGltf and gltfDoc.isNone:
+    stderr.writeLine "    [transcode] packFromGltf set but no usable " &
+      gltfPath & "; falling back to binary splice"
 
   # Textures (Stage 3 § 3.3): wire texture splice into emit. The plan's
   # `ops` list was built by planTexturePort during planPortToDlc; here
@@ -565,19 +477,19 @@ proc collectGeometryEdits(p: DlcPortPlan;
         " lod0Spliced=" & $r.report.lod0Spliced
       if r.report.mode != tmDonorVerbatim:
         result[ga.zipEntryName] = r.bytes
-    of dgaDonorOnly, dgaSourceExtra:
+    of dgaDonorOnly:
       discard
 
-  # ---- Part add / remove (Phase 2) ----
-  # Operates on the MAIN body carbin only. ADD: any glTF mesh tagged
-  # lodKind=main whose name is not a donor section → synthesize a new
-  # carbin section (clone a body section as scaffold) and append. REMOVE:
-  # section names listed in working/<slug>/part_edits.json {"drop":[...]}.
+  # ---- Part drop / replace (Phase 2) ----
+  # Operates on the MAIN body carbin only. REPLACE: any glTF mesh tagged
+  # lodKind=main whose name is not a donor section is synthesized into an
+  # existing donor slot picked via part_edits.json's addName map
+  # (APPENDING a section the donor lacks crashes in-game unconditionally —
+  # docs/FH1_PART_EDITING.md §3). DROP: section names listed in
+  # working/<slug>/part_edits.json {"drop":[...]}.
   block partEdits:
     var dropSet = initHashSet[string]()
-    var dupAppend: seq[tuple[src, name: string]] = @[]   # debug: clone+rename+append
     var addName = initTable[string, string]()  # gltf mesh name -> carbin section name
-    var mutateOps: seq[tuple[section, op: string]] = @[]  # bisect: mutate a real section in place
     var boxScale = 1.0'f32   # enlarge the donor target bbox a synthesized part fits into
     var partOffset = [0.0'f32, 0.0'f32, 0.0'f32]   # shift a synthesized part in world
     var subName = ""   # template subsection to clone (its material binding) — "" = ss0
@@ -587,14 +499,8 @@ proc collectGeometryEdits(p: DlcPortPlan;
         let pj = parseJson(readFile(sidecar))
         if pj.hasKey("drop"):
           for n in pj["drop"].getElems: dropSet.incl n.getStr
-        if pj.hasKey("dupAppend"):
-          for e in pj["dupAppend"].getElems:
-            dupAppend.add (src: e{"src"}.getStr, name: e{"name"}.getStr)
         if pj.hasKey("addName"):
           for k, v in pj["addName"].pairs: addName[k] = v.getStr
-        if pj.hasKey("mutate"):
-          for e in pj["mutate"].getElems:
-            mutateOps.add (section: e{"section"}.getStr, op: e{"op"}.getStr)
         if pj.hasKey("boxScale"): boxScale = pj["boxScale"].getFloat.float32
         if pj.hasKey("offset") and pj["offset"].len >= 3:
           for a in 0 .. 2: partOffset[a] = pj["offset"][a].getFloat.float32
@@ -604,7 +510,7 @@ proc collectGeometryEdits(p: DlcPortPlan;
 
     # Locate the main body carbin entry (not stripped/lod0/cockpit/caliper/rotor).
     var mainEntry = ""
-    for e in donorIdx.entries:
+    for e in donorEntries:
       if not isCarbinName(e.name): continue
       let bl = extractFilename(e.name).toLowerAscii()
       if bl.startsWith("stripped_"): continue
@@ -613,14 +519,8 @@ proc collectGeometryEdits(p: DlcPortPlan;
       mainEntry = e.name; break
     if mainEntry.len == 0: break partEdits
 
-    var gDoc2 = none(GltfDoc)
-    let gltfPath2 = p.workingCar / "car.gltf"
-    if fileExists(gltfPath2):
-      try: gDoc2 = some(loadGltfDoc(gltfPath2))
-      except CatchableError: discard
-
     # Nothing to do?
-    if dropSet.len == 0 and gDoc2.isNone: break partEdits
+    if dropSet.len == 0 and gltfDoc.isNone: break partEdits
 
     var mainBytes =
       if mainEntry in result: result[mainEntry]
@@ -650,35 +550,12 @@ proc collectGeometryEdits(p: DlcPortPlan;
       for i, s in info.sections:
         if s.lodVerticesCount > 0'u32 and s.subsections.len > 0: tplIdx = i; break
 
-    var added: seq[seq[byte]] = @[]
     var replaceTbl = initTable[string, seq[byte]]()  # in-place section swaps
 
-    # Debug isolation: append verbatim byte-copies of existing sections,
-    # renamed, each with a fresh unique perSectionId. Known-good bytes →
-    # tells us whether appending a part at all is the wall, independent of
-    # synthesis (and whether perSectionId must be unique).
-    var nextPsid = 1'u32
-    block:
-      let used = readPerSectionIds(mainBytes, info)
-      for v in used:
-        if v != high(uint32) and v + 1 > nextPsid: nextPsid = v + 1
-    for da in dupAppend:
-      var srcIdx = -1
-      for i, s in info.sections:
-        if s.name == da.src: srcIdx = i; break
-      if srcIdx < 0:
-        stderr.writeLine "    [parts] dupAppend src '" & da.src & "' not found"
-        continue
-      added.add cloneSectionRenamed(mainBytes, info.sections[srcIdx], da.name,
-                                    int(nextPsid))
-      stderr.writeLine "    [parts] +dup '" & da.src & "' as '" & da.name &
-        "' (perSectionId=" & $nextPsid & ")"
-      inc nextPsid
-
-    if gDoc2.isSome and tplIdx >= 0:
-      for meshName in gDoc2.get.mainMeshNames:
+    if gltfDoc.isSome and tplIdx >= 0:
+      for meshName in gltfDoc.get.mainMeshNames:
         if meshName in donorNames: continue          # existing part → Phase 1
-        let mg = gDoc2.get.meshGeometry(meshName)
+        let mg = gltfDoc.get.meshGeometry(meshName)
         if not mg.found or mg.indices.len < 3: continue
         # Section name: the game looks up each section in a fixed part-name
         # registry, so a new part must use a known name. `addName` maps the
@@ -726,46 +603,17 @@ proc collectGeometryEdits(p: DlcPortPlan;
         except CatchableError as e:
           stderr.writeLine "    [parts] synth '" & meshName & "' failed: " & e.msg
 
-    # Bisect probes: mutate a REAL section in place (one field flipped) to
-    # find which difference from real→synthesis the game rejects.
-    for mo in mutateOps:
-      var si = -1
-      for i, s in info.sections:
-        if s.name == mo.section: si = i; break
-      if si < 0:
-        stderr.writeLine "    [parts] mutate: section '" & mo.section & "' not found"; continue
-      let sec = info.sections[si]
-      var mut: seq[byte]
-      case mo.op
-      of "regenquats": mut = mutateRegenQuats(mainBytes, sec)
-      of "trilist":    mut = mutateTriList(mainBytes, sec)
-      of "mergesubs":  mut = mutateMergeSubs(mainBytes, sec)
-      of "zeroatable": mut = mutateZeroAtable(mainBytes, sec)
-      of "resynth":
-        if gDoc2.isNone:
-          stderr.writeLine "    [parts] resynth needs car.gltf"; continue
-        let mg = gDoc2.get.meshGeometry(mo.section)
-        if not mg.found:
-          stderr.writeLine "    [parts] resynth: no gltf mesh '" & mo.section & "'"; continue
-        mut = synthSectionFromMesh(mainBytes, sec, mg.pos, mg.uv, mg.normal,
-          mg.indices, mo.section)
-      else:
-        stderr.writeLine "    [parts] mutate: unknown op '" & mo.op & "'"; continue
-      replaceTbl[mo.section] = mut
-      stderr.writeLine "    [parts] *mutate '" & mo.section & "' op=" & mo.op &
-        " (" & $(sec.endPos-sec.start) & "B -> " & $mut.len & "B)"
-
-    if dropSet.len == 0 and added.len == 0 and replaceTbl.len == 0: break partEdits
-    let pe = applyPartEdits(mainBytes, info, dropSet, added, replaceTbl)
+    if dropSet.len == 0 and replaceTbl.len == 0: break partEdits
+    let pe = applyPartEdits(mainBytes, info, dropSet, @[], replaceTbl)
     if pe.ok:
       result[mainEntry] = pe.bytes
       var droppedReal = 0
       for n in dropSet:
         if n in donorNames: inc droppedReal
       stderr.writeLine "    [parts] main carbin: -" & $droppedReal &
-        " dropped, ~" & $replaceTbl.len & " replaced, +" & $added.len &
-        " added (partCount " & $info.partCountDeclared & " -> " &
-        $(info.sections.len - droppedReal + added.len) & ")"
+        " dropped, ~" & $replaceTbl.len & " replaced (partCount " &
+        $info.partCountDeclared & " -> " &
+        $(info.sections.len - droppedReal) & ")"
     else:
       stderr.writeLine "    [parts] applyPartEdits skipped: " & pe.msg
 
@@ -904,16 +752,14 @@ proc extractZipToDir(srcZipPath, outDir: string,
   let entries = listEntries(srcZipPath)
   for e in entries:
     let outName = if e.name in renames: renames[e.name] else: e.name
-    # Strip directory prefixes — FH1 expects flat paths in the loose
-    # car dir. Donor zips already use flat names; this is just
-    # defensive against any with a "/" path. (Note: a few have
-    # subdirs like LiveryMasks/back.tga; preserve those.)
+    # Entry names are written as-is; any subdir components (e.g.
+    # LiveryMasks/back.tga) are preserved via the parentDir createDir.
     let outPath = outDir / outName
     createDir(outPath.parentDir)
     let bytes =
       if e.name in edits: edits[e.name]
       else: extract(srcZipPath, e)
-    writeAllBytes(outPath, bytes)
+    writeFileBytes(outPath, bytes)
 
 proc emitWheelsZip(p: DlcPortPlan) =
   ## Wheels overlay: extract donor's archive into a loose file tree at
@@ -923,7 +769,7 @@ proc emitWheelsZip(p: DlcPortPlan) =
   if not fileExists(p.donorWheelsZip): return
   let donorEntries = listEntries(p.donorWheelsZip)
   let renames = buildRenames(donorEntries, p.donorSlug, p.newSlug)
-  extractZipToDir(p.donorWheelsZip, p.wheelsZipPath, renames,
+  extractZipToDir(p.donorWheelsZip, p.wheelsOutDir, renames,
                    initTable[string, seq[byte]]())
 
 proc emitCarsZip(p: DlcPortPlan; options: TranscodeOptions) =
@@ -932,12 +778,12 @@ proc emitCarsZip(p: DlcPortPlan; options: TranscodeOptions) =
   let edits = collectGeometryEdits(p, options)
   let donorEntries = listEntries(p.donorCarsZip)
   let renames = buildRenames(donorEntries, p.donorSlug, p.newSlug)
-  extractZipToDir(p.donorCarsZip, p.carsZipPath, renames, edits)
+  extractZipToDir(p.donorCarsZip, p.carsOutDir, renames, edits)
 
 proc emitPuboffer(p: DlcPortPlan) =
   createDir(p.pubofferPath.parentDir)
   let bytes = cast[seq[byte]](PubofferMarker)
-  writeAllBytes(p.pubofferPath, bytes)
+  writeFileBytes(p.pubofferPath, bytes)
 
 proc buildXeniaHeader(displayName, packageId, titleIdHex: string): seq[byte] =
   ## Build the 332-byte sidecar `.header` xenia uses to populate
@@ -985,7 +831,7 @@ proc emitXeniaHeader(p: DlcPortPlan) =
   let displayName = CarbinGarageHeaderPrefix & p.newSlug
   let bytes = buildXeniaHeader(displayName, p.packageId,
                                 p.targetProfile.titleId.toUpperAscii())
-  writeAllBytes(p.headerPath, bytes)
+  writeFileBytes(p.headerPath, bytes)
 
 proc emitZipmount(p: DlcPortPlan) =
   createDir(p.zipmountPath.parentDir)
@@ -1065,9 +911,6 @@ proc emitAudioCmtEt(p: DlcPortPlan) =
     stderr.writeLine "    [audio] " & donorCfg.lastPathPart &
       " → " & p.newSlug & suffix & tag
 
-proc emitMergeSlt(p: DlcPortPlan) =
-  discard emitMergeSltFile(p)
-
 proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
                        skipMergeSlt: bool = false,
                        options: TranscodeOptions = defaultTranscodeOptions()) =
@@ -1090,12 +933,11 @@ proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
   ##      stale puboffer markers, partial zipmount.xml, half-written
   ##      merge.slt, all gone before the new layout lands.
   ##   3. Mkdir tree, emit puboffer + zipmount.
-  ##   4. Emit cars zip + wheels zip.
-  ##   5. Emit merge.slt (skippable for scaffold inspection).
+  ##   4. Emit cars + wheels loose overlays and donor audio CMT/ET.
+  ##   5. Emit merge.slt (skippable for package-tree inspection).
   ##
-  ## `skipMergeSlt` exists so the rest of the layout can be inspected
-  ## on disk before the merge.slt builder lands. Real ports MUST run with
-  ## skipMergeSlt=false — the new car is unreachable in-game without it.
+  ## Real ports MUST run with skipMergeSlt=false — the new car is
+  ## unreachable in-game without the merge.slt.
   if p.packageExists and not replace:
     raise newException(DlcPortError,
       "package already exists at " & p.packageDir &
@@ -1111,7 +953,7 @@ proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
   emitWheelsZip(p)
   emitAudioCmtEt(p)
   if not skipMergeSlt:
-    emitMergeSlt(p)
+    discard emitMergeSltFile(p)
 
 proc uninstallPortToDlc*(p: DlcPortPlan) =
   ## Remove the entire package directory and its sidecar header file.

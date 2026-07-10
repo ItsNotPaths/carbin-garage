@@ -136,7 +136,7 @@ jobs:
           [ -f README.md ] && cp README.md "$stage/" || true
           [ -f LICENSE ]   && cp LICENSE   "$stage/" || true
           [ -d profiles ]  && cp -r profiles "$stage/" || true
-          [ -d shaders ]   && cp -r shaders  "$stage/" || true
+          # shaders/ not staged: SPIR-V is baked into the binary via staticRead.
           ( cd "$stage" && zip -qr "../${PROJECT_NAME}-${TAG}-linux.zip" . )
 
       # ── Windows: cross-compile with mingw-w64 (SDL3 family from source) ────
@@ -170,7 +170,7 @@ jobs:
           [ -f README.md ] && cp README.md "$stage/" || true
           [ -f LICENSE ]   && cp LICENSE   "$stage/" || true
           [ -d profiles ]  && cp -r profiles "$stage/" || true
-          [ -d shaders ]   && cp -r shaders  "$stage/" || true
+          # shaders/ not staged: SPIR-V is baked into the binary via staticRead.
           ( cd "$stage" && zip -qr "../${PROJECT_NAME}-${TAG}-windows.zip" . )
 
       - name: Diagnose build output
