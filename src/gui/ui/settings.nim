@@ -42,7 +42,7 @@ const
   ClearBtnW       = 180.0'f32
   ClearBtnGap     = 8.0'f32
   ClearArmTimeout = 3.0                  ## seconds before "confirm" reverts
-  ClearDlcEnabledFor = ["fh1"]           ## profiles whose DLC pipeline ships
+  ClearDlcEnabledFor = ["fh1", "fm4"]    ## profiles whose DLC pipeline ships
 
   ExpSectionGap   = 28.0'f32       ## space above the Experimental section
   ExpHeaderH      = 24.0'f32

@@ -621,10 +621,19 @@ proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string
                     snippet: JsonNode = newJNull(),
                     siblingDlcSlts: openArray[string] = [],
                     forcedCarId: int = 0,
-                    forcedEngineId: int = 0):
+                    forcedEngineId: int = 0,
+                    targetGameId: string = "fh1",
+                    titleId: string = ""):
                     tuple[carId: int; engineId: int;
                           perTableRows: Table[string, int]] =
   ## Driver. `dlcId` is used to allocate stable new car/engine IDs.
+  ##
+  ## `targetGameId` selects the ContentOffers row flavor — the 56-table
+  ## clone machinery is schema-driven and identical for both games, but
+  ## each game has its own offer-id namespace, localized-string keys, and
+  ## offer-PK format (both verified in-game; FM4's via
+  ## probe/fm4_merge_probe.py, 2026-05-28). `titleId` is only used by
+  ## the fm4 flavor (offer PK = `<TITLEID><dlcId as 8 decimal digits>`).
   ## Caller is responsible for ensuring `dstMergeSlt`'s parent dir exists
   ## and that any existing file at that path is the right one to extend
   ## (we OPEN, not OVERWRITE — but tables are recreated only if absent;
@@ -693,15 +702,30 @@ proc buildMergeSlt*(srcGamedb, dstMergeSlt, donorMediaName, newMediaName: string
     # Without these rows the runtime won't surface the car in autoshow
     # (XamContentCreateEnumerator finds the package, but the autoshow
     # query joins ContentOffers/Mapping → no offer → no listing).
-    # Was previously hand-applied via /tmp/merge_compare/post_port.sh;
-    # wired in here so re-running port-to-dlc --replace doesn't drop it.
-    # Format mirrors the sample DLC (4D5309C900000729) row shape.
-    let offerId = 5571807927127299000 + dlcId
-    let offerPk = "4D5309C90" & $dlcId & "FFFF"
-    dstDb.exec(sql"""
+    # Both flavors share the 16-col/4-col row shape; the offer-id
+    # namespace, string-table keys, and PK format are per-game:
+    #   fh1 — mirrors the sample DLC (4D5309C900000729) row shape.
+    #   fm4 — mirrors first-party install-disc packs; validated in-game
+    #         via probe/fm4_merge_probe.py (autoshow listing + purchase).
+    var offerId: int
+    var offerPk: string
+    var strA, strB: string
+    if targetGameId == "fm4":
+      offerId = 5571807128311562241 + dlcId
+      let dec = $dlcId
+      if dec.len > 8:
+        raise newException(DlcMergeError,
+          "dlcId " & dec & " exceeds 8 decimal digits, can't fit fm4 offer PK")
+      offerPk = titleId.toUpperAscii() & "0".repeat(8 - dec.len) & dec
+      strA = "_&3100679600"; strB = "_&3100698426"
+    else:
+      offerId = 5571807927127299000 + dlcId
+      offerPk = "4D5309C90" & $dlcId & "FFFF"
+      strA = "_&3100663008"; strB = "_&3100649066"
+    dstDb.exec(sql("""
       INSERT INTO "ContentOffers" VALUES
-      (?, ?, '_&3100663008', '_&3100649066',
-       ?, 2, 0, 1, '', '', 1, 1, 0, 0, 0, 0)""",
+      (?, ?, '""" & strA & """', '""" & strB & """',
+       ?, 2, 0, 1, '', '', 1, 1, 0, 0, 0, 0)"""),
       offerPk, $offerId, $dlcId)
     dstDb.exec(sql"""
       INSERT INTO "ContentOffersMapping" VALUES (?, ?, ?, 1)""",

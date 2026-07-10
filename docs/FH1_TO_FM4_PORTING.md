@@ -9,6 +9,87 @@ direction: FH1 (source) → FM4 (target) — reverse of the shipped FM4→FH1 pi
 
 ## PROGRESS LOG
 
+**2026-07-10 — pipeline productionized end-to-end in Nim.**
+
+1. **Reverse-transcoded geometry validated IN-GAME** (user, same day):
+   swapped fh1→fm4 transcoded carbins into the loose-geometry probe pack —
+   "majorly correct and drives fine with only minor visual issues"
+   (issues untriaged; candidates: extra8 zero-pad paint analog, donor-
+   verbatim lod0/cockpit, texture format drift).
+2. **`port-to-dlc <working-car> fm4 --donor <fm4-slug>` now works.**
+   `portto_dlc.nim` grew an fm4 layout flavor (`plan.fm4Layout`):
+   lowercase package dir, `" \r\n"` puboffer, empty zipmount, empty
+   `Media/LicenseMasks`, loose geometry INSIDE the merge overlay at
+   `<dlcId>_pri_99/Media/cars/<NAME>/`, and no header/wheels/audio
+   pieces. `dlc_merge.buildMergeSlt` gained the fm4 ContentOffers
+   flavor (offer-id namespace 5571807128311562241+dlcId, string keys
+   `_&3100679600`/`_&3100698426`, PK `<TITLEID><dlcId:08d>`). FH1
+   output is unchanged (same SQL text, same paths).
+   Fixes riding along: geometry source matching is now case-insensitive
+   (FH1-imported working cars have mixed-case filenames and matched
+   nothing on a case-sensitive FS); the sibling merge.slt id scan
+   matches any `_pri_<N>` priority, not just 99; `dlc_clear`
+   identifies fm4 packs by their loose merge.slt (they ship no header).
+3. **Validated offline against the in-game-proven probe pack**: emitted
+   BMW_1M_11 (fh1) → ALF_8C_08 donor pack at `4d53091015174729`;
+   sentinels byte-match the probe, merge.slt structurally identical
+   (56 tables, same per-table row counts, correct offer row, snippet
+   BaseCost honored), main carbin spliced 27 sections and reparses as
+   cvFour with all-32B strides. NOT yet booted in FM4 — that's the
+   next xenia run.
+
+**2026-07-10 PM — first cross-car FM4 port debugged (S65AMG on SL65
+donor); two systemic fixes landed.**
+
+User exported FH1 MER_S65AMG_12 believing the donor was a "2008 S65" —
+FM4 has NO S65; the picked donor fingerprinted (via the pack's cloned
+CarPartPositions rows vs base gamedb) to **MER_SL65AMG_09**, a 2.50m-
+wheelbase roadster under a 3.17m-wheelbase sedan body. Symptoms
+("body too large, wheels wrong place, hitbox off") decomposed as:
+
+1. **Wheels + hitbox come from `Data_CarBody`** (empirically corrected
+   same day: the first fix shipped source `MAXData.xml` into
+   `physics/maxdata.xml` and changed NOTHING in-game — the XML is only
+   the offline source; the runtime reads the db row). `Data_CarBody`
+   (sub-id keyed, cloned from donor) carries ModelWheelbase /
+   ModelFront-/RearTrackOuter / ride heights + the
+   **PristineBoundingBox** (the hitbox). Values are rebaked vs the XML
+   (sign flips, adjusted track) so deriving from MAXData is wrong.
+   The geometry itself was fine: the 9 part-bound floats are
+   byte-identical between FM4/FH1 builds of the same car (verified over
+   the 8 sample pairs — bounds semantics equal, transfer correct), so
+   the body renders at true source scale and the donor-dimensioned
+   frame sat wrong underneath. **Fix**: `cardb.nim:extractCarDb` now
+   captures `Data_CarBody` (sub-id range) and `CarPartPositions`
+   (Ordinal-keyed anchor points) into the cardb.json snippet; the
+   existing export-side overlay then carries source dimensions onto the
+   donor clone with ids rewritten. Direction-agnostic — FM4 imports get
+   the same capture, so FH1-target ports benefit identically.
+   **Existing working cars must be re-imported** (or cardb.json
+   regenerated via `extractCarDb`) to pick up the new tables.
+   The maxdata.xml splice stays (harmless, keeps the shipped pack
+   internally consistent) but is NOT the operative fix.
+2. **Interior UV mess = texture/geometry mismatch**, not a transcode
+   bug: source's `interior_lod0.xds` was painted onto the
+   donor-verbatim cockpit mesh. **Fix**: `*_lod0.xds` buckets now
+   follow the lod0/cockpit geometry decision — donor-verbatim unless
+   `--lod0-splice-cross-car`. Applies to both port directions (same
+   mismatch existed FM4→FH1).
+
+Donor-selection assist: FM4 donors ranked by wheelbase proximity to the
+S65's 3.170 — best fits CHR_300C_08 (3.048), AST_Rapide_10 (2.990),
+**MER_CL65AMG_10 (2.955, same M275 V12, brand-matched cockpit)**.
+Scanner probe: extract `Wheelbase=` from each donor zip's maxdata.xml.
+
+Still donor-verbatim after these fixes (candidate future work):
+lod0/cockpit models (splice gate), CarPartPositions rows (part/light
+anchor points — importwc doesn't capture the source's; overlay would
+need an importwc snippet extension), caranimationevents/skeleton gr2s.
+
+Remaining: (a) boot-test the re-exported S65 pack (`4d53091009448691`,
+BaseCost 215000) + the BMW pack; (b) confirm FM4 accepts FH1's sparser
+CollSpheres set.
+
 **2026-05-28 — the two hard unknowns are both resolved empirically.**
 
 1. **Container / db (§5): SOLVED.** FM4 honors a DLC

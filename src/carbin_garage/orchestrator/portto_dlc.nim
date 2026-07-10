@@ -1,7 +1,18 @@
-## port-to-dlc: emit a Forza Horizon DLC package for a new car. This is
-## THE shipping path for cross-game / new-car ports (in-game validated).
+## port-to-dlc: emit a Forza DLC package for a new car. This is THE
+## shipping path for cross-game / new-car ports (in-game validated).
 ## Same-game overwrite of an existing slug goes through
 ## `orchestrator/portto.nim` instead; the CLI verb picks between them.
+##
+## Two package layouts, selected by the target profile:
+##   - fh1 (default): the layout described below — cars/wheels overlays
+##     as sibling `*_pri_<dlcId>` dirs, header sidecar, donor audio
+##     CMT/ET splice.
+##   - fm4 (`plan.fm4Layout`): everything rides inside the ONE merge
+##     overlay dir — geometry loose at `<dlcId>_pri_99/Media/cars/<NAME>/`
+##     next to the merge.slt, empty zipmount, an empty `LicenseMasks`
+##     sentinel, lowercase package dir, and NO header / wheels / audio
+##     pieces (validated in-game without them via
+##     probe/fm4_merge_probe.py --geometry-src, 2026-05-28 + 2026-07-10).
 ##
 ## ## Why DLC packaging
 ##
@@ -105,15 +116,21 @@ type
     packageId*:     string         # 16-hex: <TitleID><dlcId8hex>
     packageDir*:    string         # dlcSlot/packageId
 
+    # Layout flavor
+    fm4Layout*:     bool           # true = FM4 package shape (see module doc)
+
     # Per-package output paths (under packageDir/Media/...)
     pubofferPath*:  string
     dlcZipsDir*:    string         # packageDir/Media/DLCZips
     zipmountPath*:  string         # dlcZipsDir/zipmount.xml
+    licenseMasksPath*: string      # packageDir/Media/LicenseMasks (fm4 only, else "")
     mergeOverlayDir*: string       # dlcZipsDir/<dlcId>_pri_99
     mergeSltPath*:  string         # mergeOverlayDir/Media/db/patch/<dlcId>00_merge.slt
-    carsOutDir*:    string         # dlcZipsDir/cars_pri_<dlcId>/<newSlug>/ (loose files)
-    wheelsOutDir*:  string         # dlcZipsDir/wheels_pri_<dlcId>/<newSlug>/ (loose files)
+    carsOutDir*:    string         # fh1: dlcZipsDir/cars_pri_<dlcId>/<newSlug>/
+                                    # fm4: mergeOverlayDir/Media/cars/<newSlug>/
+    wheelsOutDir*:  string         # dlcZipsDir/wheels_pri_<dlcId>/<newSlug>/ (fh1 only, else "")
     headerPath*:    string         # contentRoot/<profileId>/<TitleID>/Headers/00000002/<packageId>.header
+                                    # (fh1 only, else "")
 
     # Source pieces from the target mount
     donorCarsZip*:    string       # <mountFolder>/<profile.cars>/<donor>.zip
@@ -148,6 +165,9 @@ const
   PubofferMarker = "\r\n\n"
     ## 3-byte marker observed in the sample DLC's `Media/729.puboffer`.
     ## Treated as opaque content for now (PLAN open question §2).
+  PubofferMarkerFm4 = " \r\n"
+    ## FM4's 3-byte variant (0x20 0x0D 0x0A) — observed in first-party
+    ## install-disc packs and used by the validated probe pack.
 
 proc synthDlcId*(slug: string): int =
   ## Deterministic 24-bit id from the new-car slug. Range chosen to
@@ -218,17 +238,26 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
   let dlcId =
     if overrideDlcId > 0: overrideDlcId
     else: synthDlcId(finalSlug)
+  let fm4Layout = targetProfile.id == "fm4"
   let packageId = packageIdFor(targetProfile, dlcId)
   let titleIdDir = contentRoot / profileId / targetProfile.titleId.toUpperAscii()
   let dlcSlot = titleIdDir / DlcContentTypeDir
-  let packageDir = dlcSlot / packageId
+  # FM4 package dirs are lowercase on disk (`4d530910000000NN` — both the
+  # install-disc first-party packs and the validated probe pack); FH1's
+  # sample DLC dir is uppercase. Case matters on a Linux host filesystem.
+  let packageDir = dlcSlot / (if fm4Layout: packageId.toLowerAscii()
+                              else: packageId)
   let dlcZipsDir = packageDir / "Media" / "DLCZips"
   # Overlay dir naming: `<dlcId>_pri_<priority>` (NOT packageId). The
-  # sample DLC at 4D5309C900000729 uses `729_pri_99/`, not the full
-  # 16-hex package id. FH1 auto-discovers this dir by name pattern;
-  # zipmount.xml does NOT register it (verified against sample's
-  # zipmount.xml).
-  let mergeOverlayDir = dlcZipsDir / ($dlcId & "_pri_" & $DefaultMergePriority)
+  # FH1 sample DLC at 4D5309C900000729 uses `729_pri_99/`, not the full
+  # 16-hex package id. The runtime auto-discovers this dir by name
+  # pattern; zipmount.xml does NOT register it (verified against
+  # sample's zipmount.xml). FM4 zero-pads the dlcId to at least 4 digits
+  # (`0099_pri_99` in the validated probe pack).
+  let overlayDirName =
+    if fm4Layout: align($dlcId, 4, '0') & "_pri_" & $DefaultMergePriority
+    else: $dlcId & "_pri_" & $DefaultMergePriority
+  let mergeOverlayDir = dlcZipsDir / overlayDirName
 
   var plan = DlcPortPlan(
     workingCar: abs, sourceSlug: slug,
@@ -238,16 +267,29 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
     titleIdDir: titleIdDir, dlcSlot: dlcSlot,
     dlcId: dlcId, forcedCarId: forcedCarId, forcedEngineId: forcedEngineId,
     packageId: packageId, packageDir: packageDir,
+    fm4Layout: fm4Layout,
     pubofferPath: packageDir / "Media" / ($dlcId & ".puboffer"),
     dlcZipsDir: dlcZipsDir,
     zipmountPath: dlcZipsDir / "zipmount.xml",
+    licenseMasksPath:
+      (if fm4Layout: packageDir / "Media" / "LicenseMasks" else: ""),
     mergeOverlayDir: mergeOverlayDir,
     mergeSltPath: mergeOverlayDir / "Media" / "db" / "patch" /
                   ($dlcId & "00_merge.slt"),
-    carsOutDir: dlcZipsDir / ("cars_pri_" & $dlcId) / finalSlug,
-    wheelsOutDir: dlcZipsDir / ("wheels_pri_" & $dlcId) / finalSlug,
-    headerPath: titleIdDir / "Headers" / DlcContentTypeDir /
-                (packageId & ".header"),
+    # FM4 reads the loose car overlay from INSIDE the merge overlay dir
+    # (mounted whole at game:\), so geometry sits next to db/patch/.
+    # FH1 uses a dedicated cars_pri_<dlcId> sibling registered in
+    # zipmount.xml.
+    carsOutDir:
+      (if fm4Layout: mergeOverlayDir / "Media" / "cars" / finalSlug
+       else: dlcZipsDir / ("cars_pri_" & $dlcId) / finalSlug),
+    wheelsOutDir:
+      (if fm4Layout: ""
+       else: dlcZipsDir / ("wheels_pri_" & $dlcId) / finalSlug),
+    headerPath:
+      (if fm4Layout: ""
+       else: titleIdDir / "Headers" / DlcContentTypeDir /
+             (packageId & ".header")),
     donorCarsZip: donorZip,
     donorWheelsZip: donorWheelsZip,
     packageExists: dirExists(packageDir))
@@ -288,7 +330,16 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
                                      sourceProfile, targetProfile)
 
   # Geometry actions (donor's part list is authoritative — same as portto.nim).
+  # Source files are matched by LOWERCASED basename: importwc preserves
+  # each game's on-disk casing (FM4 entries are lowercase, FH1 entries
+  # mixed-case like `BMW_1M_11_caliperLF_LOD0.carbin`), so a literal
+  # fileExists probe misses FH1-sourced cars on a case-sensitive FS.
   let workingGeomDir = abs / "geometry"
+  var workingGeomByBase = initTable[string, string]()
+  if dirExists(workingGeomDir):
+    for kind, p in walkDir(workingGeomDir):
+      if kind != pcFile: continue
+      workingGeomByBase[extractFilename(p).toLowerAscii()] = p
   for e in donorEntries:
     if not isCarbinName(e.name): continue
     let baseLc = extractFilename(e.name).toLowerAscii()
@@ -306,14 +357,10 @@ proc planPortToDlc*(workingCar: string, mount: Mount, targetProfile: GameProfile
         sourcePrefixLc & donorBaseLc[donorPrefixLc.len .. ^1]
       else:
         donorBaseLc
-    let candidates = [
-      workingGeomDir / sourceBaseGuess,
-      workingGeomDir / donorBaseLc,
-      workingGeomDir / donorBase,
-    ]
     var sourcePath = ""
-    for c in candidates:
-      if fileExists(c): sourcePath = c; break
+    for key in [sourceBaseGuess, donorBaseLc]:
+      if key in workingGeomByBase:
+        sourcePath = workingGeomByBase[key]; break
     if sourcePath.len > 0:
       plan.geometryActions.add(DlcGeometryAction(
         kind: dgaTranscode, zipEntryName: e.name, sourcePath: sourcePath,
@@ -336,12 +383,16 @@ proc describePlan*(p: DlcPortPlan): string =
   if p.packageExists:
     result.add "    (! package dir already exists — will refuse unless replace=true)\n"
   result.add "  emits:\n"
-  result.add "    [sidecar] " & p.headerPath & "\n"
+  if p.headerPath.len > 0:
+    result.add "    [sidecar] " & p.headerPath & "\n"
   result.add "    " & p.pubofferPath.relativePath(p.packageDir) & "\n"
   result.add "    " & p.zipmountPath.relativePath(p.packageDir) & "\n"
+  if p.licenseMasksPath.len > 0:
+    result.add "    " & p.licenseMasksPath.relativePath(p.packageDir) & "\n"
   result.add "    " & p.mergeSltPath.relativePath(p.packageDir) & "\n"
   result.add "    " & p.carsOutDir.relativePath(p.packageDir) & "\n"
-  result.add "    " & p.wheelsOutDir.relativePath(p.packageDir) & "\n"
+  if p.wheelsOutDir.len > 0:
+    result.add "    " & p.wheelsOutDir.relativePath(p.packageDir) & "\n"
   result.add "  textures: copy=" & $p.texturePlan.sourceCount &
              " splice=" & $p.texturePlan.donorCount &
              " drop=" & $p.texturePlan.droppedCount & "\n"
@@ -405,6 +456,16 @@ proc collectGeometryEdits(p: DlcPortPlan;
   for op in p.texturePlan.ops:
     case op.kind
     of topCopySource:
+      # `*_lod0` texture buckets pair with the lod0/cockpit geometry,
+      # which ships donor-verbatim (splice gate below). Painting the
+      # SOURCE car's lod0 textures onto the DONOR's meshes mismaps every
+      # UV (messy interior — S65-on-SL65, 2026-07-10). Keep donor's
+      # lod0 texture set so texture and geometry stay consistent.
+      if not options.lod0SpliceCrossCar and
+         op.targetName.toLowerAscii().endsWith("_lod0.xds"):
+        stderr.writeLine "    [texture] " & op.targetName &
+          " — donor verbatim (pairs with donor-verbatim lod0/cockpit)"
+        continue
       let srcPath = workingTexDir / op.sourceName
       if not fileExists(srcPath):
         stderr.writeLine "    [texture] missing source: " & srcPath & " (skipped)"
@@ -419,6 +480,27 @@ proc collectGeometryEdits(p: DlcPortPlan;
       result[donorEntryName] = bytes
     of topSpliceDonor, topDropExtra:
       discard
+
+  # Physics dimensions (fm4 targets). FM4 reads per-car suspension +
+  # collision geometry from `physics/maxdata.xml` (Misc Wheelbase /
+  # FrontTrackOuter / RearTrackOuter / ride heights + Collision
+  # BoundingBox + CollSpheres). Donor's file places wheels and hitbox at
+  # DONOR dimensions — visibly wrong for cross-car ports (2012 S65 body
+  # on SL65 donor: wheels inboard, hitbox 0.7m short; 2026-07-10). The
+  # working car carries the source's MAXData.xml in the same schema
+  # family, so ship that instead. FH1 targets keep donor's: FH1 gets
+  # its physics from the compiled physicsdefinition.bin (donor
+  # passthrough policy), not the XML.
+  if p.fm4Layout:
+    var workingMax = ""
+    for kind, f in walkDir(p.workingCar):
+      if kind != pcFile: continue
+      if extractFilename(f).toLowerAscii() == "maxdata.xml":
+        workingMax = f; break
+    if workingMax.len > 0 and "maxdata.xml" in donorEntryByBase:
+      result[donorEntryByBase["maxdata.xml"].name] = readFileBytes(workingMax)
+      stderr.writeLine "    [physics] maxdata.xml <- working source " &
+        "(wheelbase/track/collision at source dimensions)"
 
   # Geometry.
   for ga in p.geometryActions:
@@ -653,11 +735,14 @@ proc zipmountEntry(name, mount: string): string =
            "AltRootPath=\"" & mount & "\" ShouldCache=\"0\" /> \n"
 
 proc emitZipmountXml(p: DlcPortPlan): string =
-  ## Mounts cars + wheels overlays. Critically does NOT register the
-  ## `<dlcId>_pri_99/` merge-overlay dir — FH1 auto-discovers that one
-  ## by name pattern. Sample DLC's zipmount.xml omits it too. Audio
-  ## CMT/ET/StringTables entries land here when those emitters are
-  ## wired.
+  ## fh1: mounts cars + wheels overlays. Critically does NOT register
+  ## the `<dlcId>_pri_99/` merge-overlay dir — FH1 auto-discovers that
+  ## one by name pattern. Sample DLC's zipmount.xml omits it too.
+  ## fm4: EMPTY mount set — the loose car overlay rides inside the
+  ## auto-discovered merge overlay dir, so nothing needs registering
+  ## (matches the validated probe pack byte-for-byte).
+  if p.fm4Layout:
+    return "<?xml version=\"1.0\" ?>\n<zipmount>\n</zipmount>\n"
   result = "<?xml version=\"1.0\" ?> \n<zipmount> \n"
   result.add zipmountEntry("cars_pri_" & $p.dlcId, "game:\\Media\\cars\\")
   result.add zipmountEntry("wheels_pri_" & $p.dlcId, "game:\\Media\\wheels\\")
@@ -718,7 +803,11 @@ proc emitMergeSltFile(p: DlcPortPlan): tuple[carId: int; engineId: int;
       if not dirExists(patchDir): continue
       for kind2, sub in walkDir(patchDir):
         if kind2 != pcDir: continue
-        if not sub.extractFilename.endsWith("_pri_99"): continue
+        # Any-priority match: hand-deployed packs (e.g. the FM4 probe at
+        # `0098_pri_98`) don't necessarily use priority 99, and missing
+        # a sibling merge.slt here means its car/engine IDs aren't
+        # blocked during allocation.
+        if not sub.extractFilename.contains("_pri_"): continue
         let mergeDir = sub / "Media" / "db" / "patch"
         if not dirExists(mergeDir): continue
         for f in walkFiles(mergeDir / "*.slt"):
@@ -732,7 +821,9 @@ proc emitMergeSltFile(p: DlcPortPlan): tuple[carId: int; engineId: int;
     snippet = snippet,
     siblingDlcSlts = siblingSlts,
     forcedCarId = p.forcedCarId,
-    forcedEngineId = p.forcedEngineId)
+    forcedEngineId = p.forcedEngineId,
+    targetGameId = p.targetProfile.id,
+    titleId = p.targetProfile.titleId)
 
 proc extractZipToDir(srcZipPath, outDir: string,
                       renames: Table[string, string],
@@ -766,6 +857,7 @@ proc emitWheelsZip(p: DlcPortPlan) =
   ## `wheels_pri_<id>/<MediaName>/...`. Renames `<donorSlug>_*` →
   ## `<newSlug>_*` per the prefix-rename map. Donor-bin passthrough
   ## applies — never synthesize wheel content.
+  if p.wheelsOutDir.len == 0: return  # fm4 layout ships no wheels overlay
   if not fileExists(p.donorWheelsZip): return
   let donorEntries = listEntries(p.donorWheelsZip)
   let renames = buildRenames(donorEntries, p.donorSlug, p.newSlug)
@@ -782,8 +874,16 @@ proc emitCarsZip(p: DlcPortPlan; options: TranscodeOptions) =
 
 proc emitPuboffer(p: DlcPortPlan) =
   createDir(p.pubofferPath.parentDir)
-  let bytes = cast[seq[byte]](PubofferMarker)
-  writeFileBytes(p.pubofferPath, bytes)
+  let marker = if p.fm4Layout: PubofferMarkerFm4 else: PubofferMarker
+  writeFileBytes(p.pubofferPath, cast[seq[byte]](marker))
+
+proc emitLicenseMasks(p: DlcPortPlan) =
+  ## FM4-only zero-byte sentinel at Media/LicenseMasks. Present in every
+  ## first-party install-disc pack and in the validated probe pack;
+  ## purpose unknown, shipped for parity.
+  if p.licenseMasksPath.len == 0: return
+  createDir(p.licenseMasksPath.parentDir)
+  writeFileBytes(p.licenseMasksPath, newSeq[byte]())
 
 proc buildXeniaHeader(displayName, packageId, titleIdHex: string): seq[byte] =
   ## Build the 332-byte sidecar `.header` xenia uses to populate
@@ -827,6 +927,7 @@ proc buildXeniaHeader(displayName, packageId, titleIdHex: string): seq[byte] =
     result[0x143] = byte(parseHexInt(titleIdHex[6 ..< 8]))
 
 proc emitXeniaHeader(p: DlcPortPlan) =
+  if p.headerPath.len == 0: return  # fm4: validated in-game with no header
   createDir(p.headerPath.parentDir)
   let displayName = CarbinGarageHeaderPrefix & p.newSlug
   let bytes = buildXeniaHeader(displayName, p.packageId,
@@ -949,9 +1050,13 @@ proc executePortToDlc*(p: DlcPortPlan, replace: bool = false,
   emitXeniaHeader(p)
   emitPuboffer(p)
   emitZipmount(p)
+  emitLicenseMasks(p)
   emitCarsZip(p, options)
   emitWheelsZip(p)
-  emitAudioCmtEt(p)
+  if not p.fm4Layout:
+    # FM4 has no on-disk CMT/ET audio config system; the probe pack
+    # shipped none and the car loaded with working audio.
+    emitAudioCmtEt(p)
   if not skipMergeSlt:
     discard emitMergeSltFile(p)
 

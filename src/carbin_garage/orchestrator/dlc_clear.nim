@@ -10,6 +10,13 @@
 ##   2. The package must contain at least one `*_merge.slt` file under
 ##      `Media/DLCZips/<n>_pri_<m>/Media/db/patch/`. This file is unique
 ##      to the carbin-garage pipeline.
+##
+## FM4 packages ship WITHOUT a header sidecar (the fm4 layout was
+## in-game validated header-less), so marker 1 can't apply. There the
+## loose merge.slt alone identifies ours: first-party FM4 DLC keeps
+## everything inside `<id>_pri_<NN>.zip` archives and carries no loose
+## `db/patch/*_merge.slt` dir (verified by grep over the install-disc
+## packs, 2026-05-13).
 
 import std/[os, strutils]
 import ../core/profile
@@ -67,11 +74,19 @@ proc enumerateCarbinGarageDlcs*(contentRoot: string;
   let slot = dlcSlotFor(contentRoot, targetProfile, profileId)
   let headersDir = headersDirFor(contentRoot, targetProfile, profileId)
   if not dirExists(slot): return @[]
+  let headerless = targetProfile.id == "fm4"
   for kind, sub in walkDir(slot):
     if kind != pcDir: continue
     let pkgId = extractFilename(sub)
     let hdr = headersDir / (pkgId & ".header")
-    if headerHasCarbinGaragePrefix(hdr) and hasMergeSlt(sub):
+    if headerless:
+      # Still pair a header sidecar when one exists — packs written
+      # before the fm4 layout landed used the fh1 shape (header + all),
+      # and clearing them should not orphan the sidecar.
+      if hasMergeSlt(sub):
+        result.add DlcPackage(packageDir: sub,
+          headerPath: (if fileExists(hdr): hdr else: ""))
+    elif headerHasCarbinGaragePrefix(hdr) and hasMergeSlt(sub):
       result.add DlcPackage(packageDir: sub, headerPath: hdr)
 
 proc clearCarbinGarageDlcs*(contentRoot: string;

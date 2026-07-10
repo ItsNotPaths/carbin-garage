@@ -132,6 +132,11 @@ usage:
                                             [--lod0-splice-cross-car]
                                             [--pack-from-gltf]
                                             New-car port via DLC packaging.
+                                            Target fh1 or fm4 — the package
+                                            layout adapts per game (fm4:
+                                            loose geometry inside the merge
+                                            overlay, LicenseMasks, no
+                                            wheels/audio/header pieces).
                                             --pack-from-gltf sources geometry
                                             positions from working/<slug>/car.gltf
                                             instead of the original carbin pool.

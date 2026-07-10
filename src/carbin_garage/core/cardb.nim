@@ -129,6 +129,25 @@ proc extractCarDb*(gamedbPath: string, mediaName: string,
       rows = encodeRows(db, cols,
         "SELECT * FROM " & tbl & " WHERE CarID=?", $carId)
       keyMode = "CarID"
+    elif tbl == "Data_CarBody" and "Id" in colNames:
+      # Sub-id keyed (Id = carId*1000 + slot). Carries the car's MODEL
+      # dimensions — ModelWheelbase / track / ride heights + the
+      # PristineBoundingBox. The runtime places wheels and the hitbox
+      # from THIS row (physics/maxdata.xml is only its offline source) —
+      # leaving donor-cloned values puts a donor-sized frame under the
+      # ported body (S65-on-SL65, 2026-07-10). Captured here so the
+      # export-side snippet overlay carries source dimensions.
+      rows = encodeRows(db, cols,
+        "SELECT * FROM " & tbl & " WHERE Id >= ? AND Id < ?",
+        $(carId * 1000), $((carId + 1) * 1000))
+      keyMode = "SubId"
+    elif tbl == "CarPartPositions" and "Ordinal" in colNames:
+      # Ordinal-keyed anchor points (PartId + world pos — lights,
+      # exhausts, effects). Same rationale as Data_CarBody: donor's
+      # anchors sit at donor dimensions.
+      rows = encodeRows(db, cols,
+        "SELECT * FROM " & tbl & " WHERE Ordinal=?", $carId)
+      keyMode = "Ordinal"
     if rows != nil and rows.len > 0:
       tablesNode[tbl] = %*{
         "key":     keyMode,
